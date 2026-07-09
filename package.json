@@ -1,0 +1,37 @@
+{
+  "name": "membridge",
+  "version": "0.1.0",
+  "description": "Shared memory across your AI coding tools. A tiny background daemon that watches Claude Code, Codex and any other agent's session logs, distills a brief per-project memory, and syncs it into the context files every tool reads (CLAUDE.md, AGENTS.md, ...).",
+  "keywords": [
+    "ai",
+    "claude-code",
+    "codex",
+    "agents",
+    "memory",
+    "context",
+    "sync",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "bin": {
+    "membridge": "bin/membridge.js"
+  },
+  "main": "lib/scan.js",
+  "files": [
+    "bin",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/run-tests.js",
+    "start": "node bin/membridge.js start"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/membridge/membridge.git"
+  }
+}
