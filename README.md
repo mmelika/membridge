@@ -47,9 +47,33 @@ Files recently modified by AI tools: src/login.js
 The rest of your file is never touched, and `membridge remove` strips the
 blocks cleanly.
 
+## Per-project memory database and file index
+
+Beyond the brief context block, MemBridge keeps a structured memory database
+inside each project at `.membridge/`:
+
+- **`memory.json`** — every AI update as a structured entry: timestamp, which
+  tool, what was asked, and exactly which files it touched. It also carries an
+  **index of the project's local files** (relative path, size, modified time —
+  ignore-aware, so `node_modules`/`.git` never pollute it), which lets one LLM
+  point another at the precise files a change refers to.
+- **`memory.md`** — the same memory rendered as markdown, readable by humans
+  and by any agent that opens the project.
+
+The injected context block links to these files, so a tool that wants more
+than the brief summary can follow the reference. Add `.membridge/` to your
+project's `.gitignore` if you don't want the memory committed — or commit it
+to share AI context with your whole team.
+
 ## Quick start
 
-Requires Node.js 18+.
+**macOS menu-bar app:** download `MemBridge-<version>.dmg` from the
+[latest release](https://github.com/mmelika/membridge/releases), drag it to
+Applications, and launch — a bridge icon appears in your menu bar with
+status, dashboard, pause, and start-at-login. (Builds are unsigned for now:
+right-click → Open on first launch.)
+
+**CLI daemon** (any OS, Node.js 18+):
 
 ```bash
 npm install -g membridge
@@ -61,7 +85,7 @@ membridge dashboard  # open the local web dashboard
 
 Optional: `membridge enable-autostart` launches MemBridge at login
 (Startup folder on Windows, launchd on macOS, systemd user unit on Linux —
-no admin rights needed).
+no admin rights needed). The tray app has its own "Start at login" toggle.
 
 ## Supported AI coding tools
 
@@ -167,16 +191,20 @@ syncs (60s default), and has zero runtime dependencies.
 
 ```bash
 node test/run-tests.js   # zero-dependency end-to-end suite (temp dirs only)
+npm run app              # run the tray app from source (Electron)
+npm run dist:mac         # build the macOS menu-bar app (dmg + zip)
 ```
 
-CI runs the suite on Linux, Windows, and macOS across Node 18/20/22.
+The core stays zero-dependency; Electron is a devDependency used only by the
+tray app. CI runs the suite on Linux, Windows, and macOS across Node 18/20/22,
+and the "Build app" workflow produces macOS builds on Apple runners.
 
 ## Roadmap
 
 - LLM-powered summaries (optional API key): richer memory in fewer lines
 - First-class adapters for Gemini CLI, Cursor, opencode, Copilot CLI
 - Team sync: share project memory across machines
-- System tray app
+- Signed + notarized macOS builds
 
 ## License
 

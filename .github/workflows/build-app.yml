@@ -1,0 +1,38 @@
+# Builds the MemBridge tray app for macOS (menu bar) on Apple's runners.
+# Runs on manual dispatch and on every published release; release builds are
+# attached to the release as downloadable artifacts.
+name: Build app
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install
+      - run: node test/run-tests.js
+      - run: npm run dist:mac
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: membridge-mac
+          path: |
+            dist/*.dmg
+            dist/*.zip
+      - name: Attach to release
+        if: github.event_name == 'release'
+        run: gh release upload "$TAG" dist/*.dmg dist/*-mac.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}

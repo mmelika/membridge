@@ -1,6 +1,6 @@
 {
   "name": "membridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared memory across your AI coding tools. A tiny background daemon that watches Claude Code, Codex and any other agent's session logs, distills a brief per-project memory, and syncs it into the context files every tool reads (CLAUDE.md, AGENTS.md, ...).",
   "keywords": [
     "ai",
@@ -30,7 +30,29 @@
   ],
   "scripts": {
     "test": "node test/run-tests.js",
-    "start": "node bin/membridge.js start"
+    "start": "node bin/membridge.js start",
+    "app": "node scripts/prepare-app.js && electron app",
+    "dist:mac": "node scripts/prepare-app.js && electron-builder --mac --publish never",
+    "dist:win": "node scripts/prepare-app.js && electron-builder --win --publish never"
+  },
+  "build": {
+    "appId": "com.membridge.app",
+    "productName": "MemBridge",
+    "directories": {
+      "app": "app",
+      "output": "dist"
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "category": "public.app-category.developer-tools",
+      "icon": "app/assets/icon.png",
+      "extendInfo": {
+        "LSUIElement": true
+      }
+    },
+    "win": {
+      "target": ["zip"]
+    }
   },
   "engines": {
     "node": ">=18"
@@ -38,5 +60,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mmelika/membridge.git"
+  },
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3"
   }
 }

@@ -40,6 +40,10 @@ const count = (hay, needle) => hay.split(needle).length - 1;
 function setupFixtures() {
   for (const p of [proj1, proj2, proj3]) fs.mkdirSync(p, { recursive: true });
   fs.writeFileSync(path.join(proj1, 'CLAUDE.md'), '# Shop app\n\nOriginal notes that must survive.\n');
+  fs.mkdirSync(path.join(proj1, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(proj1, 'src', 'login.js'), 'export const login = () => {};\n');
+  fs.mkdirSync(path.join(proj1, 'node_modules', 'junk'), { recursive: true });
+  fs.writeFileSync(path.join(proj1, 'node_modules', 'junk', 'index.js'), 'ignored\n');
   fs.writeFileSync(path.join(proj3, '.membridge-off'), '');
 
   // Claude Code sessions
@@ -150,6 +154,37 @@ async function main() {
   check('recently modified files are listed', () => {
     assert.ok(claudeMd().includes('login.js'), 'edited file missing');
   });
+  check('project memory DB is created with entries referencing files', () => {
+    const db = JSON.parse(read(path.join(proj1, '.membridge', 'memory.json')));
+    assert.ok(db.entries.find(e => e.ask.includes('Build the login page')), 'entry missing');
+    // the 10:02 edit belongs to the most recent ask before it (10:01)
+    const withFile = db.entries.find(e => e.files.includes('src/login.js'));
+    assert.ok(withFile, 'no entry references the edited file');
+    assert.strictEqual(withFile.source, 'Claude Code');
+    assert.strictEqual(withFile.ts, '2026-07-09T10:01:00.000Z', 'edit attached to wrong ask');
+    const banned = db.entries.find(e => e.ask.includes('sk-test1234567890abcdef'));
+    assert.ok(!banned, 'secret leaked into memory DB');
+  });
+  check('file index covers project files and skips ignored dirs', () => {
+    const db = JSON.parse(read(path.join(proj1, '.membridge', 'memory.json')));
+    const paths = db.fileIndex.files.map(f => f.path);
+    assert.ok(paths.includes('src/login.js'), 'src/login.js not indexed');
+    assert.ok(paths.includes('CLAUDE.md'), 'CLAUDE.md not indexed');
+    assert.ok(!paths.some(p => p.startsWith('node_modules')), 'node_modules indexed');
+    assert.ok(!paths.some(p => p.startsWith('.membridge')), 'own dir indexed');
+    assert.ok(db.fileIndex.files.every(f => typeof f.size === 'number' && f.mtime), 'index entries incomplete');
+  });
+  check('memory.md renders the log and the injected block points to it', () => {
+    const md = read(path.join(proj1, '.membridge', 'memory.md'));
+    assert.ok(md.includes('Claude Code'), 'source missing in memory.md');
+    assert.ok(md.includes('`src/login.js`'), 'file reference missing in memory.md');
+    assert.ok(md.includes('File index:'), 'file index summary missing');
+    assert.ok(claudeMd().includes('.membridge/memory.md'), 'context block does not point at memory log');
+  });
+  check('excluded/paused projects get no memory DB', () => {
+    assert.ok(!fs.existsSync(path.join(proj2, '.membridge')), 'excluded project got a DB');
+    assert.ok(!fs.existsSync(path.join(proj3, '.membridge')), 'marker project got a DB');
+  });
   check('excluded project is untouched', () => {
     assert.ok(!fs.existsSync(path.join(proj2, 'CLAUDE.md')), 'exclude ignored');
     assert.ok(!fs.existsSync(path.join(proj2, 'AGENTS.md')), 'exclude ignored');
@@ -182,11 +217,12 @@ async function main() {
   });
 
   // --- 3. remove ---
-  check('remove strips the block and restores the original file', () => {
-    const config = util.getConfig();
-    for (const t of config.targets) digest.removeBlock(path.join(proj1, t));
+  check('remove strips blocks, restores originals, deletes the memory DB', () => {
+    const out = spawnSync(process.execPath, [BIN, 'remove', '--project', proj1], { encoding: 'utf8' });
+    assert.strictEqual(out.status, 0, out.stderr);
     assert.strictEqual(claudeMd(), '# Shop app\n\nOriginal notes that must survive.\n', 'original not restored');
     assert.ok(!fs.existsSync(path.join(proj1, 'AGENTS.md')), 'block-only file should be deleted');
+    assert.ok(!fs.existsSync(path.join(proj1, '.membridge')), 'memory DB not removed');
   });
 
   // --- 4. daemon + dashboard ---
@@ -230,6 +266,7 @@ async function main() {
     check('paused project is not injected even with new activity', () => {
       assert.ok(!fs.existsSync(path.join(proj1, 'AGENTS.md')), 'paused project was written');
       assert.ok(!claudeMd().includes('Implement the secret feature Zeta'), 'paused project was written');
+      assert.ok(!fs.existsSync(path.join(proj1, '.membridge')), 'paused project got a memory DB');
     });
 
     // resume + force a project sync

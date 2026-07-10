@@ -6,6 +6,7 @@ const { spawn, spawnSync } = require('child_process');
 const util = require('../lib/util');
 const { scanAll, syncOnce, getAdapters, findProjectKey } = require('../lib/scan');
 const digest = require('../lib/digest');
+const memorydb = require('../lib/memorydb');
 const { startServer } = require('../lib/server');
 const autostart = require('../lib/autostart');
 const pkg = require('../package.json');
@@ -174,6 +175,10 @@ function cmdRemove() {
         console.log(`  ${res === 'deleted' ? 'deleted (was only the memory block)' : 'block removed'}: ${file}`);
         n++;
       }
+    }
+    if (memorydb.removeProjectMemory(key)) {
+      console.log(`  removed: ${path.join(key, memorydb.DIR_NAME)}`);
+      n++;
     }
   }
   console.log(n ? `Done — ${n} file(s) cleaned.` : 'No MemBridge blocks found.');

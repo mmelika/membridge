@@ -1,6 +1,8 @@
 node_modules/
 *.log
 .DS_Store
+dist/
+app/lib/
 
 # internal business plan stays local
 BUSINESS.md
