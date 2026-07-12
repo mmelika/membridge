@@ -546,6 +546,26 @@ async function main() {
   process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
   const HOME_A = process.env.MEMBRIDGE_HOME; // homeDir() reads env per call
   const sameKey = (a, b) => a.toLowerCase() === path.resolve(b).toLowerCase();
+
+  check('team: backend resolves env > config > baked default', () => {
+    // env override in force now
+    assert.ok(teamsync.backend(util.getConfig()), 'env override not honored');
+    // with env cleared, an unfilled build (empty baked backend.json) is off,
+    // and a config override still turns it on
+    const savedUrl = process.env.MEMBRIDGE_TEAM_URL;
+    const savedKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    try {
+      assert.strictEqual(teamsync.backend({}), null, 'empty baked build should be off');
+      assert.ok(teamsync.backend({ team: { url: 'https://x.supabase.co', anonKey: 'k' } }),
+        'config override not honored');
+    } finally {
+      process.env.MEMBRIDGE_TEAM_URL = savedUrl;
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey;
+    }
+  });
+
   try {
     // Marco: signup, team, link the shop-app project, first push.
     const credsA = await teamsync.signup(util.getConfig(), 'marco@test.dev', 'pw-a', 'Marco');

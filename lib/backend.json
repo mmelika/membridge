@@ -1,0 +1,5 @@
+{
+  "$comment": "Baked-in MemBridge team-sync backend, shipped with the app so end users never configure anything — they just `membridge signup`. OPERATOR (one-time): create ONE Supabase project, run supabase/schema.sql in its SQL editor, then paste the Project URL and the anon public key below. Both are safe to commit and ship publicly — the anon key is designed to live in client apps, and row-level security is what actually protects the data. Leave empty to disable team sync in a build.",
+  "url": "",
+  "anonKey": ""
+}

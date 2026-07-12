@@ -96,17 +96,10 @@ Teammates' AI activity (MemBridge team sync):
 - 2026-07-12 09:00 · Andrew · Codex: Refactor checkout validation — files: src/checkout.js
 ```
 
-The backend is a [Supabase](https://supabase.com) project **you** control
-(free tier is plenty). One-time setup per team:
-
-1. Create a Supabase project, open its SQL Editor, and run
-   [`supabase/schema.sql`](supabase/schema.sql) from this repo.
-2. Grab the Project URL and `anon` public key from Settings → API.
-
-Then on each machine:
+The backend ships with MemBridge — there is nothing to install or configure.
+Just sign up:
 
 ```bash
-membridge team setup --url https://<ref>.supabase.co --anon-key <anon key>
 membridge signup --email you@company.com --password ... --name "Marco"
 
 # one person creates the team...
@@ -127,6 +120,25 @@ redacted digest entries you see in `.membridge/memory.md` — timestamps, tool
 names, redacted asks, relative file paths. Never file contents, never
 unlinked projects, and row-level security means only your team's members can
 read any of it.
+
+<details>
+<summary><b>Running your own backend</b> (self-hosting / operators)</summary>
+
+Team sync talks to a Supabase project. Official builds ship pointed at the
+hosted MemBridge backend (baked into [`lib/backend.json`](lib/backend.json)),
+so users configure nothing. To run your own instead:
+
+1. Create a [Supabase](https://supabase.com) project (free tier is plenty),
+   open its SQL Editor, and run [`supabase/schema.sql`](supabase/schema.sql).
+2. Grab the Project URL and `anon` public key from Settings → API. Both are
+   safe to publish — the anon key is meant for client apps, and row-level
+   security is what protects the data.
+3. Either bake them into `lib/backend.json` before building, or point an
+   existing install at them per-machine:
+   ```bash
+   membridge team setup --url https://<ref>.supabase.co --anon-key <anon key>
+   ```
+</details>
 
 ## Quick start
 

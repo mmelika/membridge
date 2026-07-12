@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1 — 2026-07-12
+
+- **Team sync is now zero-config for users.** The Supabase backend is baked
+  into the build (`lib/backend.json`, filled once by whoever operates the
+  MemBridge backend), so end users no longer run `team setup` — they just
+  `membridge signup` and go. `team setup` remains as an advanced override for
+  self-hosting your own backend. (Backend resolution order: env → config →
+  baked default.)
+
 ## 0.4.0 — 2026-07-12
 
 - **Team sync (beta)**: link a project to a team and every member's MemBridge

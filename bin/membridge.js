@@ -299,21 +299,23 @@ async function cmdTeam() {
   const sub = args[1] || 'list';
   const config = util.getConfig();
 
+  // Advanced/self-host override: point MemBridge at your own backend instead
+  // of the one shipped with the build. Normal users never need this.
   if (sub === 'setup') {
     const url = opt('--url');
     const anonKey = opt('--anon-key');
     if (!url || !anonKey) {
-      die('Usage: membridge team setup --url https://<ref>.supabase.co --anon-key <anon key>\nCreate a free Supabase project, run supabase/schema.sql in its SQL editor, then paste the Project URL and anon public key from Settings -> API.');
+      die('Usage: membridge team setup --url https://<ref>.supabase.co --anon-key <anon key>\n(Advanced — self-hosting your own backend. On a normal build team sync already works; just run `membridge signup`.)');
     }
     const raw = util.loadUserConfig();
     raw.team = { url, anonKey };
     util.saveUserConfig(raw);
-    console.log('Team backend saved. Next: membridge signup --email ... --password ...');
+    console.log('Custom team backend saved (overrides the built-in one).');
     return;
   }
 
   if (!teamsync.isConfigured(config)) {
-    die('No team backend configured yet — run `membridge team setup` first (see the Team sync section of the README).');
+    die('Team sync is not available in this build. If you are building MemBridge yourself, an operator must fill lib/backend.json (see the Team sync section of the README); or point at your own backend with `membridge team setup`.');
   }
 
   if (sub === 'create') {
@@ -409,7 +411,6 @@ Usage: membridge <command>
   help                this text
 
 Team sync (share project memory with your team — see README):
-  team setup --url <supabase-url> --anon-key <key>   point at your backend
   signup / login --email <e> --password <p> [--name "You"]
   logout
   team create <name>       new team (prints the invite code)
@@ -417,6 +418,7 @@ Team sync (share project memory with your team — see README):
   team link [--project <path>] [--team <id>]   sync this project with the team
   team unlink [--project <path>]               stop syncing this project
   team list                your login, teams and linked projects
+  team setup ...           advanced: point at your own self-hosted backend
 
 Config: ${util.configPath()}
 Docs:   https://github.com/mmelika/membridge#readme`);
