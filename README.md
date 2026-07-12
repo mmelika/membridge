@@ -83,6 +83,51 @@ thing):
 - **Settings** — sync interval and target files, editable live. No
   config-file editing required.
 
+## Team sync (beta) — shared memory for your whole team
+
+Solo MemBridge syncs your own AI tools with each other. Team sync extends
+that to your teammates: everyone's MemBridge pushes its per-project memory
+entries (already redacted) to a shared backend and pulls everyone else's
+down, so **your Claude Code knows what your teammate's Codex did an hour
+ago** — with attribution:
+
+```markdown
+Teammates' AI activity (MemBridge team sync):
+- 2026-07-12 09:00 · Andrew · Codex: Refactor checkout validation — files: src/checkout.js
+```
+
+The backend is a [Supabase](https://supabase.com) project **you** control
+(free tier is plenty). One-time setup per team:
+
+1. Create a Supabase project, open its SQL Editor, and run
+   [`supabase/schema.sql`](supabase/schema.sql) from this repo.
+2. Grab the Project URL and `anon` public key from Settings → API.
+
+Then on each machine:
+
+```bash
+membridge team setup --url https://<ref>.supabase.co --anon-key <anon key>
+membridge signup --email you@company.com --password ... --name "Marco"
+
+# one person creates the team...
+membridge team create acme        # prints the invite code
+# ...everyone else joins it
+membridge team join <invite-code>
+
+# inside a project you want to share
+membridge team link               # commit .membridge/team.json for teammates
+```
+
+From then on the daemon syncs the linked project with your team on its
+normal interval. `membridge team list` shows your teams and linked projects;
+`membridge team unlink` stops sharing a project.
+
+**What leaves your machine (and only for linked projects):** the same
+redacted digest entries you see in `.membridge/memory.md` — timestamps, tool
+names, redacted asks, relative file paths. Never file contents, never
+unlinked projects, and row-level security means only your team's members can
+read any of it.
+
 ## Quick start
 
 **macOS menu-bar app:** download `MemBridge-<version>.dmg` from the
@@ -124,6 +169,8 @@ no admin rights needed). The tray app has its own "Start at login" toggle.
 | `membridge scan` | Read-only report of discovered tools and projects |
 | `membridge remove [--project <path>]` | Strip injected memory blocks |
 | `membridge enable-autostart` / `disable-autostart` | Run at login |
+| `membridge team <setup\|create\|join\|link\|unlink\|list>` | Team sync (see above) |
+| `membridge signup` / `login` / `logout` | Team sync account |
 
 ## Configuration
 
@@ -175,8 +222,10 @@ automatically.
 
 ## Privacy and security
 
-- **100% local.** The daemon binds to `127.0.0.1` only; nothing ever leaves
-  your machine. No telemetry, no accounts.
+- **100% local by default.** The daemon binds to `127.0.0.1` only; nothing
+  leaves your machine unless you opt a project into team sync — and then
+  only redacted digest entries go to a Supabase backend you control. No
+  telemetry, no third-party accounts.
 - **Secrets are redacted** before anything is written into a context file:
   common API-key shapes (`sk-…`, `AKIA…`, `ghp_…`, `key=value`) are scrubbed
   by default, and you can add your own patterns.
@@ -234,12 +283,13 @@ step), [`bin/membridge.js`](bin/membridge.js) (CLI). Recent changes are in
 
 ## Roadmap
 
+- Team sync v2: dashboard UI for teams, hosted backend option (SaaS),
+  presence ("Andrew's Claude Code is working in src/checkout right now")
 - LLM-powered summaries (optional API key): richer memory in fewer lines
 - Neural map v2: calmer 2D layout by default, 3D behind a toggle
 - Import ChatGPT / claude.ai data exports, and a `membridge mcp` server so
   MCP-capable clients can query project memory live
 - First-class adapters for Gemini CLI, Cursor, opencode, Copilot CLI
-- Team sync: share project memory across machines
 - Signed + notarized macOS builds
 
 ## License

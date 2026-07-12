@@ -19,6 +19,8 @@ const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { buildGraph } = require('../lib/graph');
 const { startServer } = require('../lib/server');
+const teamsync = require('../lib/teamsync');
+const { createMockSupabase } = require('./mock-supabase');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -535,6 +537,163 @@ async function main() {
       assert.ok(read(util.logPath()).includes(`dashboard on http://127.0.0.1:${PORT3}`), 'no bind log line');
     });
     await new Promise(r => srv.close(r));
+  }
+
+  // --- 8. team sync (mock Supabase: GoTrue + PostgREST + membership checks) ---
+  const mock = createMockSupabase();
+  await new Promise(r => mock.server.listen(17945, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17945';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  const HOME_A = process.env.MEMBRIDGE_HOME; // homeDir() reads env per call
+  const sameKey = (a, b) => a.toLowerCase() === path.resolve(b).toLowerCase();
+  try {
+    // Marco: signup, team, link the shop-app project, first push.
+    const credsA = await teamsync.signup(util.getConfig(), 'marco@test.dev', 'pw-a', 'Marco');
+    check('team: signup stores credentials outside any project, chmod 600', () => {
+      assert.strictEqual(credsA.email, 'marco@test.dev');
+      assert.ok(teamsync.credentialsPath().startsWith(HOME_A), 'credentials not in MemBridge home');
+      const stored = JSON.parse(read(teamsync.credentialsPath()));
+      assert.strictEqual(stored.displayName, 'Marco');
+      assert.ok(stored.refreshToken, 'refresh token missing');
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(teamsync.credentialsPath()).mode & 0o777, 0o600);
+      }
+    });
+
+    const team = await teamsync.createTeam(util.getConfig(), 'Acme');
+    const linkA = await teamsync.linkProject(util.getConfig(), proj1, team.team_id, 'Acme');
+    check('team: create + link write .membridge/team.json with the project id', () => {
+      assert.ok(team.team_id && team.invite_code, 'team ids missing');
+      const l = JSON.parse(read(path.join(proj1, '.membridge', 'team.json')));
+      assert.strictEqual(l.projectId, linkA.projectId);
+      assert.strictEqual(l.teamId, team.team_id);
+    });
+
+    // proj1 was deleted+revived earlier, so its live history is the single
+    // "Ship the checkout flow" ask — enough to prove the push path end to end.
+    fs.appendFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Add the order confirmation email' }, cwd: proj1, timestamp: '2026-07-12T08:00:00.000Z' }) + '\n' +
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Wire the receipt PDF, api_key=sk-test1234567890abcdef' }, cwd: proj1, timestamp: '2026-07-12T08:01:00.000Z' }) + '\n',
+    );
+    syncOnce(); // fold the new asks into proj1's history before the first push
+    const rA = await teamsync.syncTeams();
+    check('team: push uploads only redacted digest entries', () => {
+      assert.ok(rA.synced.some(k => sameKey(k, proj1)), `synced said: ${JSON.stringify(rA)}`);
+      assert.ok(mock.entries.length >= 3, `expected >=3 pushed entries, got ${mock.entries.length}`);
+      const body = JSON.stringify(mock.entries);
+      assert.ok(!body.includes('sk-test1234567890abcdef'), 'secret reached the server');
+      assert.ok(body.includes('[redacted]'), 'redaction marker missing server-side');
+      assert.ok(mock.entries.every(e => e.author_name === 'Marco'), 'author attribution wrong');
+    });
+
+    const pushedCount = mock.entries.length;
+    await teamsync.syncTeams();
+    check('team: re-sync is idempotent (cursor + server dedupe)', () => {
+      assert.strictEqual(mock.entries.length, pushedCount, 'duplicate entries pushed');
+    });
+
+    // Andrew: second machine (own MemBridge home), same repo basename, joins
+    // by invite code — link_project maps his clone to the same project row.
+    const projB = path.join(ROOT, 'projects-b', 'shop-app');
+    fs.mkdirSync(projB, { recursive: true });
+    fs.writeFileSync(path.join(projB, 'CLAUDE.md'), '# B clone\n\nAndrew notes.\n');
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-b');
+    util.ensureConfig();
+    const stateB = util.loadState();
+    stateB.projects = {
+      [projB]: {
+        events: [{ ts: '2026-07-12T09:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'Refactor checkout validation', session: 'b1' }],
+      },
+    };
+    util.saveState(stateB);
+    await teamsync.signup(util.getConfig(), 'andrew@test.dev', 'pw-b', 'Andrew');
+    const joined = await teamsync.joinTeam(util.getConfig(), team.invite_code);
+    const linkB = await teamsync.linkProject(util.getConfig(), projB, joined.team_id, joined.team_name);
+    check('team: invite-code join maps the clone to the same project row', () => {
+      assert.strictEqual(joined.team_id, team.team_id);
+      assert.strictEqual(joined.team_name, 'Acme');
+      assert.strictEqual(linkB.projectId, linkA.projectId, 'clone got a different project row');
+    });
+
+    const rB = await teamsync.syncTeams();
+    for (const k of rB.changed) syncOnce({ project: k });
+    check("team: Andrew pulls Marco's asks into his context block", () => {
+      assert.ok(rB.changed.some(k => sameKey(k, projB)), `changed said: ${JSON.stringify(rB)}`);
+      const md = read(path.join(projB, 'CLAUDE.md'));
+      assert.ok(md.startsWith('# B clone'), 'his own notes were lost');
+      assert.ok(md.includes("Teammates' AI activity"), 'team section missing');
+      assert.ok(md.includes('Marco'), 'author name missing');
+      assert.ok(md.includes('Ship the checkout flow'), "Marco's ask missing");
+      assert.ok(!md.includes('sk-test1234567890abcdef'), 'secret leaked into teammate file');
+    });
+
+    // Back to Marco: his next pass pulls Andrew's Codex ask.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const rA2 = await teamsync.syncTeams();
+    for (const k of rA2.changed) syncOnce({ project: k });
+    check("team: Marco pulls Andrew's ask back, with attribution", () => {
+      assert.ok(rA2.changed.some(k => sameKey(k, proj1)), `changed said: ${JSON.stringify(rA2)}`);
+      const md = claudeMd();
+      assert.ok(md.includes("Teammates' AI activity"), 'team section missing');
+      assert.ok(md.includes('Andrew · Codex: Refactor checkout validation'), "Andrew's ask missing");
+    });
+
+    // Stale token: the next call must transparently use the refresh grant.
+    const stale = teamsync.loadCredentials();
+    stale.expiresAt = Date.now() - 1000;
+    fs.writeFileSync(teamsync.credentialsPath(), JSON.stringify(stale));
+    const refreshesBefore = mock.stats.refreshCalls;
+    await teamsync.getAccessToken(util.getConfig());
+    check('team: stale access token refreshes transparently', () => {
+      assert.strictEqual(mock.stats.refreshCalls, refreshesBefore + 1, 'refresh grant not used');
+    });
+
+    // Mallory: signed up but never joined the team; a hand-crafted team.json
+    // must not let her push into (or read) the team's project.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-c');
+    util.ensureConfig();
+    const projC = path.join(ROOT, 'projects-c', 'shop-app');
+    fs.mkdirSync(path.join(projC, '.membridge'), { recursive: true });
+    fs.writeFileSync(path.join(projC, '.membridge', 'team.json'),
+      JSON.stringify({ projectId: linkA.projectId, teamId: team.team_id }));
+    const stateC = util.loadState();
+    stateC.projects = {
+      [projC]: {
+        events: [{ ts: '2026-07-12T10:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'sneaky non-member write', session: 'c1' }],
+      },
+    };
+    util.saveState(stateC);
+    await teamsync.signup(util.getConfig(), 'mallory@test.dev', 'pw-c', 'Mallory');
+    const rC = await teamsync.syncTeams();
+    check('team: a non-member cannot push into or pull from the project', () => {
+      assert.strictEqual(rC.changed.length, 0, 'non-member pulled entries');
+      assert.strictEqual(rC.errors.length, 1, `errors said: ${JSON.stringify(rC.errors)}`);
+      assert.ok(/security|member/i.test(rC.errors[0]), `error said: ${rC.errors[0]}`);
+      assert.ok(!JSON.stringify(mock.entries).includes('sneaky'), 'non-member row was stored');
+      assert.ok(mock.stats.deniedInserts >= 1, 'mock never denied the insert');
+    });
+
+    // CLI: `team setup` persists the backend; `logout` clears credentials.
+    const HOME_CLI = path.join(ROOT, 'home-cli');
+    const envT = { ...process.env, MEMBRIDGE_HOME: HOME_CLI };
+    const setupOut = spawnSync(process.execPath,
+      [BIN, 'team', 'setup', '--url', 'http://127.0.0.1:17945', '--anon-key', 'anon-test'],
+      { env: envT, encoding: 'utf8' });
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const logoutOut = spawnSync(process.execPath, [BIN, 'logout'], { env: { ...process.env }, encoding: 'utf8' });
+    check('CLI: team setup persists the backend, logout clears credentials', () => {
+      assert.ok(/Team backend saved/.test(setupOut.stdout), `setup said: ${setupOut.stdout} ${setupOut.stderr}`);
+      const cfg = JSON.parse(read(path.join(HOME_CLI, 'config.json')));
+      assert.strictEqual(cfg.team.url, 'http://127.0.0.1:17945');
+      assert.ok(/Logged out/.test(logoutOut.stdout), `logout said: ${logoutOut.stdout}`);
+      assert.ok(!fs.existsSync(teamsync.credentialsPath()), 'credentials survive logout');
+    });
+  } finally {
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock.server.close(r));
   }
 
   // --- summary ---

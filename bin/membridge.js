@@ -9,6 +9,7 @@ const digest = require('../lib/digest');
 const memorydb = require('../lib/memorydb');
 const { startServer } = require('../lib/server');
 const autostart = require('../lib/autostart');
+const teamsync = require('../lib/teamsync');
 const pkg = require('../package.json');
 
 const args = process.argv.slice(2);
@@ -48,6 +49,21 @@ function cmdSync() {
   const result = syncOnce({ dryRun, project: opt('--project') });
   console.log(`${dryRun ? '[dry run] ' : ''}${result.newEvents} new event(s), ${result.projects.length} project(s) affected`);
   printChanges(result);
+  if (!dryRun && teamsync.isConfigured(util.getConfig())) {
+    return teamSyncPass({ project: opt('--project') }).catch(err => console.error(`team sync failed: ${err.message}`));
+  }
+}
+
+// One team push/pull pass; pulled teammate entries re-render those projects'
+// context blocks right away.
+async function teamSyncPass(opts = {}) {
+  const r = await teamsync.syncTeams(opts);
+  for (const key of r.changed) syncOnce({ project: key });
+  for (const e of r.errors) util.log(`team sync: ${e}`);
+  if (r.synced.length || r.errors.length) {
+    console.log(`team sync: ${r.synced.length} project(s), ${r.changed.length} with new teammate activity${r.errors.length ? `, ${r.errors.length} error(s) (see log)` : ''}`);
+  }
+  return r;
 }
 
 function cmdScan() {
@@ -109,9 +125,26 @@ function cmdDaemon() {
       if (r.changes.length) {
         util.log(`sync: ${r.newEvents} new event(s) -> ${r.changes.map(c => c.file).join('; ')}`);
       }
+      teamTick();
     } catch (err) {
       util.log(`sync error: ${err.stack || err}`);
     }
+  };
+  // Team sync rides the same tick, guarded so a slow network round cannot
+  // overlap the next one. Best-effort: errors are logged, local sync is never
+  // blocked by the backend being unreachable.
+  let teamBusy = false;
+  const teamTick = () => {
+    if (teamBusy || !teamsync.isConfigured(util.getConfig())) return;
+    teamBusy = true;
+    teamsync.syncTeams()
+      .then(r => {
+        for (const key of r.changed) syncOnce({ project: key });
+        for (const e of r.errors) util.log(`team sync: ${e}`);
+        if (r.changed.length) util.log(`team sync: pulled teammate activity into ${r.changed.length} project(s)`);
+      })
+      .catch(err => util.log(`team sync error: ${err.message}`))
+      .finally(() => { teamBusy = false; });
   };
   // Chained timeout instead of setInterval: the delay is re-read from config
   // each round, so an interval change in Settings applies from the next check
@@ -222,6 +255,137 @@ function cmdDashboard() {
   console.log(`Dashboard: ${url}`);
 }
 
+// ---------------------------------------------------------------------------
+// Team sync commands (Supabase backend, see supabase/schema.sql + README)
+// ---------------------------------------------------------------------------
+function die(msg) {
+  console.error(msg);
+  process.exit(1);
+}
+
+function credArgs() {
+  const email = opt('--email');
+  const password = opt('--password') || process.env.MEMBRIDGE_PASSWORD || null;
+  if (!email || !password) {
+    die('Usage: membridge <signup|login> --email you@company.com --password <pass> [--name "Your Name"]\n(The password can also come from the MEMBRIDGE_PASSWORD env var.)');
+  }
+  return { email, password, name: opt('--name') };
+}
+
+async function cmdSignup() {
+  util.ensureConfig();
+  const { email, password, name } = credArgs();
+  const r = await teamsync.signup(util.getConfig(), email, password, name);
+  if (r.needsConfirmation) {
+    console.log(`Check ${email} for a confirmation link, then run: membridge login --email ${email} --password ...`);
+    return;
+  }
+  console.log(`Signed up and logged in as ${r.email} (display name: ${r.displayName}).`);
+}
+
+async function cmdLogin() {
+  util.ensureConfig();
+  const { email, password, name } = credArgs();
+  const r = await teamsync.login(util.getConfig(), email, password, name);
+  console.log(`Logged in as ${r.email} (display name: ${r.displayName}).`);
+}
+
+function cmdLogout() {
+  console.log(teamsync.clearCredentials() ? 'Logged out.' : 'Already logged out.');
+}
+
+async function cmdTeam() {
+  util.ensureConfig();
+  const sub = args[1] || 'list';
+  const config = util.getConfig();
+
+  if (sub === 'setup') {
+    const url = opt('--url');
+    const anonKey = opt('--anon-key');
+    if (!url || !anonKey) {
+      die('Usage: membridge team setup --url https://<ref>.supabase.co --anon-key <anon key>\nCreate a free Supabase project, run supabase/schema.sql in its SQL editor, then paste the Project URL and anon public key from Settings -> API.');
+    }
+    const raw = util.loadUserConfig();
+    raw.team = { url, anonKey };
+    util.saveUserConfig(raw);
+    console.log('Team backend saved. Next: membridge signup --email ... --password ...');
+    return;
+  }
+
+  if (!teamsync.isConfigured(config)) {
+    die('No team backend configured yet — run `membridge team setup` first (see the Team sync section of the README).');
+  }
+
+  if (sub === 'create') {
+    const name = args[2];
+    if (!name) die('Usage: membridge team create <name>');
+    const t = await teamsync.createTeam(config, name);
+    console.log(`Team created.\n  id:          ${t.team_id}\n  invite code: ${t.invite_code}\nTeammates join with: membridge team join ${t.invite_code}`);
+    return;
+  }
+
+  if (sub === 'join') {
+    const code = args[2];
+    if (!code) die('Usage: membridge team join <invite-code>');
+    const t = await teamsync.joinTeam(config, code);
+    console.log(`Joined team "${t.team_name}" (${t.team_id}).`);
+    return;
+  }
+
+  if (sub === 'link') {
+    const projectPath = path.resolve(opt('--project') || process.cwd());
+    let teamId = opt('--team');
+    const teams = await teamsync.listTeams(config);
+    if (!teams.length) die('You are not in any team yet — `membridge team create <name>` or `team join <code>` first.');
+    if (!teamId && teams.length === 1) teamId = teams[0].team_id;
+    if (!teamId) {
+      die(`You are in ${teams.length} teams — pick one with --team <id>:\n` +
+        teams.map(t => `  ${t.team_id}  ${t.team_name}`).join('\n'));
+    }
+    const team = teams.find(t => t.team_id === teamId);
+    const link = await teamsync.linkProject(config, projectPath, teamId, team ? team.team_name : '');
+    console.log(`Linked ${projectPath} to team "${team ? team.team_name : teamId}".\nRedacted memory entries for this project now sync with your team (${path.join(memorydb.DIR_NAME, 'team.json')} — commit it so teammates' clones auto-link).`);
+    // First pass right away so the link is visible without waiting a tick.
+    await teamSyncPass({ project: projectPath });
+    return void link;
+  }
+
+  if (sub === 'unlink') {
+    const projectPath = path.resolve(opt('--project') || process.cwd());
+    console.log(teamsync.unlinkProject(projectPath)
+      ? `Unlinked ${projectPath} — this project no longer syncs with any team.`
+      : 'This project was not linked.');
+    return;
+  }
+
+  if (sub === 'list') {
+    const creds = teamsync.loadCredentials();
+    console.log(creds ? `Logged in as ${creds.email} (${creds.displayName})` : 'Not logged in.');
+    if (!creds) return;
+    const teams = await teamsync.listTeams(config);
+    if (!teams.length) {
+      console.log('No teams yet — create one with: membridge team create <name>');
+      return;
+    }
+    console.log('Teams:');
+    for (const t of teams) {
+      console.log(`  ${t.team_name} (${t.role})  id: ${t.team_id}${t.role === 'owner' ? `  invite: ${t.invite_code}` : ''}`);
+    }
+    const state = util.loadState();
+    const linked = Object.keys(state.projects || {}).filter(k => teamsync.loadTeamLink(k));
+    if (linked.length) {
+      console.log('Linked projects:');
+      for (const k of linked) {
+        const l = teamsync.loadTeamLink(k);
+        console.log(`  ${k} -> ${l.teamName || l.teamId}`);
+      }
+    }
+    return;
+  }
+
+  die(`Unknown team subcommand: ${sub}\nUsage: membridge team <setup|create|join|link|unlink|list>`);
+}
+
 function cmdHelp() {
   console.log(`MemBridge v${pkg.version} — shared memory across your AI coding tools
 
@@ -244,6 +408,16 @@ Usage: membridge <command>
   daemon              run in the foreground (used internally / by services)
   help                this text
 
+Team sync (share project memory with your team — see README):
+  team setup --url <supabase-url> --anon-key <key>   point at your backend
+  signup / login --email <e> --password <p> [--name "You"]
+  logout
+  team create <name>       new team (prints the invite code)
+  team join <invite-code>  join a teammate's team
+  team link [--project <path>] [--team <id>]   sync this project with the team
+  team unlink [--project <path>]               stop syncing this project
+  team list                your login, teams and linked projects
+
 Config: ${util.configPath()}
 Docs:   https://github.com/mmelika/membridge#readme`);
 }
@@ -257,6 +431,10 @@ const commands = {
   status: cmdStatus,
   remove: cmdRemove,
   dashboard: cmdDashboard,
+  signup: cmdSignup,
+  login: cmdLogin,
+  logout: cmdLogout,
+  team: cmdTeam,
   'enable-autostart': () => console.log(autostart.enable()),
   'disable-autostart': () => console.log(autostart.disable()),
   help: cmdHelp,
@@ -272,4 +450,7 @@ if (!fn) {
   cmdHelp();
   process.exit(1);
 }
-fn();
+Promise.resolve(fn()).catch(err => {
+  console.error(err && err.message ? err.message : err);
+  process.exit(1);
+});

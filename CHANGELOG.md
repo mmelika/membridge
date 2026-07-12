@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-07-12
+
+- **Team sync (beta)**: link a project to a team and every member's MemBridge
+  pushes its redacted per-project memory entries to a shared Supabase backend
+  (yours — run `supabase/schema.sql` in a free project) and pulls teammates'
+  entries down. The injected context block gains a "Teammates' AI activity"
+  section with author attribution, so your Claude Code knows what a
+  teammate's Codex did. New commands: `team setup/create/join/link/unlink/
+  list`, `signup`, `login`, `logout`. Invite-code joins; clones map to one
+  project row via the normalized git remote (name fallback). Row-level
+  security restricts every row to team members; only already-redacted digest
+  entries ever leave the machine, and only for explicitly linked projects.
+  Auth tokens live in `~/.membridge/credentials.json` (chmod 600). Team sync
+  is best-effort on top of local sync: an unreachable backend never blocks
+  local syncing. (New: `lib/teamsync.js`, `supabase/schema.sql`; the suite
+  gains an offline mock Supabase and now has 60 checks.)
+
 ## 0.3.0 — 2026-07-12
 
 - **Project pages**: the Overview is now a clean projects grid (name, tool
