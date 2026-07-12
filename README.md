@@ -65,6 +65,45 @@ than the brief summary can follow the reference. Add `.membridge/` to your
 project's `.gitignore` if you don't want the memory committed — or commit it
 to share AI context with your whole team.
 
+## The dashboard
+
+`membridge dashboard` opens a local web UI (the menu-bar app shows the same
+thing):
+
+- **Projects grid** — every project with AI activity: tool badges, last
+  activity, paused state. Click one for its page.
+- **Project pages** — the full ask-by-ask activity feed with the files each
+  ask touched; a Memory tab showing exactly what gets injected where, with a
+  read-only view of the full memory log; pause/resume and delete; and a
+  **Copy for AI** button that puts a trimmed, redacted digest on your
+  clipboard for pasting into ChatGPT, claude.ai, or any web AI that cannot
+  see your disk.
+- **Neural map** — a force-directed map of every chat across every project,
+  linked by shared files and shared ideas.
+- **Settings** — bring-your-own-key, planner model, sync interval and target
+  files. No config-file editing required.
+
+## Roadmaps — the bring-your-own-key upgrade
+
+The free core never talks to any API. Add your own Anthropic API key in
+Settings and each project's **Plan tab** becomes a roadmap generator:
+
+- Describe what you want to build next; the estimated cost sits on the
+  button before you click (about 1¢ per roadmap with the default model).
+- You get a phased plan where **every task names the AI model that should do
+  it** — "Everyday — Haiku" up to "Frontier — Fable", plus an independent
+  "Cross-check — Codex" — each with a one-line reason and a size. The
+  routing philosophy is baked in: start cheap, escalate on failure — never
+  the reverse.
+- The actual cost, from real usage, is shown afterwards. The plan is saved
+  to `.membridge/plan.json`, and one line — `Current roadmap: …` — is
+  written into the shared memory block, **so Claude Code and Codex see the
+  plan too**.
+- What's sent to Anthropic (with your key, only when you click Generate):
+  the project's name, your goal, recent asks (already redacted), file paths
+  touched, and top-level folder names. Never file contents, never other
+  projects.
+
 ## Quick start
 
 **macOS menu-bar app:** download `MemBridge-<version>.dmg` from the
@@ -157,8 +196,12 @@ automatically.
 
 ## Privacy and security
 
-- **100% local.** The daemon binds to `127.0.0.1` only; nothing ever leaves
-  your machine. No telemetry, no accounts.
+- **100% local by default.** The daemon binds to `127.0.0.1` only; the free
+  core sends nothing anywhere. No telemetry, no accounts. The one optional
+  network call is the roadmap generator: your own Anthropic key, only when
+  you click Generate, sending only the redacted digest listed above. The key
+  lives in `~/.membridge/config.json` (chmod 600), never in any project
+  folder, and is never shown back to the dashboard page.
 - **Secrets are redacted** before anything is written into a context file:
   common API-key shapes (`sk-…`, `AKIA…`, `ghp_…`, `key=value`) are scrubbed
   by default, and you can add your own patterns.
@@ -167,6 +210,11 @@ automatically.
   plus its own state in `~/.membridge`.
 
 ## FAQ
+
+**Do I need an API key?**
+No. Syncing works with zero keys and zero network. An Anthropic API key
+(added in Settings) unlocks exactly one optional feature: per-project
+roadmaps on the Plan tab, billed to your key at roughly a cent per roadmap.
 
 **How do I make Codex aware of what Claude Code did?**
 Install MemBridge and run `membridge start`. It summarizes recent Claude Code
@@ -199,11 +247,31 @@ The core stays zero-dependency; Electron is a devDependency used only by the
 tray app. CI runs the suite on Linux, Windows, and macOS across Node 18/20/22,
 and the "Build app" workflow produces macOS builds on Apple runners.
 
+The suite is fully offline and hermetic: it runs in temp dirs and talks to a
+mock Anthropic API (the advisor honors a `MEMBRIDGE_API_BASE` override). To
+hack on the dashboard against fake data without touching your real
+`~/.membridge`, run the daemon with the `MEMBRIDGE_HOME`,
+`MEMBRIDGE_CLAUDE_DIR`, `MEMBRIDGE_CODEX_DIR` and `MEMBRIDGE_PORT` env
+overrides pointed at a scratch folder.
+
+Code map: [`lib/scan.js`](lib/scan.js) (adapters → events → sync),
+[`lib/digest.js`](lib/digest.js) (memory block + injection),
+[`lib/memorydb.js`](lib/memorydb.js) (per-project `.membridge/` DB),
+[`lib/graph.js`](lib/graph.js) (neural-map data),
+[`lib/advisor.js`](lib/advisor.js) (BYOK roadmaps, raw fetch, zero deps),
+[`lib/server.js`](lib/server.js) (local HTTP API),
+[`lib/dashboard.js`](lib/dashboard.js) (the whole web UI, one file, no build
+step), [`bin/membridge.js`](bin/membridge.js) (CLI). The working product plan
+is [PLAN.md](PLAN.md); recent changes are in [CHANGELOG.md](CHANGELOG.md).
+
 ## Roadmap
 
-- LLM-powered summaries (optional API key): richer memory in fewer lines
-- First-class adapters for Gemini CLI, Cursor, opencode, Copilot CLI
-- Team sync: share project memory across machines
+The working plan lives in [PLAN.md](PLAN.md). Next up:
+
+- Neural map v2: calmer 2D layout by default, 3D behind a toggle
+- Import ChatGPT / claude.ai data exports, and a `membridge mcp` server so
+  MCP-capable clients can query project memory live
+- First-class adapters for Gemini CLI and Cursor
 - Signed + notarized macOS builds
 
 ## License

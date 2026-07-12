@@ -93,6 +93,18 @@ function cmdDaemon() {
 
   const tick = () => {
     try {
+      // An npm upgrade can migrate the state while this daemon keeps running:
+      // never write a state version this code did not produce — exit instead
+      // so a restart picks up the new code.
+      let onDisk = null;
+      try {
+        onDisk = JSON.parse(fs.readFileSync(util.statePath(), 'utf8'));
+      } catch {}
+      if (onDisk && typeof onDisk.version === 'number' && onDisk.version > util.STATE_VERSION) {
+        util.log(`state v${onDisk.version} is newer than this daemon writes (v${util.STATE_VERSION}); exiting for restart`);
+        cleanup();
+        return;
+      }
       const r = syncOnce();
       if (r.changes.length) {
         util.log(`sync: ${r.newEvents} new event(s) -> ${r.changes.map(c => c.file).join('; ')}`);
@@ -101,8 +113,15 @@ function cmdDaemon() {
       util.log(`sync error: ${err.stack || err}`);
     }
   };
+  // Chained timeout instead of setInterval: the delay is re-read from config
+  // each round, so an interval change in Settings applies from the next check
+  // without restarting the daemon.
+  const schedule = () => setTimeout(() => {
+    tick();
+    schedule();
+  }, util.getConfig().intervalSec * 1000);
   tick();
-  setInterval(tick, util.getConfig().intervalSec * 1000);
+  schedule();
   startServer(config.dashboardPort);
 }
 

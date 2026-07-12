@@ -6,3 +6,9 @@ app/lib/
 
 # internal business plan stays local
 BUSINESS.md
+
+# MemBridge's own output in its own repo: the daemon rewrites these while you
+# use AI tools here. Per-machine derived data, not source.
+.membridge/
+CLAUDE.md
+AGENTS.md
