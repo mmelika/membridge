@@ -3,6 +3,7 @@
 // dir via MEMBRIDGE_* env overrides — no real user files are read or written.
 const assert = require('assert');
 const fs = require('fs');
+const http = require('http');
 const net = require('net');
 const os = require('os');
 const path = require('path');
@@ -13,6 +14,7 @@ process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home');
 process.env.MEMBRIDGE_CLAUDE_DIR = path.join(ROOT, 'claude-projects');
 process.env.MEMBRIDGE_CODEX_DIR = path.join(ROOT, 'codex-sessions');
 process.env.MEMBRIDGE_INTERVAL = '3600'; // daemon ticks once at boot, then stays quiet
+delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not leak into settings tests
 
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
@@ -21,6 +23,7 @@ const { buildGraph } = require('../lib/graph');
 const { startServer, teamPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
+const advisorLib = require('../lib/advisor');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -312,9 +315,64 @@ async function main() {
   });
 
   // --- 5. daemon + dashboard ---
+  // Mock Anthropic API so key tests and roadmap generation stay offline
+  // (advisor honors MEMBRIDGE_API_BASE).
+  const GOOD_KEY = 'sk-ant-test-goodkey123';
+  const AUTH_FAIL = '{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}';
+  const CANNED_PLAN = {
+    summary: 'Shop-app has working OAuth login and early payment wiring; checkout is the next milestone.',
+    phases: [
+      {
+        title: 'Checkout flow',
+        tasks: [
+          { task: 'Build the cart page', why: 'Users need to review items before paying', model: 'sonnet', model_reason: 'Standard UI feature work', size: 'M' },
+          { task: 'Rename legacy price fields', why: 'Consistency before new code lands', model: 'haiku', model_reason: 'Mechanical rename', size: 'S' },
+        ],
+      },
+      {
+        title: 'Hardening',
+        tasks: [
+          { task: 'Debug the payment webhook retries', why: 'Orders drop when the webhook flakes', model: 'opus', model_reason: 'Tricky debugging across services', size: 'L' },
+        ],
+      },
+    ],
+    risks: ['Stripe sandbox limits could block end-to-end testing'],
+    questions: ['Should guest checkout ship in v1?'],
+  };
+  let lastPlanRequest = null;
+  const mockApi = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const authed = req.headers['x-api-key'] === GOOD_KEY;
+      if (req.method === 'POST' && req.url === '/v1/messages/count_tokens') {
+        res.writeHead(authed ? 200 : 401, { 'Content-Type': 'application/json' });
+        res.end(authed ? '{"input_tokens":1}' : AUTH_FAIL);
+      } else if (req.method === 'POST' && req.url === '/v1/messages') {
+        if (!authed) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(AUTH_FAIL);
+          return;
+        }
+        lastPlanRequest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          model: lastPlanRequest.model,
+          stop_reason: 'end_turn',
+          content: [{ type: 'text', text: JSON.stringify(CANNED_PLAN) }],
+          usage: { input_tokens: 4200, output_tokens: 900 },
+        }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+  });
+  await new Promise(r => mockApi.listen(17944, '127.0.0.1', r));
+
   const PORT = 17941;
   const child = spawn(process.execPath, [BIN, 'daemon'], {
-    env: { ...process.env, MEMBRIDGE_PORT: String(PORT) },
+    env: { ...process.env, MEMBRIDGE_PORT: String(PORT), MEMBRIDGE_API_BASE: 'http://127.0.0.1:17944' },
     stdio: 'ignore',
   });
   const base = `http://127.0.0.1:${PORT}`;
@@ -349,12 +407,11 @@ async function main() {
     check('dashboard page has the project view', () => {
       assert.ok(pageHtml.includes('view-project'), 'project view missing');
     });
-    check('dashboard page has the Settings screen without BYOK/plan remnants', () => {
+    check('dashboard page has the Settings screen with BYOK', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
       assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
-      assert.ok(!pageHtml.includes('Anthropic API key'), 'BYOK key section still on the page');
-      assert.ok(!pageHtml.includes('Planner model'), 'planner model section still on the page');
-      assert.ok(!pageHtml.includes('data-ptab="plan"'), 'Plan tab still on the page');
+      assert.ok(pageHtml.includes('Anthropic API key'), 'key section missing');
+      assert.ok(pageHtml.includes('Planner model'), 'model section missing');
     });
     const graphRes = await fetch(`${base}/api/graph`);
     const graphText = await graphRes.text();
@@ -448,18 +505,101 @@ async function main() {
       assert.strictEqual(memBad.status, 404, 'unknown project memory was served');
     });
 
-    // M2: settings (sync interval + injection targets)
+    // M2: settings + BYOK (key test goes to the mock Anthropic API)
     const st0 = await (await fetch(`${base}/api/settings`)).json();
     const stSave = await (await post(`${base}/api/settings`, {
-      intervalSec: 45, targets: ['CLAUDE.md', 'AGENTS.md'],
+      apiKey: GOOD_KEY, model: 'claude-sonnet-5', intervalSec: 45, targets: ['CLAUDE.md', 'AGENTS.md'],
     })).json();
-    check('settings: interval and targets save and persist', () => {
-      assert.ok(Array.isArray(st0.targets) && st0.targets.includes('CLAUDE.md'), 'targets missing from payload');
-      assert.deepStrictEqual(stSave.targets, ['CLAUDE.md', 'AGENTS.md']);
+    check('settings: key + model save, key never echoed back', () => {
+      assert.strictEqual(st0.hasKey, false, 'fresh config claims a key');
+      assert.strictEqual(st0.model, 'claude-haiku-4-5', 'default planner is not haiku');
+      assert.strictEqual(stSave.hasKey, true);
+      assert.strictEqual(stSave.keySource, 'config');
+      assert.strictEqual(stSave.keyHint, '…y123');
+      assert.strictEqual(stSave.model, 'claude-sonnet-5');
+      assert.ok(!JSON.stringify(stSave).includes(GOOD_KEY), 'key echoed to the page');
       const rawCfg = JSON.parse(read(util.configPath()));
+      assert.strictEqual(rawCfg.advisor.apiKey, GOOD_KEY, 'key not persisted');
       assert.strictEqual(rawCfg.intervalSec, 45, 'interval not persisted');
-      assert.deepStrictEqual(rawCfg.targets, ['CLAUDE.md', 'AGENTS.md'], 'targets not persisted');
     });
+    check('settings: config file is chmod 600 once a key is present', () => {
+      if (process.platform === 'win32') return;
+      const mode = fs.statSync(util.configPath()).mode & 0o777;
+      assert.strictEqual(mode, 0o600, `mode was ${mode.toString(8)}`);
+    });
+    const tGood = await (await post(`${base}/api/settings/test`, {})).json();
+    const tBad = await (await post(`${base}/api/settings/test`, { apiKey: 'sk-ant-wrong' })).json();
+    check('settings: key test — stored key passes, bad key is rejected', () => {
+      assert.strictEqual(tGood.ok, true, `good key said: ${JSON.stringify(tGood)}`);
+      assert.strictEqual(tBad.ok, false);
+      assert.ok(/rejected/.test(tBad.error), `bad key error said: ${tBad.error}`);
+    });
+    const stClear = await (await post(`${base}/api/settings`, { apiKey: '' })).json();
+    check('settings: key removal + ANTHROPIC_API_KEY env fallback', () => {
+      assert.strictEqual(stClear.hasKey, false, 'key not removed');
+      process.env.ANTHROPIC_API_KEY = 'sk-env-fallback';
+      const viaEnv = advisorLib.getAdvisorConfig({ advisor: { apiKey: '' } });
+      delete process.env.ANTHROPIC_API_KEY;
+      assert.strictEqual(viaEnv.source, 'env');
+      assert.strictEqual(viaEnv.apiKey, 'sk-env-fallback');
+      assert.strictEqual(advisorLib.getAdvisorConfig({}).source, null, 'no key should mean null source');
+    });
+
+    // M3: roadmap generation (the mock returns a canned plan and captures the request)
+    const planNoKey = await post(`${base}/api/plan/generate`, { path: proj1, goal: 'Ship checkout' });
+    check('plan: generating without a key is refused', () => {
+      assert.strictEqual(planNoKey.status, 400);
+    });
+    await post(`${base}/api/settings`, { apiKey: GOOD_KEY });
+    const genRes = await post(`${base}/api/plan/generate`, {
+      path: proj1,
+      goal: 'Ship checkout with api_key=sk-goal-secret-9999 and card vaulting',
+    });
+    const gen = await genRes.json();
+    check('plan: generate succeeds and persists plan.json', () => {
+      assert.strictEqual(genRes.status, 200, JSON.stringify(gen));
+      assert.strictEqual(gen.ok, true);
+      const saved = JSON.parse(read(path.join(proj1, '.membridge', 'plan.json')));
+      assert.strictEqual(saved.model, 'claude-sonnet-5');
+      assert.ok(Math.abs(saved.costUsd - 0.0174) < 1e-9, `costUsd was ${saved.costUsd}`);
+      assert.strictEqual(saved.plan.phases.length, 2);
+      assert.ok(saved.generatedAt, 'generatedAt missing');
+      assert.ok(!saved.goal.includes('sk-goal-secret-9999'), 'secret kept in the stored goal');
+    });
+    check('plan: request to Anthropic is shaped right and fully redacted', () => {
+      assert.ok(lastPlanRequest, 'mock never saw the request');
+      assert.strictEqual(lastPlanRequest.model, 'claude-sonnet-5');
+      assert.strictEqual(lastPlanRequest.max_tokens, 4000);
+      assert.strictEqual(lastPlanRequest.output_config.format.type, 'json_schema');
+      assert.strictEqual(lastPlanRequest.thinking.type, 'disabled', 'sonnet must run with thinking off');
+      assert.ok(lastPlanRequest.system.includes('escalating on failure'), 'routing philosophy missing');
+      const body = JSON.stringify(lastPlanRequest);
+      assert.ok(!body.includes('sk-goal-secret-9999'), 'goal secret reached the API');
+      assert.ok(!body.includes('sk-test1234567890abcdef'), 'transcript secret reached the API');
+      assert.ok(body.includes('[redacted]'), 'redaction marker missing from the payload');
+      assert.ok(body.includes('shop-app'), 'project name missing');
+      assert.ok(body.includes('Build the login page with OAuth'), 'recent asks missing');
+    });
+    check('plan: roadmap line lands in the context files right away', () => {
+      const md = claudeMd();
+      assert.ok(md.includes('Current roadmap:'), 'roadmap line missing');
+      assert.ok(md.includes('3 tasks'), 'task count wrong');
+      assert.ok(md.includes('.membridge/plan.json'), 'plan pointer missing');
+      assert.ok(!md.includes('sk-goal-secret-9999'), 'secret leaked into the context file');
+    });
+    const detPlan = await (await fetch(`${base}/api/project?path=${encodeURIComponent(proj1)}`)).json();
+    check('plan: /api/project carries the plan, key state and estimate', () => {
+      assert.strictEqual(detPlan.hasKey, true);
+      assert.ok(detPlan.plan && detPlan.plan.plan.phases.length === 2, 'plan missing from detail');
+      assert.ok(detPlan.estimate.costUsd > 0, 'estimate missing');
+      assert.strictEqual(detPlan.estimate.model, 'claude-sonnet-5');
+    });
+    await post(`${base}/api/settings`, { apiKey: 'sk-ant-badkey-000000' });
+    const gen401 = await post(`${base}/api/plan/generate`, { path: proj1, goal: 'Anything at all' });
+    check('plan: an invalid key surfaces a friendly 401', () => {
+      assert.strictEqual(gen401.status, 401);
+    });
+    await post(`${base}/api/settings`, { apiKey: '' });
     const lowSave = await post(`${base}/api/settings`, { intervalSec: 3 });
     check('settings: interval below the 15s floor is clamped', () => {
       assert.strictEqual(lowSave.status, 200);
@@ -509,6 +649,7 @@ async function main() {
     });
   } finally {
     child.kill();
+    await new Promise(r => mockApi.close(r));
   }
   await new Promise(r => setTimeout(r, 300));
 

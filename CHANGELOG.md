@@ -28,6 +28,27 @@
 
 ## 0.3.0 — 2026-07-12
 
+- **Roadmaps (the BYOK upgrade)**: with a key saved, every project's Plan tab
+  becomes a generator — describe what you want to build, see the estimated
+  cost before you click, and get back a phased roadmap where every task
+  carries the AI model that should do it (Everyday — Haiku up to Frontier —
+  Fable, plus a cross-check by Codex), a reason, and a size. The tab lists
+  exactly what leaves the machine (project name, goal, redacted recent asks,
+  file paths, top-level names — never file contents), shows the actual cost
+  from usage afterwards, warns when new AI activity postdates the plan, and
+  saves to `.membridge/plan.json`. One line — "Current roadmap: …" — is
+  written into the shared memory block, so Claude Code and Codex see the
+  plan too. (New: `POST /api/plan/generate`; structured-outputs request in
+  `lib/advisor.js` with one retry and a 60s timeout.)
+- **Settings + bring-your-own-key**: a gear in the header opens Settings —
+  paste an Anthropic API key (stored only in `~/.membridge/config.json`,
+  chmod 600, `ANTHROPIC_API_KEY` env honored as fallback) with a Test button
+  that makes a single count_tokens request; pick the planner model in plain
+  English (Fast & cheap ~1¢ / Smarter ~4¢ / Deepest ~6¢ per roadmap); and
+  set the sync interval and context files, which used to require editing
+  config by hand. Interval changes now apply without restarting the daemon.
+  (New: `lib/advisor.js`, `GET/POST /api/settings`, `POST /api/settings/test`;
+  the key is never sent to the dashboard page.)
 - **Project pages**: the Overview is now a clean projects grid (name, tool
   badges, last activity, paused state) and clicking a card opens a full
   project page — Activity (the complete ask-by-ask history with the files
@@ -39,10 +60,6 @@
   similarity. Events now carry per-chat session ids (state v2 triggers a
   one-time full rescan from the transcripts). (New: `lib/graph.js`,
   `GET /api/graph`.)
-- **Settings**: a gear in the header opens Settings — set the sync interval
-  and context files, which used to require editing config by hand. Interval
-  changes now apply without restarting the daemon. (New:
-  `GET/POST /api/settings`.)
 - **Copy for AI**: every project page has a Copy for AI button that puts a
   trimmed, redacted digest of recent AI activity on the clipboard, ready to
   paste into ChatGPT / claude.ai / any web AI that can't see your disk. The
