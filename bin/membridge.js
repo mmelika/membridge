@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 'use strict';
+// Fast path: the Claude Code Stop hook fires on every session stop and must
+// not pay for the full CLI require tree below (server, dashboard, team sync).
+if (process.argv[2] === 'hook' && process.argv[3] === 'stop') {
+  require('../lib/hooks').runStop();
+  return;
+}
 const fs = require('fs');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
@@ -10,6 +16,7 @@ const memorydb = require('../lib/memorydb');
 const { startServer } = require('../lib/server');
 const autostart = require('../lib/autostart');
 const teamsync = require('../lib/teamsync');
+const hooks = require('../lib/hooks');
 const pkg = require('../package.json');
 
 const args = process.argv.slice(2);
@@ -447,6 +454,15 @@ async function cmdTeam() {
   die(`Unknown team subcommand: ${sub}\nUsage: membridge team <setup|create|invite|revoke-invite|join|link|unlink|list>`);
 }
 
+// ---------------------------------------------------------------------------
+// Distillation (Claude Code Stop hook, see lib/hooks.js)
+// ---------------------------------------------------------------------------
+function cmdHook() {
+  const sub = args[1];
+  if (sub === 'stop') return hooks.runStop();
+  die('Usage: membridge hook stop  (invoked by the Claude Code Stop hook — see `membridge setup-hooks`)');
+}
+
 function cmdHelp() {
   console.log(`MemBridge v${pkg.version} — shared memory across your AI coding tools
 
@@ -500,6 +516,7 @@ const commands = {
   logout: cmdLogout,
   join: cmdJoin,
   team: cmdTeam,
+  hook: cmdHook,
   'enable-autostart': () => console.log(autostart.enable()),
   'disable-autostart': () => console.log(autostart.disable()),
   help: cmdHelp,
