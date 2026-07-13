@@ -18,7 +18,7 @@ const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { buildGraph } = require('../lib/graph');
-const { startServer } = require('../lib/server');
+const { startServer, teamPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 
@@ -335,6 +335,14 @@ async function main() {
       assert.ok(pageHtml.includes('Overview'), 'Overview tab missing');
       assert.ok(pageHtml.includes('Neural map'), 'Neural map tab missing');
     });
+    check('dashboard page has the full Team workspace', () => {
+      assert.ok(pageHtml.includes('view-auth'), 'account gate missing');
+      assert.ok(pageHtml.includes('view-team'), 'team view missing');
+      assert.ok(pageHtml.includes("path = '/api/team/' + kind"), 'account auth flow missing');
+      assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
+      assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
+      assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
+    });
     check('dashboard page has the Copy for AI button', () => {
       assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
     });
@@ -550,14 +558,14 @@ async function main() {
   check('team: backend resolves env > config > baked default', () => {
     // env override in force now
     assert.ok(teamsync.backend(util.getConfig()), 'env override not honored');
-    // with env cleared, an unfilled build (empty baked backend.json) is off,
-    // and a config override still turns it on
+    // with env cleared, this official build falls back to its baked backend,
+    // and a config override still takes precedence.
     const savedUrl = process.env.MEMBRIDGE_TEAM_URL;
     const savedKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
     delete process.env.MEMBRIDGE_TEAM_URL;
     delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
     try {
-      assert.strictEqual(teamsync.backend({}), null, 'empty baked build should be off');
+      assert.ok(teamsync.backend({}), 'baked backend missing');
       assert.ok(teamsync.backend({ team: { url: 'https://x.supabase.co', anonKey: 'k' } }),
         'config override not honored');
     } finally {
@@ -587,6 +595,15 @@ async function main() {
       const l = JSON.parse(read(path.join(proj1, '.membridge', 'team.json')));
       assert.strictEqual(l.projectId, linkA.projectId);
       assert.strictEqual(l.teamId, team.team_id);
+    });
+    const dashboardTeam = await teamPayload();
+    check('dashboard: team payload exposes identity, teams and linked projects without tokens', () => {
+      assert.strictEqual(dashboardTeam.authenticated, true);
+      assert.strictEqual(dashboardTeam.user.email, 'marco@test.dev');
+      assert.ok(dashboardTeam.teams.some(t => t.team_id === team.team_id), 'team missing');
+      assert.ok(dashboardTeam.linkedProjects.some(p => sameKey(p.path, proj1)), 'linked project missing');
+      assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.accessToken), 'access token exposed');
+      assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.refreshToken), 'refresh token exposed');
     });
 
     // proj1 was deleted+revived earlier, so its live history is the single
@@ -703,7 +720,7 @@ async function main() {
     process.env.MEMBRIDGE_HOME = HOME_A;
     const logoutOut = spawnSync(process.execPath, [BIN, 'logout'], { env: { ...process.env }, encoding: 'utf8' });
     check('CLI: team setup persists the backend, logout clears credentials', () => {
-      assert.ok(/Team backend saved/.test(setupOut.stdout), `setup said: ${setupOut.stdout} ${setupOut.stderr}`);
+      assert.ok(/team backend saved/i.test(setupOut.stdout), `setup said: ${setupOut.stdout} ${setupOut.stderr}`);
       const cfg = JSON.parse(read(path.join(HOME_CLI, 'config.json')));
       assert.strictEqual(cfg.team.url, 'http://127.0.0.1:17945');
       assert.ok(/Logged out/.test(logoutOut.stdout), `logout said: ${logoutOut.stdout}`);

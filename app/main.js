@@ -18,12 +18,14 @@ function lib(m) {
 const util = lib('util');
 const { syncOnce } = lib('scan');
 const { startServer } = lib('server');
+const teamsync = lib('teamsync');
 
 const SMOKE = process.argv.includes('--smoke');
 let tray = null;
 let win = null;
 let paused = false;
 let lastSync = null;
+let syncBusy = false;
 
 function readPid() {
   try {
@@ -56,18 +58,26 @@ function takeOverDaemon() {
   fs.writeFileSync(util.pidPath(), String(process.pid));
 }
 
-function runSync() {
+async function runSync() {
+  if (syncBusy) return;
+  syncBusy = true;
   try {
     syncOnce();
+    const teamResult = await teamsync.syncTeams();
+    // Team pulls mark the affected project dirty. Re-render immediately so
+    // every local AI tool sees new teammate context in the same timer pass.
+    for (const projectPath of teamResult.changed) syncOnce({ project: projectPath });
     lastSync = new Date();
   } catch (err) {
     util.log(`tray app sync error: ${err.stack || err}`);
+  } finally {
+    syncBusy = false;
   }
 }
 
 function tick() {
-  if (!paused) runSync();
-  updateMenu();
+  if (!paused) runSync().then(updateMenu);
+  else updateMenu();
 }
 
 function ago(date) {
@@ -112,8 +122,7 @@ function updateMenu() {
     {
       label: 'Sync now',
       click: () => {
-        runSync();
-        updateMenu();
+        runSync().then(updateMenu);
       },
     },
     {
