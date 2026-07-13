@@ -25,6 +25,8 @@ const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
 const memorydb = require('../lib/memorydb');
+const claudeAdapter = require('../lib/adapters/claude-code');
+const codexAdapter = require('../lib/adapters/codex');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -1004,15 +1006,16 @@ async function main() {
       assert.strictEqual(link.projectId, apiLink.projectId);
     });
 
-    // Privacy: entries never carry a foreign absolute path — basename only.
-    check('privacy: files outside the project fall back to basename in entries', () => {
+    // Privacy: entries never carry a foreign path — not even its basename.
+    check('privacy: files outside the project are dropped from entries', () => {
       const ents = memorydb.buildEntries(proj1, {
         events: [
           { ts: '2026-07-12T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'tweak global config', session: 'x1' },
-          { ts: '2026-07-12T12:00:01.000Z', source: 'Claude Code', kind: 'edit', file: '/Users/alice/secret-place/config.js' },
+          { ts: '2026-07-12T12:00:01.000Z', source: 'Claude Code', kind: 'edit', file: '/Users/alice/secret-place/config.js', session: 'x1' },
         ],
       }, util.getConfig());
-      assert.deepStrictEqual(ents[ents.length - 1].files, ['config.js']);
+      assert.deepStrictEqual(ents[ents.length - 1].files, []);
+      assert.ok(!JSON.stringify(ents).includes('config.js'), 'foreign basename leaked into entries');
     });
 
     // CLI: `membridge join <token>` signs the account up when it is new.
@@ -1090,6 +1093,191 @@ async function main() {
     delete process.env.MEMBRIDGE_TEAM_URL;
     delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
     await new Promise(r => mock.server.close(r));
+  }
+
+  // --- 9. rich signals: todos + agent summaries ---
+  const projR = path.join(ROOT, 'projects', 'rich-app');
+  fs.mkdirSync(projR, { recursive: true });
+  const rDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-rich-app');
+  fs.mkdirSync(rDir, { recursive: true });
+  const OLD_SUMMARY = 'Refactored the payment retry queue: exponential backoff with jitter is in, the dead-letter queue is wired, and idempotency is covered by tests. Rotated api_key=sk-test1234567890abcdef.';
+  const NEW_SUMMARY = 'All retry-queue work is finished: backoff, dead-letter wiring and the idempotency suite all pass in CI.';
+  fs.writeFileSync(path.join(rDir, 'sessR.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Refactor the payment retry queue with backoff' }, cwd: projR, timestamp: '2026-07-12T09:00:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'TodoWrite', input: { todos: [
+      { content: 'Add exponential backoff', status: 'completed', activeForm: 'Adding backoff' },
+      { content: 'Wire the dead-letter queue token=secret-todo-999', status: 'in_progress', activeForm: 'Wiring DLQ' },
+      { content: 'Cover idempotency with tests', status: 'pending', activeForm: 'Covering idempotency' },
+    ] } }] }, cwd: projR, timestamp: '2026-07-12T09:01:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projR, 'src', 'queue.js') } }] }, cwd: projR, timestamp: '2026-07-12T09:02:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: OLD_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:03:00.000Z' },
+  ]));
+  // A second session whose final text is under the 80-char summary bar.
+  fs.writeFileSync(path.join(rDir, 'sessShort.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Quick tweak to the readme' }, cwd: projR, timestamp: '2026-07-12T09:10:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] }, cwd: projR, timestamp: '2026-07-12T09:11:00.000Z' },
+  ]));
+  syncOnce();
+  const richMd = () => read(path.join(projR, 'CLAUDE.md'));
+  const richEvents = () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === projR.toLowerCase());
+    return state.projects[key].events;
+  };
+
+  check('rich: adapter extracts todos and summary events from the transcript', () => {
+    const evs = richEvents();
+    const todos = evs.find(e => e.kind === 'todos' && e.session === 'sessR');
+    assert.ok(todos, 'todos event missing');
+    assert.strictEqual(todos.items.length, 3);
+    assert.deepStrictEqual(todos.items[0], { text: 'Add exponential backoff', status: 'completed' });
+    const summary = evs.find(e => e.kind === 'summary' && e.session === 'sessR');
+    assert.ok(summary, 'summary event missing');
+    assert.strictEqual(summary.text, OLD_SUMMARY);
+    assert.strictEqual(summary.ts, '2026-07-12T09:03:00.000Z');
+  });
+  check('rich: a final text under 80 chars is not emitted as a summary', () => {
+    assert.ok(!richEvents().some(e => e.kind === 'summary' && e.session === 'sessShort'), 'short text became a summary');
+  });
+  check('rich: renderBlock groups by session with Ask/Result/Tasks/Files', () => {
+    const md = richMd();
+    assert.ok(md.includes('Ask: Refactor the payment retry queue with backoff'), 'Ask line missing');
+    assert.ok(md.includes('Result: Refactored the payment retry queue'), 'Result line missing');
+    assert.ok(md.includes('Tasks: 1/3 done'), 'Tasks line missing');
+    assert.ok(md.includes('Files: src/queue.js'), 'Files line missing');
+    // the summary-less session keeps the original one-line ask format
+    assert.ok(md.includes('Claude Code: Quick tweak to the readme'), 'fallback one-liner missing');
+  });
+  check('rich: summaries and todo items are redacted everywhere they land', () => {
+    assert.ok(!richMd().includes('sk-test1234567890abcdef'), 'summary secret leaked into the block');
+    assert.ok(richMd().includes('[redacted]'), 'no redaction marker in the block');
+    const db = JSON.parse(read(path.join(projR, '.membridge', 'memory.json')));
+    const entry = db.entries.find(e => e.summary);
+    assert.ok(entry, 'no entry carries a summary');
+    assert.ok(entry.summary.includes('[redacted]') && !entry.summary.includes('sk-test1234567890abcdef'), 'entry summary not redacted');
+    assert.deepStrictEqual({ done: entry.tasks.done, total: entry.tasks.total }, { done: 1, total: 3 });
+    const raw = read(path.join(projR, '.membridge', 'memory.json')) + read(path.join(projR, '.membridge', 'memory.md'));
+    assert.ok(!raw.includes('secret-todo-999'), 'todo item secret leaked into the memory DB');
+    assert.ok(read(path.join(projR, '.membridge', 'memory.md')).includes('Result: '), 'memory.md has no Result line');
+  });
+  check('rich: copy-for-AI digest shows the Result line', () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === projR.toLowerCase());
+    const text = memorydb.renderCopyText(projR, state.projects[key], util.getConfig());
+    assert.ok(text.includes('Result: '), 'Result line missing from copy digest');
+    assert.ok(!text.includes('sk-test1234567890abcdef'), 'secret leaked into copy digest');
+  });
+
+  // Incremental: the session keeps going, a fresh final text lands. The new
+  // summary event supersedes the old one in rendering (latest per session).
+  fs.appendFileSync(path.join(rDir, 'sessR.jsonl'),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship it once CI is green' }, cwd: projR, timestamp: '2026-07-12T09:20:00.000Z' }) + '\n' +
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: NEW_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:21:00.000Z' }) + '\n');
+  syncOnce();
+  check('rich: incremental reads produce a superseding summary in rendering', () => {
+    const summaries = richEvents().filter(e => e.kind === 'summary' && e.session === 'sessR');
+    assert.strictEqual(summaries.length, 2, `expected 2 summary events, got ${summaries.length}`);
+    const md = richMd();
+    assert.ok(md.includes('all pass in CI'), 'updated summary missing');
+    assert.ok(!md.includes('exponential backoff with jitter'), 'stale summary still rendered');
+  });
+
+  // Adapter units: item cap, and both Codex agent_message payload shapes.
+  check('rich: todos items are capped at 20 per event', () => {
+    const todos = Array.from({ length: 25 }, (_, i) => ({ content: `task ${i}`, status: 'pending' }));
+    const evs = claudeAdapter.extractEvents([
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'TodoWrite', input: { todos } }] }, cwd: projR, timestamp: '2026-07-12T10:00:00.000Z' },
+    ], {});
+    const ev = evs.find(e => e.kind === 'todos');
+    assert.strictEqual(ev.items.length, 20, `stored ${ev.items.length} items`);
+  });
+  check('rich: codex summaries parse both string and content-array payloads', () => {
+    const long = 'The Codex agent finished the task: it rewrote the retry logic and added regression tests for the queue.';
+    const meta = { timestamp: '2026-07-12T10:00:00.000Z', type: 'session_meta', payload: { id: 'x', cwd: projR } };
+    const asString = codexAdapter.extractEvents([
+      meta,
+      { timestamp: '2026-07-12T10:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', message: long } },
+    ], {});
+    const asArray = codexAdapter.extractEvents([
+      meta,
+      { timestamp: '2026-07-12T10:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', content: [{ type: 'output_text', text: long }] } },
+    ], {});
+    for (const evs of [asString, asArray]) {
+      const s = evs.find(e => e.kind === 'summary');
+      assert.ok(s, 'codex summary missing');
+      assert.strictEqual(s.text, long);
+      assert.strictEqual(s.project, projR);
+    }
+    const short = codexAdapter.extractEvents([
+      meta,
+      { timestamp: '2026-07-12T10:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'Done.' } },
+    ], {});
+    assert.ok(!short.some(e => e.kind === 'summary'), 'short codex text became a summary');
+  });
+
+  // Rendering fixes: out-of-project files, markdown summaries, missing asks.
+  const MD_SUMMARY = '## Build patch\n\n**Rewrote** the scratch build runner and `verified` it twice | all targets\n```bash\nmake test\n```\nGreen across the board.';
+  fs.writeFileSync(path.join(rDir, 'sessOut.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Patch the temp build script' }, cwd: projR, timestamp: '2026-07-12T09:30:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(ROOT, 'outside-place', 'tmp-script.sh') } }] }, cwd: projR, timestamp: '2026-07-12T09:31:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: MD_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:32:00.000Z' },
+  ]));
+  // A session whose only capture is the agent's self-report (no user prompt).
+  fs.writeFileSync(path.join(rDir, 'sessNoAsk.jsonl'), jsonl([
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Resumed after a crash and finished wiring the webhook retries; the full suite is passing again.' }] }, cwd: projR, timestamp: '2026-07-12T09:40:00.000Z' },
+  ]));
+  syncOnce();
+
+  check('fix: out-of-project files are excluded from the block and memory DB', () => {
+    const md = richMd();
+    assert.ok(md.includes('Files: (outside project)'), 'placeholder missing for an outside-only session');
+    assert.ok(!md.includes('tmp-script.sh') && !md.includes('outside-place'), 'foreign path leaked into the block');
+    const mem = read(path.join(projR, '.membridge', 'memory.json')) + read(path.join(projR, '.membridge', 'memory.md'));
+    assert.ok(!mem.includes('tmp-script.sh') && !mem.includes('outside-place'), 'foreign path leaked into the memory DB');
+  });
+  check('fix: plainText flattens markdown before clipping', () => {
+    const flat = digest.plainText('## Heading\n**bold** and `inline` text\n```js\nlet x = 1\n```\ncol a | col b');
+    assert.strictEqual(flat, 'Heading bold and inline text let x = 1 col a col b');
+    const line = richMd().split('\n').find(l => l.includes('Rewrote the scratch build runner'));
+    assert.ok(line && line.trim().startsWith('Result:'), 'flattened summary missing from the block');
+    assert.ok(!/[*`|#]/.test(line), `markdown survived into the Result line: ${line}`);
+  });
+  check('fix: a summary-only session renders Ask: (not captured)', () => {
+    const md = richMd();
+    assert.ok(md.includes('Ask: (not captured)'), 'placeholder Ask line missing');
+    assert.ok(md.includes('finished wiring the webhook retries'), 'prompt-less summary missing');
+  });
+
+  // Team push carries the redacted summary (fresh mock: section 8's is gone).
+  const mock2 = createMockSupabase();
+  await new Promise(r => mock2.server.listen(17946, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17946';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  try {
+    await teamsync.signup(util.getConfig(), 'rich@test.dev', 'pw-r', 'Rich');
+    const teamR = await teamsync.createTeam(util.getConfig(), 'RichTeam');
+    await teamsync.linkProject(util.getConfig(), projR, teamR.team_id, 'RichTeam');
+    await teamsync.syncTeams({ project: projR });
+    check('rich: pushed entries include the redacted summary, never todo text', () => {
+      const withSummary = mock2.entries.filter(e => e.summary);
+      assert.ok(withSummary.length >= 1, `no pushed entry carries a summary (${mock2.entries.length} rows)`);
+      assert.ok(withSummary.some(e => e.summary.includes('[redacted]')), 'pushed summary not redacted');
+      assert.ok(mock2.entries.every(e => !e.summary || e.summary.length <= 300), 'summary over the 300-char cap');
+      const body = JSON.stringify(mock2.entries);
+      assert.ok(!body.includes('sk-test1234567890abcdef'), 'summary secret reached the server');
+      assert.ok(!body.includes('secret-todo-999'), 'todo item text reached the server');
+      assert.ok(mock2.entries.some(e => e.summary === null), 'summary-less entries should push null');
+    });
+    check('fix: out-of-project files never reach the server', () => {
+      const row = mock2.entries.find(e => e.ask.includes('Patch the temp build script'));
+      assert.ok(row, 'sessOut entry not pushed');
+      assert.deepStrictEqual(row.files, [], `files said: ${JSON.stringify(row.files)}`);
+      assert.ok(!JSON.stringify(mock2.entries).includes('tmp-script.sh'), 'foreign path reached the server');
+    });
+  } finally {
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock2.server.close(r));
   }
 
   // --- summary ---

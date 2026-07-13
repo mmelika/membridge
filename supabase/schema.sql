@@ -47,6 +47,14 @@ create table if not exists public.memory_entries (
   unique (project_id, author_id, ts, source)
 );
 
+-- Rich signals: the agent's final self-report for the entry, redacted and
+-- clipped client-side (<=300 chars pushed; the check leaves headroom like
+-- ask's). Nullable and added via `alter` so it is backwards-compatible: it
+-- applies to already-live backends, and pre-existing clients that push rows
+-- without the field keep working.
+alter table public.memory_entries
+  add column if not exists summary text check (char_length(summary) <= 400);
+
 create index if not exists memory_entries_pull_idx
   on public.memory_entries (project_id, created_at);
 
