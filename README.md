@@ -4,7 +4,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](package.json)
 
-**Your Claude Code knows what your teammate's Codex did an hour ago.**
+**Your Claude Code knows what your teammate's Codex did 30 seconds ago.**
 
 MemBridge is a team collaboration tool for AI-assisted development. A tiny
 background daemon watches every AI coding tool's session logs, distills a
