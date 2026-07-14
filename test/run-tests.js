@@ -20,7 +20,7 @@ const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { buildGraph } = require('../lib/graph');
-const { startServer, teamPayload } = require('../lib/server');
+const { startServer, teamPayload, teamProjectsPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
@@ -418,11 +418,16 @@ async function main() {
       assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
       assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
       assert.ok(pageHtml.includes('/api/team/revoke-invite'), 'invite revoke UI missing');
-      assert.ok(pageHtml.includes("Revoke this invite link?"), 'invite revoke confirmation missing');
-      assert.ok(pageHtml.includes('data-team-form="invite-options"'), 'invite options form missing');
+      assert.ok(pageHtml.includes('Click again to confirm'), 'destructive-action arming missing');
+      assert.ok(pageHtml.includes('data-team-form="invite-create"'), 'invite options form missing');
       assert.ok(pageHtml.includes('expiresDays'), 'invite expiry field missing');
       assert.ok(pageHtml.includes('maxUses'), 'invite max-uses field missing');
       assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
+      assert.ok(pageHtml.includes('hub-grid'), 'team hub layout missing');
+      assert.ok(pageHtml.includes('#team-member='), 'member drill-down route missing');
+      assert.ok(pageHtml.includes('#team-project='), 'team project route missing');
+      assert.ok(pageHtml.includes('/api/team/feed'), 'activity feed wiring missing');
+      assert.ok(pageHtml.includes('/api/team/members'), 'members wiring missing');
     });
     check('dashboard page has the Copy for AI button', () => {
       assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
@@ -1135,6 +1140,96 @@ async function main() {
       assert.strictEqual(feedPage1.length, 1);
       assert.strictEqual(feedPage2.length, 1);
       assert.notStrictEqual(feedPage1[0].id, feedPage2[0].id, 'keyset returned the same row');
+    });
+
+    // ----- team hub: read wrappers, dashboard routes, management -----
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const hubMembers = await teamsync.listMembers(util.getConfig(), team.team_id);
+    check('hub: listMembers returns every member with role and joined_at', () => {
+      const names = hubMembers.map(m => m.display_name);
+      assert.ok(names.includes('Marco') && names.includes('Andrew') && names.includes('Dana'), `members were ${names}`);
+      assert.strictEqual(hubMembers.find(m => m.display_name === 'Marco').role, 'owner');
+      assert.ok(hubMembers.every(m => m.user_id && m.joined_at), 'user_id/joined_at missing');
+    });
+
+    const hubFeedAndrew = await teamsync.teamFeed(util.getConfig(), team.team_id, { author: andrewId, limit: 10 });
+    check('hub: teamFeed wrapper filters by author', () => {
+      assert.ok(hubFeedAndrew.length >= 1, 'no rows for Andrew');
+      assert.ok(hubFeedAndrew.every(r => r.author_id === andrewId), 'author filter leaked other rows');
+    });
+
+    const hubStats = await teamsync.projectStats(util.getConfig(), team.team_id);
+    check('hub: projectStats aggregates contributors, entries and last activity', () => {
+      const shop = hubStats.find(r => r.name === 'shop-app');
+      assert.ok(shop, 'shop-app missing from stats');
+      assert.ok(shop.contributors >= 2, `contributors was ${shop.contributors}`);
+      assert.ok(shop.entries >= 3, `entries was ${shop.entries}`);
+      assert.ok(shop.last_activity, 'last_activity missing');
+    });
+
+    const hubProjects = await teamProjectsPayload(team.team_id);
+    check('hub: team projects payload maps team projects to linked local folders', () => {
+      const shop = hubProjects.find(r => r.name === 'shop-app');
+      assert.ok(shop && shop.localPath && sameKey(shop.localPath, proj1), `localPath was ${shop && shop.localPath}`);
+    });
+
+    // The same reads over the local dashboard API (in-process server; the mock
+    // backend is async in this process too, so no event-loop deadlock).
+    const HUB_PORT = 17947;
+    const hubSrv = startServer(HUB_PORT, { retries: 0 });
+    await waitForHttp(`http://127.0.0.1:${HUB_PORT}/api/status`);
+    const hubBase = `http://127.0.0.1:${HUB_PORT}`;
+    const membersRes = await (await fetch(`${hubBase}/api/team/members?teamId=${team.team_id}`)).json();
+    const feedRes = await (await fetch(`${hubBase}/api/team/feed?teamId=${team.team_id}&source=Codex`)).json();
+    const projectsRes = await (await fetch(`${hubBase}/api/team/projects?teamId=${team.team_id}`)).json();
+    const badRes = await fetch(`${hubBase}/api/team/feed`);
+    check('hub routes: members, feed and projects serve team data over the local API', () => {
+      assert.ok(membersRes.members.some(m => m.display_name === 'Andrew'), 'members route empty');
+      assert.ok(feedRes.entries.length >= 1 && feedRes.entries.every(e => e.source === 'Codex'), 'feed route filter failed');
+      assert.ok(projectsRes.projects.some(p => p.name === 'shop-app'), 'projects route empty');
+      assert.strictEqual(badRes.status, 400, 'missing teamId must 400');
+    });
+    await new Promise(r => hubSrv.close(r));
+
+    // Management runs on a fresh team so rotate/remove cannot disturb the
+    // Acme fixtures that later tests (CLI join, Mallory) still rely on.
+    const opsTeam = await teamsync.createTeam(util.getConfig(), 'Hub Ops');
+    const opsInv = await teamsync.createInvite(util.getConfig(), opsTeam.team_id, {});
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-f');
+    await teamsync.join(util.getConfig(), opsInv.token);
+    const frankId = mock.members.find(m => m.displayName === 'Frank').userId;
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    await teamsync.setRole(util.getConfig(), opsTeam.team_id, frankId, 'admin');
+    await teamsync.renameTeam(util.getConfig(), opsTeam.team_id, 'Hub Operations');
+    const rotated = await teamsync.rotateInvite(util.getConfig(), opsTeam.team_id);
+    check('hub: owner manages roles, team name and the legacy code via wrappers', () => {
+      assert.strictEqual(mock.members.find(m => m.userId === frankId && m.teamId === opsTeam.team_id).role, 'admin');
+      assert.strictEqual(mock.teams.get(opsTeam.team_id).name, 'Hub Operations');
+      assert.notStrictEqual(rotated, opsTeam.invite_code, 'invite code did not rotate');
+      assert.ok(mock.invites.get(opsInv.token).revokedAt, 'rotate must revoke outstanding invite links');
+    });
+
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-f');
+    await teamsync.leaveTeam(util.getConfig(), opsTeam.team_id);
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    let ownerLeaveErr = null;
+    try {
+      await teamsync.leaveTeam(util.getConfig(), opsTeam.team_id);
+    } catch (err) {
+      ownerLeaveErr = err;
+    }
+    check('hub: members can leave; the owner cannot abandon their own team', () => {
+      assert.ok(!mock.members.some(m => m.teamId === opsTeam.team_id && m.userId === frankId), 'Frank still a member');
+      assert.ok(ownerLeaveErr && /owner cannot leave/i.test(ownerLeaveErr.message), `said: ${ownerLeaveErr && ownerLeaveErr.message}`);
+    });
+
+    const opsInv2 = await teamsync.createInvite(util.getConfig(), opsTeam.team_id, {});
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-f');
+    await teamsync.join(util.getConfig(), opsInv2.token);
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    await teamsync.removeMember(util.getConfig(), opsTeam.team_id, frankId);
+    check('hub: the owner can remove a member', () => {
+      assert.ok(!mock.members.some(m => m.teamId === opsTeam.team_id && m.userId === frankId), 'Frank not removed');
     });
 
     // Auto-link: Marco links a git-remoted project; credentials in the remote

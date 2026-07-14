@@ -52,14 +52,14 @@ function createMockSupabase() {
     if (fn === 'create_team') {
       const team = { id: uuid(), name: body.p_name, inviteCode: uuid() };
       teams.set(team.id, team);
-      members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'owner' });
+      members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'owner', joinedAt: new Date().toISOString() });
       return json(res, 200, [{ team_id: team.id, invite_code: team.inviteCode }]);
     }
     if (fn === 'join_team') {
       const team = [...teams.values()].find(t => t.inviteCode === body.p_code);
       if (!team) return json(res, 400, { message: 'invalid invite code' });
       if (!isMember(team.id, userId)) {
-        members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'member' });
+        members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'member', joinedAt: new Date().toISOString() });
       }
       return json(res, 200, [{ team_id: team.id, team_name: team.name }]);
     }
@@ -110,7 +110,7 @@ function createMockSupabase() {
       if (inv.maxUses !== null && inv.useCount >= inv.maxUses) return json(res, 400, { message: 'this invite link has already been used' });
       const team = teams.get(inv.teamId);
       if (!isMember(team.id, userId)) {
-        members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'member' });
+        members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'member', joinedAt: new Date().toISOString() });
         inv.useCount++;
       }
       return json(res, 200, [{ team_id: team.id, team_name: team.name }]);
@@ -146,6 +146,14 @@ function createMockSupabase() {
       const i = members.findIndex(m => m.teamId === body.p_team && m.userId === userId);
       if (i !== -1) members.splice(i, 1);
       return json(res, 200, null);
+    }
+    if (fn === 'team_members_list') {
+      if (!isMember(body.p_team, userId)) return json(res, 200, []);
+      const rows = members
+        .filter(m => m.teamId === body.p_team)
+        .sort((a, b) => String(a.joinedAt || '').localeCompare(String(b.joinedAt || '')))
+        .map(m => ({ user_id: m.userId, display_name: m.displayName, role: m.role, joined_at: m.joinedAt || null }));
+      return json(res, 200, rows);
     }
     if (fn === 'team_feed') {
       if (!isMember(body.p_team, userId)) return json(res, 200, []);
@@ -232,6 +240,25 @@ function createMockSupabase() {
       if (rpcMatch) return handleRpc(res, rpcMatch[1], body, authedUser(req));
       if (url.pathname === '/rest/v1/memory_entries') {
         return handleEntries(res, url, req.method, body, authedUser(req));
+      }
+      if (url.pathname === '/rest/v1/project_stats' && req.method === 'GET') {
+        // The security_invoker view: per-project last activity / contributor /
+        // entry counts, RLS-filtered to the caller's teams.
+        const userId = authedUser(req);
+        if (!userId) return json(res, 401, { message: 'not authenticated' });
+        const teamEq = (url.searchParams.get('team_id') || '').replace(/^eq\./, '');
+        const rows = projects
+          .filter(p => (!teamEq || p.teamId === teamEq) && isMember(p.teamId, userId))
+          .map(p => {
+            const es = entries.filter(e => e.project_id === p.id);
+            return {
+              project_id: p.id, team_id: p.teamId, name: p.name, repo_url: p.repoUrl,
+              last_activity: es.length ? es.map(e => e.ts).sort().pop() : null,
+              contributors: new Set(es.map(e => e.author_id)).size,
+              entries: es.length,
+            };
+          });
+        return json(res, 200, rows);
       }
       if (url.pathname === '/rest/v1/projects' && req.method === 'GET') {
         // Auto-link fetch: RLS means only projects in the caller's teams.
