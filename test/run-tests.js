@@ -1242,7 +1242,8 @@ async function main() {
       created_at: new Date(Date.now() + 5000).toISOString(),
     });
     const feedSummaryRes = await (await fetch(`${hubBase}/api/feed?limit=50`)).json();
-    check('/api/feed surfaces teammate summaries (migration 004)', () => {
+    // NOTE: exercises the read path (team_feed RPC -> normalizeTeam -> /api/feed). The mock cannot model Postgres's create-or-replace return-type constraint, so migration 004 itself must be validated against real Postgres before deploy.
+    check('/api/feed surfaces teammate summaries end-to-end (read path)', () => {
       const teamEntry = feedSummaryRes.entries.find(e => e.origin === 'team' && e.summary);
       assert.ok(teamEntry, 'at least one team entry carries a non-null summary');
       assert.ok(/receipt PDF/.test(teamEntry.summary), `summary text lost: ${teamEntry && teamEntry.summary}`);

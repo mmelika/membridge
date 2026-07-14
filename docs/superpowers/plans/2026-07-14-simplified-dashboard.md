@@ -426,14 +426,18 @@ git commit -m "feat: add local /api/feed unified merged-feed route"
 **Files:**
 - Create: `supabase/migrations/004_feed_summary.sql`
 
-- [ ] **Step 1: Write the migration** (re-declares `team_feed` from `002_team_v2.sql:285-321` verbatim, adding `summary text` to the RETURNS TABLE and `e.summary` to the SELECT; identical `language sql / security definer / set search_path = public / stable` footer; header style matches `003`):
+- [ ] **Step 1: Write the migration** (re-declares `team_feed` from `002_team_v2.sql:285-321`, adding `summary text` to the RETURNS TABLE and `e.summary` to the SELECT; identical `language sql / security definer / set search_path = public / stable` footer; header style matches `003`). It must `drop function` with the exact 9-arg signature first — Postgres refuses to change a function's RETURNS TABLE via bare create-or-replace, so this migration's own target (a backend that already ran 002) would otherwise error. The drop makes it drop-and-recreate, and idempotent/re-runnable:
 
 ```sql
 -- Add teammates' `summary` to the team feed. The pushes table already stores
 -- summary (schema.sql), but team_feed never returned it, so the unified feed
--- could only show raw asks. Function-only change: no table/index/data touched.
--- Old clients ignore the extra column. Run in the Supabase SQL editor, or
--- `supabase db push`, on backends created before this fix.
+-- could only show raw asks. Function-only (no table/index/data changes), but it
+-- DROPs and recreates team_feed because Postgres refuses to change a function's
+-- RETURNS TABLE via create-or-replace. Idempotent/re-runnable. Old clients
+-- ignore the extra column. Run in the Supabase SQL editor or `supabase db push`.
+
+drop function if exists public.team_feed(
+  uuid, timestamptz, bigint, integer, uuid, uuid, text, timestamptz, timestamptz);
 
 create or replace function public.team_feed(
   p_team uuid,
