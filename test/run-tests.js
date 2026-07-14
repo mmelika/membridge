@@ -491,6 +491,42 @@ async function main() {
       assert.ok(p && Array.isArray(p.tools), 'tools missing');
       assert.ok(p.tools.includes('Claude Code') && p.tools.includes('Codex'), `tools said: ${JSON.stringify(p && p.tools)}`);
     });
+    // Feature 3: read-only scan/discovery view (dashboard equivalent of `membridge scan`)
+    const scanRes = await fetch(`${base}/api/scan`);
+    const scan = await scanRes.json();
+    check('/api/scan reports adapter roots with correct exists flags', () => {
+      assert.strictEqual(scanRes.status, 200);
+      const claudeAdapterRoot = scan.adapters.find(a => a.displayName === 'Claude Code');
+      assert.ok(claudeAdapterRoot, 'Claude Code adapter missing');
+      assert.strictEqual(claudeAdapterRoot.root, process.env.MEMBRIDGE_CLAUDE_DIR);
+      assert.strictEqual(claudeAdapterRoot.exists, true, 'existing Claude root reported as missing');
+      const codexAdapterRoot = scan.adapters.find(a => a.displayName === 'Codex');
+      assert.ok(codexAdapterRoot, 'Codex adapter missing');
+      assert.strictEqual(codexAdapterRoot.exists, true, 'existing Codex root reported as missing');
+    });
+    check('/api/scan reports project counts and per-source breakdown', () => {
+      assert.ok(scan.projectCount >= 3, `expected >=3 projects, got ${scan.projectCount}`);
+      const p1 = scan.projects.find(p => p.path.toLowerCase() === proj1.toLowerCase());
+      assert.ok(p1, 'shop-app missing from scan');
+      // proj1's session files accumulate events across earlier tests in this run (this is a
+      // fresh from-byte-0 scan), so assert the mixed-source breakdown is present with lower
+      // bounds rather than brittle exact counts tied to test execution order.
+      assert.ok(p1.bySource['Claude Code'] >= 4, `expected >=4 Claude Code events, got ${JSON.stringify(p1.bySource)}`);
+      assert.ok(p1.bySource.Codex >= 1, `expected >=1 Codex event, got ${JSON.stringify(p1.bySource)}`);
+      assert.ok(p1.bySource.MyTool >= 1, `expected >=1 MyTool event, got ${JSON.stringify(p1.bySource)}`);
+    });
+    check('/api/scan flags paused projects', () => {
+      const p2 = scan.projects.find(p => p.path.toLowerCase() === proj2.toLowerCase());
+      assert.ok(p2, 'excluded-app missing from scan');
+      assert.strictEqual(p2.paused, true, 'excluded project not flagged paused');
+      const p1 = scan.projects.find(p => p.path.toLowerCase() === proj1.toLowerCase());
+      assert.strictEqual(p1.paused, false, 'active project incorrectly flagged paused');
+    });
+    check('dashboard page has the scan/discovery modal', () => {
+      assert.ok(pageHtml.includes('scanOverlay'), 'scan overlay missing');
+      assert.ok(pageHtml.includes('/api/scan'), 'scan fetch missing');
+      assert.ok(pageHtml.includes('Detected tools'), 'scan modal title missing');
+    });
     const detRes = await fetch(`${base}/api/project?path=${encodeURIComponent(proj1)}`);
     const det = await detRes.json();
     const detBad = await fetch(`${base}/api/project?path=${encodeURIComponent(path.join(ROOT, 'no-such-dir'))}`);
