@@ -4,7 +4,7 @@
 // the CLI daemon — the tray is just a face on it.
 const fs = require('fs');
 const path = require('path');
-const { app, Tray, Menu, BrowserWindow, nativeImage } = require('electron');
+const { app, Tray, Menu, BrowserWindow, nativeImage, dialog } = require('electron');
 
 // lib/ is copied into app/lib by scripts/prepare-app.js (packaged builds);
 // fall back to ../lib when running straight from the repo.
@@ -165,6 +165,20 @@ if (!gotLock) {
     tray = new Tray(icon);
     tray.setToolTip('MemBridge — shared memory across your AI coding tools');
     updateMenu();
+
+    // First-run consent for session summaries
+    const consent = lib('consent');
+    if (!SMOKE && consent.needsConsentPrompt(config)) {
+      const { response } = await dialog.showMessageBox({
+        type: 'question',
+        title: 'Enable session summaries?',
+        message: 'MemBridge can ask your AI tools to leave a short note about what they worked on, so your other tools stay in the loop. This adds one line to each project\'s AGENTS.md and installs a Claude Code hook.',
+        buttons: ['Enable', 'Not now'],
+        defaultId: 0,
+        cancelId: 1,
+      });
+      consent.applyConsent(response === 0 ? 'granted' : 'declined');
+    }
 
     // smoke mode verifies tray + server boot only — it must never sync/write
     if (!SMOKE) {

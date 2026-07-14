@@ -1119,6 +1119,8 @@ async function main() {
     { type: 'user', message: { role: 'user', content: 'Quick tweak to the readme' }, cwd: projR, timestamp: '2026-07-12T09:10:00.000Z' },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] }, cwd: projR, timestamp: '2026-07-12T09:11:00.000Z' },
   ]));
+  // Grant consent so the summaries instruction appears in AGENTS.md
+  { const rc = util.loadUserConfig(); if (!rc.distill) rc.distill = {}; rc.distill.consent = 'granted'; util.saveUserConfig(rc); }
   syncOnce();
   const richMd = () => read(path.join(projR, 'CLAUDE.md'));
   const richEvents = () => {
@@ -1351,7 +1353,7 @@ async function main() {
     rawCfg.distill = { enabled: false };
     util.saveUserConfig(rawCfg);
     const out = runHook(stopPayload('sessR'));
-    delete rawCfg.distill;
+    rawCfg.distill = { enabled: true, consent: 'granted' };
     util.saveUserConfig(rawCfg);
     check('distill: hook exits immediately when distill.enabled is false', () => {
       assert.strictEqual(out.status, 0);
@@ -1809,6 +1811,104 @@ async function main() {
     delete process.env.MEMBRIDGE_TEAM_URL;
     delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
     await new Promise(r => mock5.server.close(r));
+  }
+
+  // --- 12. consent: needsConsentPrompt + applyConsent + digest gating ---
+  const consent = require('../lib/consent');
+
+  check('consent: needsConsentPrompt returns true for fresh config', () => {
+    assert.strictEqual(consent.needsConsentPrompt({ distill: { enabled: true, consent: null } }), true);
+  });
+  check('consent: needsConsentPrompt returns false after granted', () => {
+    assert.strictEqual(consent.needsConsentPrompt({ distill: { enabled: true, consent: 'granted' } }), false);
+  });
+  check('consent: needsConsentPrompt returns false after declined', () => {
+    assert.strictEqual(consent.needsConsentPrompt({ distill: { enabled: true, consent: 'declined' } }), false);
+  });
+  check('consent: needsConsentPrompt returns false when distill disabled', () => {
+    assert.strictEqual(consent.needsConsentPrompt({ distill: { enabled: false, consent: null } }), false);
+  });
+
+  // Save current consent, test digest gating, then restore
+  const savedConsent = (util.loadUserConfig().distill || {}).consent;
+  function setConsent(val) {
+    const rc = util.loadUserConfig();
+    if (!rc.distill) rc.distill = {};
+    rc.distill.consent = val;
+    util.saveUserConfig(rc);
+  }
+  function dirtyProj1() {
+    const st = util.loadState();
+    const k = Object.keys(st.projects).find(p => p.toLowerCase() === proj1.toLowerCase());
+    if (k) { st.projects[k].dirty = true; util.saveState(st); }
+  }
+  setConsent(null);
+  dirtyProj1();
+  syncOnce();
+  check('consent: digest omits summary line when consent is null', () => {
+    const agents = read(path.join(proj1, 'AGENTS.md'));
+    assert.ok(!agents.includes('summaries.jsonl'), 'summaries instruction present without consent');
+  });
+  setConsent('granted');
+  dirtyProj1();
+  syncOnce();
+  check('consent: digest includes summary line after consent granted', () => {
+    const agents = read(path.join(proj1, 'AGENTS.md'));
+    assert.ok(agents.includes('summaries.jsonl'), 'summaries instruction missing after consent granted');
+  });
+  setConsent('declined');
+  dirtyProj1();
+  syncOnce();
+  check('consent: digest omits summary line after consent declined', () => {
+    const agents = read(path.join(proj1, 'AGENTS.md'));
+    assert.ok(!agents.includes('summaries.jsonl'), 'summaries instruction present after declined');
+  });
+
+  // applyConsent + hook checks
+  const consentSettings = path.join(ROOT, 'consent-claude-settings.json');
+  fs.writeFileSync(consentSettings, JSON.stringify({ model: 'opus' }));
+  setConsent(null);
+  const origEnv = process.env.MEMBRIDGE_CLAUDE_SETTINGS;
+  process.env.MEMBRIDGE_CLAUDE_SETTINGS = consentSettings;
+  try {
+    consent.applyConsent('granted');
+    check('consent: applyConsent granted installs the Stop hook', () => {
+      const s = JSON.parse(read(consentSettings));
+      const stopHooks = (s.hooks && s.hooks.Stop) || [];
+      assert.ok(stopHooks.some(e => JSON.stringify(e).includes('membridge')), 'hook not installed');
+    });
+    check('consent: applyConsent granted sets consent in config', () => {
+      assert.strictEqual(util.loadUserConfig().distill.consent, 'granted');
+    });
+
+    // Reset and test declined
+    fs.writeFileSync(consentSettings, JSON.stringify({ model: 'opus' }));
+    setConsent(null);
+    consent.applyConsent('declined');
+    check('consent: applyConsent declined does NOT install the hook', () => {
+      const s = JSON.parse(read(consentSettings));
+      const stopHooks = (s.hooks && s.hooks.Stop) || [];
+      assert.ok(!stopHooks.some(e => JSON.stringify(e).includes('membridge')), 'hook installed on decline');
+    });
+
+    // Idempotency
+    setConsent(null);
+    fs.writeFileSync(consentSettings, JSON.stringify({ model: 'opus' }));
+    consent.applyConsent('granted');
+    consent.applyConsent('granted');
+    check('consent: granting twice does not duplicate the hook', () => {
+      const s = JSON.parse(read(consentSettings));
+      const stopHooks = (s.hooks && s.hooks.Stop) || [];
+      const mbHooks = stopHooks.filter(e => JSON.stringify(e).includes('membridge'));
+      assert.strictEqual(mbHooks.length, 1, `expected 1 membridge hook, got ${mbHooks.length}`);
+    });
+  } finally {
+    if (origEnv !== undefined) process.env.MEMBRIDGE_CLAUDE_SETTINGS = origEnv;
+    else delete process.env.MEMBRIDGE_CLAUDE_SETTINGS;
+    // Restore consent for any remaining tests
+    const rc = util.loadUserConfig();
+    rc.distill.consent = savedConsent;
+    util.saveUserConfig(rc);
   }
 
   // --- summary ---
