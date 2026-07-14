@@ -160,9 +160,11 @@ begin
   end if;
   select * into v_team from public.teams where id = v_invite.team_id;
   -- Never grants more than member; joining twice is a no-op, not a burn.
+  -- No conflict target: naming team_id here is ambiguous with the OUT column
+  -- of the same name, and the composite PK is the table's only constraint.
   insert into public.team_members (team_id, user_id, display_name)
     values (v_team.id, auth.uid(), p_display_name)
-    on conflict (team_id, user_id) do nothing;
+    on conflict do nothing;
   if found then
     update public.invites set use_count = use_count + 1
       where invites.token = p_token;
