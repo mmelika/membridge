@@ -96,9 +96,9 @@ Adapters tail each tool's local session logs → events merge into per-project h
 
 ## 8. Decision list (the TWEAKs, in one place)
 
-1. Build order — as listed, or M4 before M3?
-2. Chat in Plan tab — my strong rec: goal box, no chat. Veto?
-3. Zero-dep raw fetch vs official SDK for the API call — rec: raw fetch.
-4. OpenAI key field in v1 — rec: no.
-5. Planner default — rec: Haiku (~1¢), user-switchable.
-6. Anything to add/cut from M5 table?
+1. Build order? decision: as listed (M3 then m4)
+2. Chat in Plan tab — my strong rec: goal box, no chat. Decision: no
+3. Zero-dep raw fetch vs official SDK for the API call — rec: raw fetch. decision: approved rec
+4. OpenAI key field in v1 — rec: no. decsision: accepted 
+5. Planner default — rec: Haiku (~1¢), user-switchable. accepted 
+6. Anything to add/cut from M5 table? accepted 

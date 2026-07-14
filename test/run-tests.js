@@ -20,8 +20,15 @@ const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { buildGraph } = require('../lib/graph');
-const { startServer } = require('../lib/server');
+const { startServer, teamPayload } = require('../lib/server');
+const teamsync = require('../lib/teamsync');
+const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
+const memorydb = require('../lib/memorydb');
+const claudeAdapter = require('../lib/adapters/claude-code');
+const codexAdapter = require('../lib/adapters/codex');
+const hooks = require('../lib/hooks');
+const redactLib = require('../lib/redact');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -155,7 +162,7 @@ async function main() {
   check('secrets are redacted before injection', () => {
     const md = claudeMd();
     assert.ok(!md.includes('sk-test1234567890abcdef'), 'API key leaked');
-    assert.ok(md.includes('[redacted]'), 'no redaction marker');
+    assert.ok(md.includes('[redacted'), 'no redaction marker');
   });
   check('recently modified files are listed', () => {
     assert.ok(claudeMd().includes('login.js'), 'edited file missing');
@@ -391,16 +398,23 @@ async function main() {
       assert.ok(pageHtml.includes('Overview'), 'Overview tab missing');
       assert.ok(pageHtml.includes('Neural map'), 'Neural map tab missing');
     });
+    check('dashboard page has the full Team workspace', () => {
+      assert.ok(pageHtml.includes('view-auth'), 'account gate missing');
+      assert.ok(pageHtml.includes('view-team'), 'team view missing');
+      assert.ok(pageHtml.includes("path = '/api/team/' + kind"), 'account auth flow missing');
+      assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
+      assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
+      assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
+    });
     check('dashboard page has the Copy for AI button', () => {
       assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
     });
-    check('dashboard page has the project view and Plan copy', () => {
+    check('dashboard page has the project view', () => {
       assert.ok(pageHtml.includes('view-project'), 'project view missing');
-      assert.ok(pageHtml.includes('Just add your Anthropic key in'), 'Plan copy missing');
-      assert.ok(!pageHtml.includes('&#128274;'), 'lock glyph still on the page');
     });
-    check('dashboard page has the Settings screen', () => {
+    check('dashboard page has the Settings screen with BYOK', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
+      assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
       assert.ok(pageHtml.includes('Anthropic API key'), 'key section missing');
       assert.ok(pageHtml.includes('Planner model'), 'model section missing');
     });
@@ -461,7 +475,7 @@ async function main() {
     });
     check('copy-for-AI digest is redacted, unknown project 404s', () => {
       assert.ok(!copyBody.text.includes('sk-test1234567890abcdef'), 'secret leaked into copy digest');
-      assert.ok(copyBody.text.includes('[redacted]'), 'no redaction marker in copy digest');
+      assert.ok(copyBody.text.includes('[redacted'), 'no redaction marker in copy digest');
       assert.strictEqual(copyBad.status, 404, 'unknown project was accepted');
     });
 
@@ -567,7 +581,7 @@ async function main() {
       const body = JSON.stringify(lastPlanRequest);
       assert.ok(!body.includes('sk-goal-secret-9999'), 'goal secret reached the API');
       assert.ok(!body.includes('sk-test1234567890abcdef'), 'transcript secret reached the API');
-      assert.ok(body.includes('[redacted]'), 'redaction marker missing from the payload');
+      assert.ok(body.includes('[redacted'), 'redaction marker missing from the payload');
       assert.ok(body.includes('shop-app'), 'project name missing');
       assert.ok(body.includes('Build the login page with OAuth'), 'recent asks missing');
     });
@@ -591,6 +605,12 @@ async function main() {
       assert.strictEqual(gen401.status, 401);
     });
     await post(`${base}/api/settings`, { apiKey: '' });
+    const lowSave = await post(`${base}/api/settings`, { intervalSec: 3 });
+    check('settings: interval below the 15s floor is clamped', () => {
+      assert.strictEqual(lowSave.status, 200);
+      const rawCfg = JSON.parse(read(util.configPath()));
+      assert.strictEqual(rawCfg.intervalSec, 15, `interval persisted as ${rawCfg.intervalSec}`);
+    });
 
     // add a fresh, never-seen directory via the dashboard API
     const freshDir = path.join(ROOT, 'projects', 'fresh-app');
@@ -671,6 +691,1124 @@ async function main() {
       assert.ok(read(util.logPath()).includes(`dashboard on http://127.0.0.1:${PORT3}`), 'no bind log line');
     });
     await new Promise(r => srv.close(r));
+  }
+
+  // --- 8. team sync (mock Supabase: GoTrue + PostgREST + membership checks) ---
+  const mock = createMockSupabase();
+  await new Promise(r => mock.server.listen(17945, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17945';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  const HOME_A = process.env.MEMBRIDGE_HOME; // homeDir() reads env per call
+  const sameKey = (a, b) => a.toLowerCase() === path.resolve(b).toLowerCase();
+
+  check('team: backend resolves env > config > baked default', () => {
+    // env override in force now
+    assert.ok(teamsync.backend(util.getConfig()), 'env override not honored');
+    // with env cleared, this official build falls back to its baked backend,
+    // and a config override still takes precedence.
+    const savedUrl = process.env.MEMBRIDGE_TEAM_URL;
+    const savedKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    try {
+      assert.ok(teamsync.backend({}), 'baked backend missing');
+      assert.ok(teamsync.backend({ team: { url: 'https://x.supabase.co', anonKey: 'k' } }),
+        'config override not honored');
+    } finally {
+      process.env.MEMBRIDGE_TEAM_URL = savedUrl;
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey;
+    }
+  });
+
+  try {
+    // Marco: signup, team, link the shop-app project, first push.
+    const credsA = await teamsync.signup(util.getConfig(), 'marco@test.dev', 'pw-a', 'Marco');
+    check('team: signup stores credentials outside any project, chmod 600', () => {
+      assert.strictEqual(credsA.email, 'marco@test.dev');
+      assert.ok(teamsync.credentialsPath().startsWith(HOME_A), 'credentials not in MemBridge home');
+      const stored = JSON.parse(read(teamsync.credentialsPath()));
+      assert.strictEqual(stored.displayName, 'Marco');
+      assert.ok(stored.refreshToken, 'refresh token missing');
+      if (process.platform !== 'win32') {
+        assert.strictEqual(fs.statSync(teamsync.credentialsPath()).mode & 0o777, 0o600);
+      }
+    });
+
+    const team = await teamsync.createTeam(util.getConfig(), 'Acme');
+    const linkA = await teamsync.linkProject(util.getConfig(), proj1, team.team_id, 'Acme');
+    check('team: create + link write .membridge/team.json with the project id', () => {
+      assert.ok(team.team_id && team.invite_code, 'team ids missing');
+      const l = JSON.parse(read(path.join(proj1, '.membridge', 'team.json')));
+      assert.strictEqual(l.projectId, linkA.projectId);
+      assert.strictEqual(l.teamId, team.team_id);
+    });
+    const dashboardTeam = await teamPayload();
+    check('dashboard: team payload exposes identity, teams and linked projects without tokens', () => {
+      assert.strictEqual(dashboardTeam.authenticated, true);
+      assert.strictEqual(dashboardTeam.user.email, 'marco@test.dev');
+      assert.ok(dashboardTeam.teams.some(t => t.team_id === team.team_id), 'team missing');
+      assert.ok(dashboardTeam.linkedProjects.some(p => sameKey(p.path, proj1)), 'linked project missing');
+      assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.accessToken), 'access token exposed');
+      assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.refreshToken), 'refresh token exposed');
+    });
+
+    // proj1 was deleted+revived earlier, so its live history is the single
+    // "Ship the checkout flow" ask — enough to prove the push path end to end.
+    fs.appendFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Add the order confirmation email' }, cwd: proj1, timestamp: '2026-07-12T08:00:00.000Z' }) + '\n' +
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Wire the receipt PDF, api_key=sk-test1234567890abcdef' }, cwd: proj1, timestamp: '2026-07-12T08:01:00.000Z' }) + '\n',
+    );
+    syncOnce(); // fold the new asks into proj1's history before the first push
+    const rA = await teamsync.syncTeams();
+    check('team: push uploads only redacted digest entries', () => {
+      assert.ok(rA.synced.some(k => sameKey(k, proj1)), `synced said: ${JSON.stringify(rA)}`);
+      assert.ok(mock.entries.length >= 3, `expected >=3 pushed entries, got ${mock.entries.length}`);
+      const body = JSON.stringify(mock.entries);
+      assert.ok(!body.includes('sk-test1234567890abcdef'), 'secret reached the server');
+      assert.ok(body.includes('[redacted'), 'redaction marker missing server-side');
+      assert.ok(mock.entries.every(e => e.author_name === 'Marco'), 'author attribution wrong');
+    });
+
+    const pushedCount = mock.entries.length;
+    await teamsync.syncTeams();
+    check('team: re-sync is idempotent (cursor + server dedupe)', () => {
+      assert.strictEqual(mock.entries.length, pushedCount, 'duplicate entries pushed');
+    });
+
+    // Andrew: second machine (own MemBridge home), same repo basename, joins
+    // by invite code — link_project maps his clone to the same project row.
+    const projB = path.join(ROOT, 'projects-b', 'shop-app');
+    fs.mkdirSync(projB, { recursive: true });
+    fs.writeFileSync(path.join(projB, 'CLAUDE.md'), '# B clone\n\nAndrew notes.\n');
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-b');
+    util.ensureConfig();
+    const stateB = util.loadState();
+    stateB.projects = {
+      [projB]: {
+        events: [{ ts: '2026-07-12T09:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'Refactor checkout validation', session: 'b1' }],
+      },
+    };
+    util.saveState(stateB);
+    await teamsync.signup(util.getConfig(), 'andrew@test.dev', 'pw-b', 'Andrew');
+    const joined = await teamsync.joinTeam(util.getConfig(), team.invite_code);
+    const linkB = await teamsync.linkProject(util.getConfig(), projB, joined.team_id, joined.team_name);
+    check('team: invite-code join maps the clone to the same project row', () => {
+      assert.strictEqual(joined.team_id, team.team_id);
+      assert.strictEqual(joined.team_name, 'Acme');
+      assert.strictEqual(linkB.projectId, linkA.projectId, 'clone got a different project row');
+    });
+
+    const rB = await teamsync.syncTeams();
+    for (const k of rB.changed) syncOnce({ project: k });
+    check("team: Andrew pulls Marco's asks into his context block", () => {
+      assert.ok(rB.changed.some(k => sameKey(k, projB)), `changed said: ${JSON.stringify(rB)}`);
+      const md = read(path.join(projB, 'CLAUDE.md'));
+      assert.ok(md.startsWith('# B clone'), 'his own notes were lost');
+      assert.ok(md.includes("Teammates' AI activity"), 'team section missing');
+      assert.ok(md.includes('Marco'), 'author name missing');
+      assert.ok(md.includes('Ship the checkout flow'), "Marco's ask missing");
+      assert.ok(!md.includes('sk-test1234567890abcdef'), 'secret leaked into teammate file');
+    });
+
+    // Back to Marco: his next pass pulls Andrew's Codex ask.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const rA2 = await teamsync.syncTeams();
+    for (const k of rA2.changed) syncOnce({ project: k });
+    check("team: Marco pulls Andrew's ask back, with attribution", () => {
+      assert.ok(rA2.changed.some(k => sameKey(k, proj1)), `changed said: ${JSON.stringify(rA2)}`);
+      const md = claudeMd();
+      assert.ok(md.includes("Teammates' AI activity"), 'team section missing');
+      assert.ok(md.includes('Andrew · Codex: Refactor checkout validation'), "Andrew's ask missing");
+    });
+
+    // ----- team v2 (002_team_v2.sql): invite links, roles, feed, auto-link -----
+    const MOCK_URL = 'http://127.0.0.1:17945';
+    // Direct RPC helper for endpoints teamsync has no wrapper for (web-only).
+    const rpcAs = async (home, fn, args) => {
+      const saved = process.env.MEMBRIDGE_HOME;
+      process.env.MEMBRIDGE_HOME = home;
+      const creds = await teamsync.getAccessToken(util.getConfig());
+      process.env.MEMBRIDGE_HOME = saved;
+      const res = await fetch(`${MOCK_URL}/rest/v1/rpc/${fn}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', apikey: 'anon-test', Authorization: `Bearer ${creds.accessToken}` },
+        body: JSON.stringify(args),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((data && data.message) || `rpc ${fn}: ${res.status}`);
+      return data;
+    };
+    const gitRepo = (dir, remote) => {
+      fs.mkdirSync(dir, { recursive: true });
+      spawnSync('git', ['init', '-q'], { cwd: dir });
+      spawnSync('git', ['-C', dir, 'remote', 'add', 'origin', remote]);
+    };
+    const HOME_B = path.join(ROOT, 'home-b');
+
+    // Marco (owner) mints an invite link.
+    const inv1 = await teamsync.createInvite(util.getConfig(), team.team_id, {});
+    check('invites: owner mints a short URL-safe token; URL parsing round-trips', () => {
+      assert.ok(/^[A-Za-z0-9_-]{8,}$/.test(inv1.token), `token was ${inv1.token}`);
+      assert.strictEqual(inv1.url, null, 'no web app configured, url must be null');
+      assert.strictEqual(teamsync.parseInviteToken(`https://app.membridge.dev/join/${inv1.token}`), inv1.token);
+      assert.strictEqual(teamsync.parseInviteToken(`  ${inv1.token}  `), inv1.token);
+      process.env.MEMBRIDGE_TEAM_WEB_URL = 'https://app.membridge.dev/';
+      assert.strictEqual(teamsync.inviteUrl(util.getConfig(), inv1.token), `https://app.membridge.dev/join/${inv1.token}`);
+      delete process.env.MEMBRIDGE_TEAM_WEB_URL;
+    });
+
+    // A plain member cannot mint one.
+    process.env.MEMBRIDGE_HOME = HOME_B;
+    let memberInviteErr = null;
+    try {
+      await teamsync.createInvite(util.getConfig(), team.team_id, {});
+    } catch (err) {
+      memberInviteErr = err;
+    }
+    check('invites: a plain member cannot create invite links', () => {
+      assert.ok(memberInviteErr && /owner or admin/i.test(memberInviteErr.message), `said: ${memberInviteErr && memberInviteErr.message}`);
+    });
+
+    // Dana joins by pasting the full /join URL.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    util.ensureConfig();
+    await teamsync.signup(util.getConfig(), 'dana@test.dev', 'pw-d', 'Dana');
+    const danaJoin = await teamsync.join(util.getConfig(), `https://app.membridge.dev/join/${inv1.token}`);
+    check('invites: redeem via pasted /join URL grants member role only', () => {
+      assert.strictEqual(danaJoin.team_name, 'Acme');
+      const m = mock.members.find(x => x.displayName === 'Dana');
+      assert.ok(m, 'Dana not a member');
+      assert.strictEqual(m.role, 'member');
+      assert.strictEqual(mock.invites.get(inv1.token).useCount, 1, 'use_count not incremented');
+    });
+
+    // Revocation, expiry and max-uses.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const inv2 = await teamsync.createInvite(util.getConfig(), team.team_id, { maxUses: 1 });
+    const invExpired = await teamsync.createInvite(util.getConfig(), team.team_id, { expiresAt: new Date(Date.now() - 1000).toISOString() });
+    await teamsync.revokeInvite(util.getConfig(), inv1.token);
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-e');
+    util.ensureConfig();
+    await teamsync.signup(util.getConfig(), 'erin@test.dev', 'pw-e', 'Erin');
+    let revokedErr = null;
+    try {
+      await teamsync.join(util.getConfig(), inv1.token);
+    } catch (err) {
+      revokedErr = err;
+    }
+    await teamsync.join(util.getConfig(), inv2.token); // burns the single use
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-f');
+    util.ensureConfig();
+    await teamsync.signup(util.getConfig(), 'frank@test.dev', 'pw-f', 'Frank');
+    let usedErr = null;
+    let expiredErr = null;
+    try {
+      await teamsync.join(util.getConfig(), inv2.token);
+    } catch (err) {
+      usedErr = err;
+    }
+    try {
+      await teamsync.join(util.getConfig(), invExpired.token);
+    } catch (err) {
+      expiredErr = err;
+    }
+    check('invites: revoked, exhausted and expired links are all refused', () => {
+      assert.ok(revokedErr && /revoked/i.test(revokedErr.message), `revoked said: ${revokedErr && revokedErr.message}`);
+      assert.ok(usedErr && /already been used/i.test(usedErr.message), `used said: ${usedErr && usedErr.message}`);
+      assert.ok(expiredErr && /expired/i.test(expiredErr.message), `expired said: ${expiredErr && expiredErr.message}`);
+    });
+
+    // Roles: owner promotes Andrew to admin; as admin he can mint invites.
+    const andrewId = mock.members.find(m => m.displayName === 'Andrew').userId;
+    await rpcAs(HOME_A, 'set_role', { p_team: team.team_id, p_user: andrewId, p_role: 'admin' });
+    process.env.MEMBRIDGE_HOME = HOME_B;
+    const adminInv = await teamsync.createInvite(util.getConfig(), team.team_id, {});
+    let demoteErr = null;
+    try {
+      await rpcAs(HOME_B, 'set_role', { p_team: team.team_id, p_user: andrewId, p_role: 'member' });
+    } catch (err) {
+      demoteErr = err;
+    }
+    check('roles: owner promotes to admin; admin manages invites but not roles', () => {
+      assert.strictEqual(mock.members.find(m => m.userId === andrewId).role, 'admin');
+      assert.ok(adminInv.token, 'admin could not mint an invite');
+      assert.ok(demoteErr && /only the team owner/i.test(demoteErr.message), `said: ${demoteErr && demoteErr.message}`);
+    });
+
+    // Feed read model: one call, filters, keyset pagination.
+    const feedAll = await rpcAs(HOME_A, 'team_feed', { p_team: team.team_id, p_limit: 50 });
+    const feedCodex = await rpcAs(HOME_A, 'team_feed', { p_team: team.team_id, p_source: 'Codex' });
+    const feedPage1 = await rpcAs(HOME_A, 'team_feed', { p_team: team.team_id, p_limit: 1 });
+    const feedPage2 = await rpcAs(HOME_A, 'team_feed', {
+      p_team: team.team_id, p_limit: 1,
+      p_before_created_at: feedPage1[0].created_at, p_before_id: feedPage1[0].id,
+    });
+    check('feed: team_feed joins project names, filters by tool, paginates by keyset', () => {
+      assert.ok(feedAll.length >= 3, `expected >=3 rows, got ${feedAll.length}`);
+      assert.ok(feedAll.every(r => r.project_name === 'shop-app'), 'project_name missing');
+      const authors = new Set(feedAll.map(r => r.author_name));
+      assert.ok(authors.has('Marco') && authors.has('Andrew'), `authors were ${[...authors]}`);
+      assert.ok(feedCodex.length >= 1 && feedCodex.every(r => r.source === 'Codex'), 'tool filter failed');
+      assert.strictEqual(feedPage1.length, 1);
+      assert.strictEqual(feedPage2.length, 1);
+      assert.notStrictEqual(feedPage1[0].id, feedPage2[0].id, 'keyset returned the same row');
+    });
+
+    // Auto-link: Marco links a git-remoted project; credentials in the remote
+    // URL must never reach the server.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const projApi = path.join(ROOT, 'projects', 'api-server');
+    gitRepo(projApi, 'https://marco:tok123@github.com/acme/api-server.git');
+    const apiLink = await teamsync.linkProject(util.getConfig(), projApi, team.team_id, 'Acme');
+    check('privacy: git remote credentials are stripped before anything is uploaded', () => {
+      assert.strictEqual(teamsync.repoUrl(projApi), 'github.com/acme/api-server');
+      const row = mock.projects.find(p => p.id === apiLink.projectId);
+      assert.strictEqual(row.repoUrl, 'github.com/acme/api-server');
+      assert.ok(!JSON.stringify(mock.projects).includes('tok123'), 'credential reached the server');
+    });
+
+    // Dana's clone (ssh remote, same repo): suggested, NOT auto-linked.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-d');
+    const danaApi = path.join(ROOT, 'projects-d', 'api-server');
+    gitRepo(danaApi, 'git@github.com:acme/api-server.git');
+    const stateD = util.loadState();
+    stateD.projects = { [danaApi]: { events: [{ ts: '2026-07-12T11:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Add rate limiting', session: 'd1' }] } };
+    util.saveState(stateD);
+    const rD = await teamsync.syncTeams();
+    check('auto-link: a matching remote is suggested, never silently shared', () => {
+      assert.ok(rD.suggested.some(k => sameKey(k, danaApi)), `suggested said: ${JSON.stringify(rD.suggested)}`);
+      const s = util.loadState().projects[danaApi].teamSuggestion;
+      assert.ok(s && s.teamName === 'Acme' && s.repoUrl === 'github.com/acme/api-server', `suggestion was ${JSON.stringify(s)}`);
+      assert.ok(!teamsync.loadTeamLink(danaApi), 'project was linked without consent');
+      assert.ok(!mock.entries.some(e => e.ask.includes('rate limiting')), 'entries pushed without consent');
+    });
+    const danaLink = await teamsync.resolveSuggestion(util.getConfig(), danaApi, true);
+    await teamsync.syncTeams();
+    check('auto-link: accepting the suggestion links the clone to the same project row', () => {
+      assert.strictEqual(danaLink.projectId, apiLink.projectId, 'clone got a different project row');
+      assert.ok(!util.loadState().projects[danaApi].teamSuggestion, 'suggestion not cleared');
+      assert.ok(mock.entries.some(e => e.ask.includes('rate limiting')), 'entries not pushed after accept');
+    });
+
+    // Erin opts into full auto-link: her clone links without a prompt.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-e');
+    const erinCfg = util.loadUserConfig();
+    erinCfg.team = { ...(erinCfg.team || {}), autoLink: true };
+    util.saveUserConfig(erinCfg);
+    const erinApi = path.join(ROOT, 'projects-e', 'api-server');
+    gitRepo(erinApi, 'https://github.com/acme/api-server.git');
+    const stateE = util.loadState();
+    stateE.projects = { [erinApi]: { events: [] } };
+    util.saveState(stateE);
+    await teamsync.syncTeams();
+    check('auto-link: config team.autoLink=true links matching clones automatically', () => {
+      const link = teamsync.loadTeamLink(erinApi);
+      assert.ok(link, 'not auto-linked');
+      assert.strictEqual(link.projectId, apiLink.projectId);
+    });
+
+    // Privacy: entries never carry a foreign path — not even its basename.
+    check('privacy: files outside the project are dropped from entries', () => {
+      const ents = memorydb.buildEntries(proj1, {
+        events: [
+          { ts: '2026-07-12T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'tweak global config', session: 'x1' },
+          { ts: '2026-07-12T12:00:01.000Z', source: 'Claude Code', kind: 'edit', file: '/Users/alice/secret-place/config.js', session: 'x1' },
+        ],
+      }, util.getConfig());
+      assert.deepStrictEqual(ents[ents.length - 1].files, []);
+      assert.ok(!JSON.stringify(ents).includes('config.js'), 'foreign basename leaked into entries');
+    });
+
+    // CLI: `membridge join <token>` signs the account up when it is new.
+    // Async spawn, NOT spawnSync: the mock backend lives in this process, and
+    // spawnSync would block the event loop the mock answers from (deadlock).
+    const HOME_CLI2 = path.join(ROOT, 'home-cli2');
+    const joinOut = await new Promise(resolve => {
+      const child = spawn(process.execPath,
+        [BIN, 'join', adminInv.token, '--email', 'cli@test.dev', '--password', 'pw-cli', '--name', 'CLI'],
+        { env: { ...process.env, MEMBRIDGE_HOME: HOME_CLI2 } });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', d => { stdout += d; });
+      child.stderr.on('data', d => { stderr += d; });
+      child.on('close', () => resolve({ stdout, stderr }));
+    });
+    check('CLI: membridge join signs up and joins in one command', () => {
+      assert.ok(/Joined team "Acme"/.test(joinOut.stdout), `join said: ${joinOut.stdout} ${joinOut.stderr}`);
+      assert.ok(mock.members.some(m => m.displayName === 'CLI' && m.role === 'member'), 'CLI user not a member');
+    });
+    process.env.MEMBRIDGE_HOME = HOME_A;
+
+    // Stale token: the next call must transparently use the refresh grant.
+    const stale = teamsync.loadCredentials();
+    stale.expiresAt = Date.now() - 1000;
+    fs.writeFileSync(teamsync.credentialsPath(), JSON.stringify(stale));
+    const refreshesBefore = mock.stats.refreshCalls;
+    await teamsync.getAccessToken(util.getConfig());
+    check('team: stale access token refreshes transparently', () => {
+      assert.strictEqual(mock.stats.refreshCalls, refreshesBefore + 1, 'refresh grant not used');
+    });
+
+    // Mallory: signed up but never joined the team; a hand-crafted team.json
+    // must not let her push into (or read) the team's project.
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-c');
+    util.ensureConfig();
+    const projC = path.join(ROOT, 'projects-c', 'shop-app');
+    fs.mkdirSync(path.join(projC, '.membridge'), { recursive: true });
+    fs.writeFileSync(path.join(projC, '.membridge', 'team.json'),
+      JSON.stringify({ projectId: linkA.projectId, teamId: team.team_id }));
+    const stateC = util.loadState();
+    stateC.projects = {
+      [projC]: {
+        events: [{ ts: '2026-07-12T10:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'sneaky non-member write', session: 'c1' }],
+      },
+    };
+    util.saveState(stateC);
+    await teamsync.signup(util.getConfig(), 'mallory@test.dev', 'pw-c', 'Mallory');
+    const rC = await teamsync.syncTeams();
+    check('team: a non-member cannot push into or pull from the project', () => {
+      assert.strictEqual(rC.changed.length, 0, 'non-member pulled entries');
+      assert.strictEqual(rC.errors.length, 1, `errors said: ${JSON.stringify(rC.errors)}`);
+      assert.ok(/security|member/i.test(rC.errors[0]), `error said: ${rC.errors[0]}`);
+      assert.ok(!JSON.stringify(mock.entries).includes('sneaky'), 'non-member row was stored');
+      assert.ok(mock.stats.deniedInserts >= 1, 'mock never denied the insert');
+    });
+
+    // CLI: `team setup` persists the backend; `logout` clears credentials.
+    const HOME_CLI = path.join(ROOT, 'home-cli');
+    const envT = { ...process.env, MEMBRIDGE_HOME: HOME_CLI };
+    const setupOut = spawnSync(process.execPath,
+      [BIN, 'team', 'setup', '--url', 'http://127.0.0.1:17945', '--anon-key', 'anon-test'],
+      { env: envT, encoding: 'utf8' });
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    const logoutOut = spawnSync(process.execPath, [BIN, 'logout'], { env: { ...process.env }, encoding: 'utf8' });
+    check('CLI: team setup persists the backend, logout clears credentials', () => {
+      assert.ok(/team backend saved/i.test(setupOut.stdout), `setup said: ${setupOut.stdout} ${setupOut.stderr}`);
+      const cfg = JSON.parse(read(path.join(HOME_CLI, 'config.json')));
+      assert.strictEqual(cfg.team.url, 'http://127.0.0.1:17945');
+      assert.ok(/Logged out/.test(logoutOut.stdout), `logout said: ${logoutOut.stdout}`);
+      assert.ok(!fs.existsSync(teamsync.credentialsPath()), 'credentials survive logout');
+    });
+  } finally {
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock.server.close(r));
+  }
+
+  // --- 9. rich signals: todos + agent summaries ---
+  const projR = path.join(ROOT, 'projects', 'rich-app');
+  fs.mkdirSync(projR, { recursive: true });
+  const rDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-rich-app');
+  fs.mkdirSync(rDir, { recursive: true });
+  const OLD_SUMMARY = 'Refactored the payment retry queue: exponential backoff with jitter is in, the dead-letter queue is wired, and idempotency is covered by tests. Rotated api_key=sk-test1234567890abcdef.';
+  const NEW_SUMMARY = 'All retry-queue work is finished: backoff, dead-letter wiring and the idempotency suite all pass in CI.';
+  fs.writeFileSync(path.join(rDir, 'sessR.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Refactor the payment retry queue with backoff' }, cwd: projR, timestamp: '2026-07-12T09:00:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'TodoWrite', input: { todos: [
+      { content: 'Add exponential backoff', status: 'completed', activeForm: 'Adding backoff' },
+      { content: 'Wire the dead-letter queue token=secret-todo-999', status: 'in_progress', activeForm: 'Wiring DLQ' },
+      { content: 'Cover idempotency with tests', status: 'pending', activeForm: 'Covering idempotency' },
+    ] } }] }, cwd: projR, timestamp: '2026-07-12T09:01:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projR, 'src', 'queue.js') } }] }, cwd: projR, timestamp: '2026-07-12T09:02:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: OLD_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:03:00.000Z' },
+  ]));
+  // A second session whose final text is under the 80-char summary bar.
+  fs.writeFileSync(path.join(rDir, 'sessShort.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Quick tweak to the readme' }, cwd: projR, timestamp: '2026-07-12T09:10:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] }, cwd: projR, timestamp: '2026-07-12T09:11:00.000Z' },
+  ]));
+  syncOnce();
+  const richMd = () => read(path.join(projR, 'CLAUDE.md'));
+  const richEvents = () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === projR.toLowerCase());
+    return state.projects[key].events;
+  };
+
+  check('rich: adapter extracts todos and summary events from the transcript', () => {
+    const evs = richEvents();
+    const todos = evs.find(e => e.kind === 'todos' && e.session === 'sessR');
+    assert.ok(todos, 'todos event missing');
+    assert.strictEqual(todos.items.length, 3);
+    assert.deepStrictEqual(todos.items[0], { text: 'Add exponential backoff', status: 'completed' });
+    const summary = evs.find(e => e.kind === 'summary' && e.session === 'sessR');
+    assert.ok(summary, 'summary event missing');
+    assert.strictEqual(summary.text, OLD_SUMMARY);
+    assert.strictEqual(summary.ts, '2026-07-12T09:03:00.000Z');
+  });
+  check('rich: a final text under 80 chars is not emitted as a summary', () => {
+    assert.ok(!richEvents().some(e => e.kind === 'summary' && e.session === 'sessShort'), 'short text became a summary');
+  });
+  check('rich: renderBlock groups by session with Ask/Result/Tasks/Files', () => {
+    const md = richMd();
+    assert.ok(md.includes('Ask: Refactor the payment retry queue with backoff'), 'Ask line missing');
+    assert.ok(md.includes('Result: Refactored the payment retry queue'), 'Result line missing');
+    assert.ok(md.includes('Tasks: 1/3 done'), 'Tasks line missing');
+    assert.ok(md.includes('Files: src/queue.js'), 'Files line missing');
+    // the summary-less session keeps the original one-line ask format
+    assert.ok(md.includes('Claude Code: Quick tweak to the readme'), 'fallback one-liner missing');
+  });
+  check('rich: summaries and todo items are redacted everywhere they land', () => {
+    assert.ok(!richMd().includes('sk-test1234567890abcdef'), 'summary secret leaked into the block');
+    assert.ok(richMd().includes('[redacted'), 'no redaction marker in the block');
+    const db = JSON.parse(read(path.join(projR, '.membridge', 'memory.json')));
+    const entry = db.entries.find(e => e.summary);
+    assert.ok(entry, 'no entry carries a summary');
+    assert.ok(entry.summary.includes('[redacted') && !entry.summary.includes('sk-test1234567890abcdef'), 'entry summary not redacted');
+    assert.deepStrictEqual({ done: entry.tasks.done, total: entry.tasks.total }, { done: 1, total: 3 });
+    const raw = read(path.join(projR, '.membridge', 'memory.json')) + read(path.join(projR, '.membridge', 'memory.md'));
+    assert.ok(!raw.includes('secret-todo-999'), 'todo item secret leaked into the memory DB');
+    assert.ok(read(path.join(projR, '.membridge', 'memory.md')).includes('Result: '), 'memory.md has no Result line');
+  });
+  check('rich: copy-for-AI digest shows the Result line', () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === projR.toLowerCase());
+    const text = memorydb.renderCopyText(projR, state.projects[key], util.getConfig());
+    assert.ok(text.includes('Result: '), 'Result line missing from copy digest');
+    assert.ok(!text.includes('sk-test1234567890abcdef'), 'secret leaked into copy digest');
+  });
+
+  // Incremental: the session keeps going, a fresh final text lands. The new
+  // summary event supersedes the old one in rendering (latest per session).
+  fs.appendFileSync(path.join(rDir, 'sessR.jsonl'),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship it once CI is green' }, cwd: projR, timestamp: '2026-07-12T09:20:00.000Z' }) + '\n' +
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: NEW_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:21:00.000Z' }) + '\n');
+  syncOnce();
+  check('rich: incremental reads produce a superseding summary in rendering', () => {
+    const summaries = richEvents().filter(e => e.kind === 'summary' && e.session === 'sessR');
+    assert.strictEqual(summaries.length, 2, `expected 2 summary events, got ${summaries.length}`);
+    const md = richMd();
+    assert.ok(md.includes('all pass in CI'), 'updated summary missing');
+    assert.ok(!md.includes('exponential backoff with jitter'), 'stale summary still rendered');
+  });
+
+  // Adapter units: item cap, and both Codex agent_message payload shapes.
+  check('rich: todos items are capped at 20 per event', () => {
+    const todos = Array.from({ length: 25 }, (_, i) => ({ content: `task ${i}`, status: 'pending' }));
+    const evs = claudeAdapter.extractEvents([
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'TodoWrite', input: { todos } }] }, cwd: projR, timestamp: '2026-07-12T10:00:00.000Z' },
+    ], {});
+    const ev = evs.find(e => e.kind === 'todos');
+    assert.strictEqual(ev.items.length, 20, `stored ${ev.items.length} items`);
+  });
+  check('rich: codex summaries parse both string and content-array payloads', () => {
+    const long = 'The Codex agent finished the task: it rewrote the retry logic and added regression tests for the queue.';
+    const meta = { timestamp: '2026-07-12T10:00:00.000Z', type: 'session_meta', payload: { id: 'x', cwd: projR } };
+    const asString = codexAdapter.extractEvents([
+      meta,
+      { timestamp: '2026-07-12T10:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', message: long } },
+    ], {});
+    const asArray = codexAdapter.extractEvents([
+      meta,
+      { timestamp: '2026-07-12T10:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', content: [{ type: 'output_text', text: long }] } },
+    ], {});
+    for (const evs of [asString, asArray]) {
+      const s = evs.find(e => e.kind === 'summary');
+      assert.ok(s, 'codex summary missing');
+      assert.strictEqual(s.text, long);
+      assert.strictEqual(s.project, projR);
+    }
+    const short = codexAdapter.extractEvents([
+      meta,
+      { timestamp: '2026-07-12T10:01:00.000Z', type: 'event_msg', payload: { type: 'agent_message', message: 'Done.' } },
+    ], {});
+    assert.ok(!short.some(e => e.kind === 'summary'), 'short codex text became a summary');
+  });
+
+  // Rendering fixes: out-of-project files, markdown summaries, missing asks.
+  const MD_SUMMARY = '## Build patch\n\n**Rewrote** the scratch build runner and `verified` it twice | all targets\n```bash\nmake test\n```\nGreen across the board.';
+  fs.writeFileSync(path.join(rDir, 'sessOut.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Patch the temp build script' }, cwd: projR, timestamp: '2026-07-12T09:30:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(ROOT, 'outside-place', 'tmp-script.sh') } }] }, cwd: projR, timestamp: '2026-07-12T09:31:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: MD_SUMMARY }] }, cwd: projR, timestamp: '2026-07-12T09:32:00.000Z' },
+  ]));
+  // A session whose only capture is the agent's self-report (no user prompt).
+  fs.writeFileSync(path.join(rDir, 'sessNoAsk.jsonl'), jsonl([
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Resumed after a crash and finished wiring the webhook retries; the full suite is passing again.' }] }, cwd: projR, timestamp: '2026-07-12T09:40:00.000Z' },
+  ]));
+  syncOnce();
+
+  check('fix: out-of-project files are excluded from the block and memory DB', () => {
+    const md = richMd();
+    assert.ok(md.includes('Files: (outside project)'), 'placeholder missing for an outside-only session');
+    assert.ok(!md.includes('tmp-script.sh') && !md.includes('outside-place'), 'foreign path leaked into the block');
+    const mem = read(path.join(projR, '.membridge', 'memory.json')) + read(path.join(projR, '.membridge', 'memory.md'));
+    assert.ok(!mem.includes('tmp-script.sh') && !mem.includes('outside-place'), 'foreign path leaked into the memory DB');
+  });
+  check('fix: plainText flattens markdown before clipping', () => {
+    const flat = digest.plainText('## Heading\n**bold** and `inline` text\n```js\nlet x = 1\n```\ncol a | col b');
+    assert.strictEqual(flat, 'Heading bold and inline text let x = 1 col a col b');
+    const line = richMd().split('\n').find(l => l.includes('Rewrote the scratch build runner'));
+    assert.ok(line && line.trim().startsWith('Result:'), 'flattened summary missing from the block');
+    assert.ok(!/[*`|#]/.test(line), `markdown survived into the Result line: ${line}`);
+  });
+  check('fix: a summary-only session renders Ask: (not captured)', () => {
+    const md = richMd();
+    assert.ok(md.includes('Ask: (not captured)'), 'placeholder Ask line missing');
+    assert.ok(md.includes('finished wiring the webhook retries'), 'prompt-less summary missing');
+  });
+
+  // Team push carries the redacted summary (fresh mock: section 8's is gone).
+  const mock2 = createMockSupabase();
+  await new Promise(r => mock2.server.listen(17946, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17946';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  try {
+    await teamsync.signup(util.getConfig(), 'rich@test.dev', 'pw-r', 'Rich');
+    const teamR = await teamsync.createTeam(util.getConfig(), 'RichTeam');
+    await teamsync.linkProject(util.getConfig(), projR, teamR.team_id, 'RichTeam');
+    await teamsync.syncTeams({ project: projR });
+    check('rich: pushed entries include the redacted summary, never todo text', () => {
+      const withSummary = mock2.entries.filter(e => e.summary);
+      assert.ok(withSummary.length >= 1, `no pushed entry carries a summary (${mock2.entries.length} rows)`);
+      assert.ok(withSummary.some(e => e.summary.includes('[redacted')), 'pushed summary not redacted');
+      assert.ok(mock2.entries.every(e => !e.summary || e.summary.length <= 300), 'summary over the 300-char cap');
+      const body = JSON.stringify(mock2.entries);
+      assert.ok(!body.includes('sk-test1234567890abcdef'), 'summary secret reached the server');
+      assert.ok(!body.includes('secret-todo-999'), 'todo item text reached the server');
+      assert.ok(mock2.entries.some(e => e.summary === null), 'summary-less entries should push null');
+    });
+    check('fix: out-of-project files never reach the server', () => {
+      const row = mock2.entries.find(e => e.ask.includes('Patch the temp build script'));
+      assert.ok(row, 'sessOut entry not pushed');
+      assert.deepStrictEqual(row.files, [], `files said: ${JSON.stringify(row.files)}`);
+      assert.ok(!JSON.stringify(mock2.entries).includes('tmp-script.sh'), 'foreign path reached the server');
+    });
+  } finally {
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock2.server.close(r));
+  }
+
+  // --- 10. distillation: Stop hook, settings surgery, Distilled precedence ---
+  const summariesFile = path.join(projR, '.membridge', 'summaries.jsonl');
+  const runHook = payload => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
+    input: JSON.stringify(payload), encoding: 'utf8', env: { ...process.env },
+  });
+  const stopPayload = (session, extra) => ({
+    session_id: session, cwd: projR, hook_event_name: 'Stop',
+    transcript_path: path.join(rDir, `${session}.jsonl`), stop_hook_active: false, ...extra,
+  });
+  // Raw stdin + arbitrary env, for the fail-open paths the JSON helper can't reach.
+  const runHookRaw = (input, env) => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
+    input, encoding: 'utf8', env: { ...process.env, ...env },
+  });
+
+  // Fail-open on the most common real path: the hook is installed but the
+  // daemon never ran, so MEMBRIDGE_HOME has no state.json at all. And on
+  // garbage/empty stdin (not a real hook invocation). Both must exit 0 silent.
+  check('distill: hook fails open on a fresh HOME with no state and on garbage stdin', () => {
+    const freshHome = path.join(ROOT, 'distill-fresh-home');
+    const env = { MEMBRIDGE_HOME: freshHome };
+    assert.ok(!fs.existsSync(path.join(freshHome, 'state.json')), 'fresh home should have no state');
+    for (const [label, out] of [
+      ['fresh home, valid payload', runHookRaw(JSON.stringify(stopPayload('sessR')), env)],
+      ['garbage stdin', runHookRaw('not json at all', env)],
+      ['empty stdin', runHookRaw('', env)],
+      ['valid JSON, wrong type', runHookRaw('42', env)],
+    ]) {
+      assert.strictEqual(out.status, 0, `${label}: exit ${out.status} (${out.stderr})`);
+      assert.strictEqual(out.stdout, '', `${label}: wrote to stdout: ${out.stdout}`);
+      assert.strictEqual(out.stderr, '', `${label}: wrote to stderr: ${out.stderr}`);
+    }
+  });
+
+  check('distill: pickSummary prefers Distilled over a newer harvested summary', () => {
+    const distilledOlder = { ts: '2026-07-12T09:00:00.000Z', source: 'Distilled', kind: 'summary', session: 's', text: 'D' };
+    const harvestedNewer = { ts: '2026-07-12T09:59:00.000Z', source: 'Claude Code', kind: 'summary', session: 's', text: 'H' };
+    assert.strictEqual(digest.pickSummary([distilledOlder, harvestedNewer]), distilledOlder);
+    // same tier: the later event wins; session filter narrows
+    const h2 = { ...harvestedNewer, ts: '2026-07-12T10:30:00.000Z', text: 'H2' };
+    assert.strictEqual(digest.pickSummary([harvestedNewer, h2]), h2);
+    assert.strictEqual(digest.pickSummary([distilledOlder, harvestedNewer], 'nope'), null);
+  });
+
+  const blockOut = runHook(stopPayload('sessR'));
+  check('distill: hook stop blocks with exact decision/reason JSON when no summary exists', () => {
+    assert.strictEqual(blockOut.status, 0, blockOut.stderr);
+    assert.strictEqual(blockOut.stderr, '', 'hook wrote to stderr');
+    const parsed = JSON.parse(blockOut.stdout);
+    assert.deepStrictEqual(Object.keys(parsed).sort(), ['decision', 'reason']);
+    assert.strictEqual(parsed.decision, 'block');
+    assert.ok(parsed.reason.includes(summariesFile), 'reason lacks the absolute summaries.jsonl path');
+    assert.ok(parsed.reason.includes('"session":"sessR"'), 'reason lacks the session id in the schema');
+    assert.ok(parsed.reason.includes('"did"') && parsed.reason.includes('"decisions"') && parsed.reason.includes('"gotchas"'), 'reason lacks the line schema');
+  });
+  check('distill: loop guard — stop_hook_active true never blocks twice', () => {
+    const out = runHook(stopPayload('sessR', { stop_hook_active: true }));
+    assert.strictEqual(out.status, 0);
+    assert.strictEqual(out.stdout, '');
+  });
+  check('distill: worthiness gate — a session with no edits is not blocked', () => {
+    const out = runHook(stopPayload('sessShort'));
+    assert.strictEqual(out.status, 0);
+    assert.strictEqual(out.stdout, '');
+  });
+  {
+    const rawCfg = util.loadUserConfig();
+    rawCfg.distill = { enabled: false };
+    util.saveUserConfig(rawCfg);
+    const out = runHook(stopPayload('sessR'));
+    delete rawCfg.distill;
+    util.saveUserConfig(rawCfg);
+    check('distill: hook exits immediately when distill.enabled is false', () => {
+      assert.strictEqual(out.status, 0);
+      assert.strictEqual(out.stdout, '');
+    });
+  }
+  fs.writeFileSync(summariesFile,
+    'this is {not json\n' +
+    JSON.stringify({ session: 'sessOther', ts: '2026-07-12T09:44:00.000Z', did: 'Tuned the CI cache keys so cold builds stopped thrashing the runner disks entirely.', decisions: '', gotchas: '' }) + '\n');
+  check('distill: malformed summaries.jsonl lines count as absent, no crash', () => {
+    const out = runHook(stopPayload('sessR'));
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.strictEqual(JSON.parse(out.stdout).decision, 'block', 'malformed line was treated as a summary');
+  });
+  fs.appendFileSync(summariesFile,
+    JSON.stringify({ session: 'sessR', ts: '2026-07-12T09:45:00.000Z', did: 'Rebuilt the retry queue end to end; the flaky legacy path is gone.', decisions: 'Kept the queue schema; only consumers changed.', gotchas: '' }) + '\n');
+  check('distill: hook allows the stop once a valid summary line exists', () => {
+    const out = runHook(stopPayload('sessR'));
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.strictEqual(out.stdout, '');
+  });
+
+  // A fresh session with BOTH a harvested and a distilled summary, recent
+  // enough to clear the team-push cursor left by the section-9 sync.
+  fs.writeFileSync(path.join(rDir, 'sessD.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Harden the webhook auth' }, cwd: projR, timestamp: '2026-07-12T09:50:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projR, 'src', 'webhook.js') } }] }, cwd: projR, timestamp: '2026-07-12T09:51:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Harvested note: webhook auth hardened with HMAC verification and replay-window checks everywhere.' }] }, cwd: projR, timestamp: '2026-07-12T09:52:00.000Z' },
+  ]));
+  fs.appendFileSync(summariesFile,
+    JSON.stringify({ session: 'sessD', ts: '2026-07-12T09:53:00.000Z', did: 'Hardened the webhook auth with HMAC and a replay window; rotated api_key=sk-distilled-secret-123.', decisions: '', gotchas: 'Clock skew over 30s breaks verification.' }) + '\n');
+  syncOnce();
+
+  check('distill: summaries.jsonl is merged as Distilled events with offsets tracked', () => {
+    const evs = richEvents();
+    const d = evs.filter(e => e.kind === 'summary' && e.source === 'Distilled');
+    assert.ok(d.some(e => e.session === 'sessR') && d.some(e => e.session === 'sessD') && d.some(e => e.session === 'sessOther'),
+      `distilled sessions were: ${JSON.stringify(d.map(e => e.session))}`);
+    assert.ok(d.find(e => e.session === 'sessD').text.includes('Gotchas: Clock skew'), 'gotchas not folded into the text');
+    const rec = util.loadState().files[summariesFile];
+    assert.ok(rec && rec.adapter === 'distill' && rec.offset > 0, `summaries offset record was ${JSON.stringify(rec)}`);
+  });
+  check('distill: the block prefers Distilled over harvested in every session', () => {
+    const md = richMd();
+    assert.ok(md.includes('Rebuilt the retry queue end to end'), 'sessR distilled summary missing');
+    assert.ok(md.includes('Decisions: Kept the queue schema'), 'decisions not folded in');
+    assert.ok(!md.includes('all pass in CI'), 'sessR harvested summary still shown');
+    assert.ok(md.includes('Hardened the webhook auth'), 'sessD distilled summary missing');
+    assert.ok(!md.includes('Harvested note'), 'sessD harvested summary still shown');
+    assert.ok(!md.includes('sk-distilled-secret-123'), 'distilled secret leaked into the block');
+  });
+  check('distill: memory.md and the copy digest show the Distilled text', () => {
+    const mem = read(path.join(projR, '.membridge', 'memory.md'));
+    assert.ok(mem.includes('Rebuilt the retry queue end to end'), 'memory.md lacks the distilled result');
+    assert.ok(mem.includes('Hardened the webhook auth') && !mem.includes('Harvested note'), 'memory.md picked the harvested summary');
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === projR.toLowerCase());
+    const copy = memorydb.renderCopyText(projR, state.projects[key], util.getConfig());
+    assert.ok(copy.includes('Hardened the webhook auth') && !copy.includes('Harvested note'), 'copy digest picked the harvested summary');
+    assert.ok(!(mem + copy).includes('sk-distilled-secret-123'), 'distilled secret leaked');
+  });
+  check('distill: AGENTS.md carries the Codex self-report fallback, CLAUDE.md does not', () => {
+    const agents = read(path.join(projR, 'AGENTS.md'));
+    assert.ok(agents.includes('summaries.jsonl'), 'AGENTS.md fallback instruction missing');
+    assert.ok(agents.includes('"did"'), 'fallback instruction lacks the line schema');
+    assert.ok(agents.includes('never edit earlier lines'), 'fallback lacks the append-more-lines guidance');
+    const claude = richMd();
+    assert.ok(!claude.includes('append a line to'), 'CLAUDE.md got the Codex fallback instruction');
+  });
+
+  // setup-hooks / remove-hooks: surgical merge into a user's settings.json.
+  const claudeSettings = path.join(ROOT, 'claude-settings.json');
+  const seedSettings = {
+    model: 'opus',
+    hooks: {
+      Stop: [{ hooks: [{ type: 'command', command: 'echo user-stop' }] }],
+      PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo pre' }] }],
+    },
+    feedbackSurveyState: { lastShown: 123 },
+  };
+  fs.writeFileSync(claudeSettings, JSON.stringify(seedSettings, null, 2));
+  const envHook = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: claudeSettings };
+  const setup1 = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envHook, encoding: 'utf8' });
+  const afterSetup = JSON.parse(read(claudeSettings));
+  const setup2 = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envHook, encoding: 'utf8' });
+  const afterSetup2 = JSON.parse(read(claudeSettings));
+  check('distill: setup-hooks appends once and preserves user hooks byte-for-byte', () => {
+    assert.strictEqual(setup1.status, 0, setup1.stderr);
+    assert.strictEqual(afterSetup.hooks.Stop.length, 2, 'membridge entry not appended');
+    assert.strictEqual(JSON.stringify(afterSetup.hooks.Stop[0]), JSON.stringify(seedSettings.hooks.Stop[0]), 'user Stop hook changed');
+    assert.ok(JSON.stringify(afterSetup.hooks.Stop[1]).includes('membridge hook stop'), 'membridge command missing');
+    assert.deepStrictEqual(afterSetup.hooks.PreToolUse, seedSettings.hooks.PreToolUse, 'unrelated hooks changed');
+    assert.strictEqual(afterSetup.model, 'opus');
+    assert.deepStrictEqual(afterSetup.feedbackSurveyState, seedSettings.feedbackSurveyState, 'unknown keys lost');
+    assert.ok(/already installed/.test(setup2.stdout), `second run said: ${setup2.stdout}`);
+    assert.strictEqual(afterSetup2.hooks.Stop.length, 2, 'setup-hooks duplicated the entry');
+  });
+  check('distill: status reports the Distill line with hook install state', () => {
+    const out = spawnSync(process.execPath, [BIN, 'status'], { env: envHook, encoding: 'utf8' });
+    assert.ok(/Distill:\s+enabled — Claude Code hook installed/.test(out.stdout), `status said: ${out.stdout}`);
+  });
+  const removeOut = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: envHook, encoding: 'utf8' });
+  const afterRemove = JSON.parse(read(claudeSettings));
+  check('distill: remove-hooks strips only membridge entries', () => {
+    assert.ok(/Removed the MemBridge Stop hook/.test(removeOut.stdout), removeOut.stdout);
+    assert.deepStrictEqual(afterRemove.hooks.Stop, seedSettings.hooks.Stop, 'user Stop hooks not intact');
+    assert.deepStrictEqual(afterRemove.hooks.PreToolUse, seedSettings.hooks.PreToolUse, 'unrelated hooks changed');
+    assert.strictEqual(afterRemove.model, 'opus');
+  });
+  // A settings.json MemBridge cannot safely parse must be refused, never
+  // overwritten — a silent default-to-{} regression would wipe the user's
+  // whole file (all their hooks, model, permissions).
+  check('distill: setup/remove-hooks refuse an unsafe settings.json, leaving it byte-identical', () => {
+    for (const bad of ['{ not json', JSON.stringify([1, 2, 3]), JSON.stringify({ hooks: [] }), JSON.stringify({ hooks: { Stop: {} } })]) {
+      const badFile = path.join(ROOT, 'bad-settings.json');
+      fs.writeFileSync(badFile, bad);
+      const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: badFile };
+      for (const cmd of ['setup-hooks', 'remove-hooks']) {
+        const out = spawnSync(process.execPath, [BIN, cmd], { env, encoding: 'utf8' });
+        assert.strictEqual(out.status, 1, `${cmd} on ${bad}: expected exit 1, got ${out.status}`);
+        assert.ok(/refusing to touch/i.test(out.stderr), `${cmd} on ${bad}: no refusal message (${out.stderr})`);
+        assert.strictEqual(read(badFile), bad, `${cmd} on ${bad}: file was modified`);
+      }
+    }
+  });
+
+  // Team push: the pushed summary field is the Distilled text, redacted.
+  const mock3 = createMockSupabase();
+  await new Promise(r => mock3.server.listen(17947, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17947';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  try {
+    await teamsync.signup(util.getConfig(), 'distill@test.dev', 'pw-x', 'Distill');
+    const teamX = await teamsync.createTeam(util.getConfig(), 'DistillTeam');
+    await teamsync.linkProject(util.getConfig(), projR, teamX.team_id, 'DistillTeam');
+    await teamsync.syncTeams({ project: projR });
+    check('distill: pushed summary is the Distilled text, redacted', () => {
+      const row = mock3.entries.find(e => e.ask.includes('Harden the webhook auth'));
+      assert.ok(row, `sessD entry not pushed (${mock3.entries.length} rows)`);
+      assert.ok(row.summary && row.summary.includes('Hardened the webhook auth'), `summary was: ${row.summary}`);
+      assert.ok(!row.summary.includes('Harvested note'), 'push chose the harvested summary');
+      assert.ok(row.summary.includes('[redacted'), 'pushed distilled summary not redacted');
+      assert.ok(!JSON.stringify(mock3.entries).includes('sk-distilled-secret-123'), 'distilled secret reached the server');
+    });
+  } finally {
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock3.server.close(r));
+  }
+
+  // Incremental second read: a summary appended AFTER the first scan must be
+  // merged on the next sync. Pins the offset to the byte past the last
+  // newline, so an over-advance that silently drops every later summary
+  // (mergeEvents dedup would otherwise mask a sibling re-read) can't ship
+  // green. Runs last: this supersedes sessR's earlier distilled summary.
+  check('distill: a summary appended after the first scan is merged incrementally', () => {
+    const before = util.loadState().files[summariesFile].offset;
+    fs.appendFileSync(summariesFile,
+      JSON.stringify({ session: 'sessR', ts: '2026-07-12T09:59:00.000Z', did: 'Follow-up: added a metrics counter for retry exhaustion so ops can alert on it.', decisions: '', gotchas: '' }) + '\n');
+    const r = syncOnce();
+    assert.ok(r.newEvents >= 1, `appended line produced no new event (got ${r.newEvents})`);
+    const merged = richEvents().filter(e => e.kind === 'summary' && e.source === 'Distilled' && e.session === 'sessR');
+    assert.ok(merged.some(e => e.text.includes('metrics counter for retry exhaustion')), 'appended summary not merged into events');
+    const after = util.loadState().files[summariesFile].offset;
+    assert.ok(after > before, `offset did not advance: ${before} -> ${after}`);
+    assert.ok(richMd().includes('metrics counter for retry exhaustion'), 'appended summary not rendered (latest-in-tier wins)');
+  });
+
+  // --- 11. checkpoints: staleness-based re-blocking + the "go deeper" view ---
+  // A project whose edit count (state) and checkpoint lines (disk) we control
+  // directly, so the block/no-block thresholds can be exercised exactly.
+  const projCk = path.join(ROOT, 'projects', 'checkpoint-app');
+  fs.mkdirSync(path.join(projCk, '.membridge'), { recursive: true });
+  const ckSummaries = path.join(projCk, '.membridge', 'summaries.jsonl');
+  const ckTs = i => `2026-07-14T00:00:${String(i).padStart(2, '0')}.000Z`;
+  const setCkEdits = n => {
+    const st = util.loadState();
+    st.projects[projCk] = {
+      events: Array.from({ length: n }, (_, i) => ({
+        ts: ckTs(i), source: 'Claude Code', kind: 'edit', file: path.join(projCk, `f${i}.js`), session: 'ck1',
+      })),
+    };
+    util.saveState(st);
+  };
+  const writeCkLines = m => fs.writeFileSync(ckSummaries,
+    Array.from({ length: m }, (_, i) => JSON.stringify({ session: 'ck1', ts: ckTs(i), did: `Checkpoint ${i}: did real work worth summarizing here.` })).join('\n') + (m ? '\n' : ''));
+  const runCk = extra => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
+    input: JSON.stringify({ session_id: 'ck1', cwd: projCk, stop_hook_active: false, ...extra }),
+    encoding: 'utf8', env: { ...process.env },
+  });
+  const ckBlocked = out => out.status === 0 && !!out.stdout.trim() && JSON.parse(out.stdout).decision === 'block';
+
+  check('checkpoint: re-blocks only when checkpointEvery further edits accrue (minEdits 1, every 4)', () => {
+    writeCkLines(0); setCkEdits(1); // 0 lines, due at minEdits (1)
+    assert.ok(ckBlocked(runCk()), 'first checkpoint did not block at minEdits');
+    writeCkLines(1); setCkEdits(2); // 1 line, next due at 1+1*4=5
+    assert.ok(!ckBlocked(runCk()), 'blocked too early (minEdits+1 with 1 line)');
+    setCkEdits(5); // reaches the 2nd threshold
+    assert.ok(ckBlocked(runCk()), 'did not block at minEdits+4 with 1 line');
+    writeCkLines(2); setCkEdits(9); // 2 lines, next due at 1+2*4=9
+    assert.ok(ckBlocked(runCk()), 'did not block again at minEdits+8 with 2 lines');
+  });
+  check('checkpoint: loop guard short-circuits even when a checkpoint is due', () => {
+    writeCkLines(0); setCkEdits(5);
+    const out = runCk({ stop_hook_active: true });
+    assert.strictEqual(out.status, 0);
+    assert.strictEqual(out.stdout, '');
+  });
+  check('checkpoint: blockReason scopes later checkpoints to only new work', () => {
+    const first = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 0);
+    const later = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 2);
+    assert.ok(!/since your previous summary/i.test(first), 'first checkpoint should not reference prior lines');
+    assert.ok(/only the work done since your previous summary/i.test(later), 'later checkpoint must scope to new work');
+    assert.ok(later.includes('2 already written'), 'later checkpoint should state the count');
+    assert.ok(later.includes('do not repeat or modify earlier lines'), 'later checkpoint must forbid editing earlier lines');
+  });
+  check('checkpoint: countSummaryLines ignores malformed lines, empty did, and other sessions', () => {
+    fs.writeFileSync(ckSummaries,
+      'not json {\n' +
+      JSON.stringify({ session: 'ck1', ts: ckTs(0), did: 'first real checkpoint' }) + '\n' +
+      JSON.stringify({ session: 'other', ts: ckTs(1), did: 'a different session' }) + '\n' +
+      JSON.stringify({ session: 'ck1', ts: ckTs(2), did: '   ' }) + '\n' +
+      JSON.stringify({ session: 'ck1', ts: ckTs(3), did: 'second real checkpoint' }) + '\n');
+    assert.strictEqual(hooks.countSummaryLines(projCk, 'ck1'), 2);
+    assert.strictEqual(hooks.countSummaryLines(projCk, 'nope'), 0);
+    assert.strictEqual(hooks.hasSummaryLine(projCk, 'ck1'), true);
+  });
+  check('checkpoint: checkpointEvery below 1 or non-finite falls back to 4', () => {
+    const rawCfg = util.loadUserConfig();
+    rawCfg.distill = { enabled: true, minEdits: 1, checkpointEvery: 0 };
+    util.saveUserConfig(rawCfg);
+    writeCkLines(1); setCkEdits(2); // with every=4 → threshold 5 → no block; with a bad every=0 → threshold 1 → block
+    const out = runCk();
+    delete rawCfg.distill;
+    util.saveUserConfig(rawCfg);
+    assert.ok(!ckBlocked(out), 'checkpointEvery 0 was not clamped to the default 4');
+  });
+  check('checkpoint: sessionSummaries returns only Distilled when both tiers exist, time-ordered', () => {
+    const evs = [
+      { kind: 'summary', source: 'Claude Code', session: 's', ts: '2026-07-14T01:00:00.000Z', text: 'harvested middle' },
+      { kind: 'summary', source: 'Distilled', session: 's', ts: '2026-07-14T00:30:00.000Z', text: 'distilled early' },
+      { kind: 'summary', source: 'Distilled', session: 's', ts: '2026-07-14T02:00:00.000Z', text: 'distilled late' },
+      { kind: 'summary', source: 'Distilled', session: 'other', ts: '2026-07-14T00:00:00.000Z', text: 'wrong session' },
+    ];
+    assert.deepStrictEqual(digest.sessionSummaries(evs, 's').map(e => e.text), ['distilled early', 'distilled late']);
+    const harvOnly = [{ kind: 'summary', source: 'Codex', session: 's', ts: 't', text: 'only harvested' }];
+    assert.deepStrictEqual(digest.sessionSummaries(harvOnly, 's').map(e => e.text), ['only harvested']);
+  });
+
+  // Three distilled checkpoints in one session, driven end to end.
+  const projSeq = path.join(ROOT, 'projects', 'seq-app');
+  fs.mkdirSync(path.join(projSeq, 'src'), { recursive: true });
+  const seqCDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-seq-app');
+  fs.mkdirSync(seqCDir, { recursive: true });
+  fs.writeFileSync(path.join(seqCDir, 'seq1.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'Migrate the auth module to tokens' }, cwd: projSeq, timestamp: '2026-07-14T03:00:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projSeq, 'src', 'auth.js') } }] }, cwd: projSeq, timestamp: '2026-07-14T03:01:00.000Z' },
+  ]));
+  fs.mkdirSync(path.join(projSeq, '.membridge'), { recursive: true });
+  fs.writeFileSync(path.join(projSeq, '.membridge', 'summaries.jsonl'),
+    JSON.stringify({ session: 'seq1', ts: '2026-07-14T03:05:00.000Z', did: 'Checkpoint one: scaffolded the token store and swapped the session cookie for a bearer header.' }) + '\n' +
+    JSON.stringify({ session: 'seq1', ts: '2026-07-14T03:15:00.000Z', did: 'Checkpoint two: migrated the login and refresh endpoints; rotated api_key=sk-seq-secret-42 along the way.' }) + '\n' +
+    JSON.stringify({ session: 'seq1', ts: '2026-07-14T03:25:00.000Z', did: 'Checkpoint three: deleted the legacy cookie path and updated every test to the token flow.' }) + '\n');
+  syncOnce();
+
+  check('checkpoint: block shows the latest checkpoint; memory.md/json hold the full ordered sequence', () => {
+    const claude = read(path.join(projSeq, 'CLAUDE.md'));
+    assert.ok(claude.includes('Result: Checkpoint three'), 'block should show the latest checkpoint');
+    assert.ok(!claude.includes('Checkpoint one') && !claude.includes('Checkpoint two'), 'block should not show earlier checkpoints');
+    assert.ok(!claude.includes('sk-seq-secret-42'), 'secret leaked into the block');
+    const mem = read(path.join(projSeq, '.membridge', 'memory.md'));
+    assert.ok(mem.includes('Checkpoints:'), 'memory.md checkpoints header missing');
+    const i1 = mem.indexOf('Checkpoint one'), i2 = mem.indexOf('Checkpoint two'), i3 = mem.indexOf('Checkpoint three');
+    assert.ok(i1 > -1 && i2 > i1 && i3 > i2, `memory.md checkpoints out of order: ${[i1, i2, i3]}`);
+    assert.ok(!mem.includes('sk-seq-secret-42'), 'secret leaked into memory.md');
+    const db = JSON.parse(read(path.join(projSeq, '.membridge', 'memory.json')));
+    const entry = db.entries.find(e => Array.isArray(e.checkpoints));
+    assert.ok(entry && entry.checkpoints.length === 3, `checkpoints array missing/wrong length: ${entry && entry.checkpoints.length}`);
+    assert.ok(entry.checkpoints[2].includes('Checkpoint three'), 'checkpoints array out of order');
+    assert.ok(!JSON.stringify(db).includes('sk-seq-secret-42'), 'secret leaked into memory.json');
+  });
+
+  const mock4 = createMockSupabase();
+  await new Promise(r => mock4.server.listen(17948, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17948';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  try {
+    await teamsync.signup(util.getConfig(), 'seq@test.dev', 'pw-s', 'Seq');
+    const teamS = await teamsync.createTeam(util.getConfig(), 'SeqTeam');
+    await teamsync.linkProject(util.getConfig(), projSeq, teamS.team_id, 'SeqTeam');
+    await teamsync.syncTeams({ project: projSeq });
+    check('checkpoint: team push carries only the latest checkpoint, redacted', () => {
+      const row = mock4.entries.find(e => e.ask.includes('Migrate the auth module'));
+      assert.ok(row, `seq entry not pushed (${mock4.entries.length} rows)`);
+      assert.ok(row.summary && row.summary.includes('Checkpoint three'), `push summary was: ${row.summary}`);
+      assert.ok(!row.summary.includes('Checkpoint one') && !row.summary.includes('Checkpoint two'), 'push carried an older checkpoint');
+      assert.ok(!JSON.stringify(mock4.entries).includes('sk-seq-secret-42'), 'secret reached the server');
+    });
+  } finally {
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock4.server.close(r));
+  }
+
+  // --- 12. built-in secret redaction (lib/redact.js) ---
+  // Per-pattern unit coverage: the secret is gone and the named marker present.
+  const GH_TOKEN = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const SLACK_TOKEN = 'xox' + 'b-9999999999-ABCDEFGHIJKLMNOP';
+  const ANTHROPIC_KEY = 'sk-ant-api03-ABCDEFGHIJKLMNOP1234567890';
+  const GOOGLE_KEY = 'AIza' + 'B1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2'; // AIza + 35
+  const AWS_KEY = 'AKIA1234567890ABCDEF';
+  const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N';
+  const PG_URI = 'postgres://app:hunter2secret@db.internal:5432/prod';
+  const ENTROPY_TOKEN = 'aB3dE5gH7jK9mN1pQ3rS5tU7wX9zA1cE'; // 32-char base64, entropy > 4.5
+  const cases = [
+    ['aws-access-key', `creds ${AWS_KEY} here`, AWS_KEY],
+    ['github-token', `rotate ${GH_TOKEN} now`, GH_TOKEN],
+    ['google-api-key', `key ${GOOGLE_KEY} end`, GOOGLE_KEY],
+    ['slack-token', `slack ${SLACK_TOKEN} end`, SLACK_TOKEN],
+    ['anthropic-key', `key ${ANTHROPIC_KEY} tail`, ANTHROPIC_KEY],
+    ['jwt', `token ${JWT} done`, JWT],
+    ['private-key', '-----BEGIN RSA PRIVATE KEY-----\nMIIBhaha+notreal/xyz==\n-----END RSA PRIVATE KEY-----', 'MIIBhaha'],
+    ['credentials', `DB ${PG_URI} yo`, 'hunter2secret'],
+    ['secret-assignment', "config password=hunter2xyz done", 'hunter2xyz'],
+    ['high-entropy', `blob ${ENTROPY_TOKEN} done`, ENTROPY_TOKEN],
+  ];
+  check('redact: every default pattern removes the secret and emits a named marker', () => {
+    for (const [name, input, secret] of cases) {
+      const out = redactLib.redactDefault(input);
+      assert.ok(!out.includes(secret), `${name}: secret survived -> ${out}`);
+      assert.ok(out.includes(`[redacted:${name}]`), `${name}: marker missing -> ${out}`);
+    }
+    // Bearer/authorization consume the whole value, no leak.
+    const auth = redactLib.redactDefault('Authorization: Bearer abcDEF123456ghijKLmn');
+    assert.ok(!auth.includes('abcDEF123456ghijKLmn') && auth.includes('[redacted:authorization]'), `auth -> ${auth}`);
+  });
+
+  // Negatives — as important as positives. None of these may be touched.
+  check('redact: normal text, versions, paths, SHAs, UUIDs, identifiers survive untouched', () => {
+    const survivors = [
+      'The quick brown fox jumps over the lazy dog again and again.',
+      'Upgrade express@4.18.2 and lodash@4.17.21 in package.json.',
+      'See lib/adapters/claude-code.js and lib/redact.js for the wiring.',
+      'Commit 9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c reverted it cleanly.',
+      'session 1f0e5d5d-1603-4ea6-8b41-832bf6d27195 kept running',
+      'getUserAuthenticationTokenFromLocalCache is called on every request',
+      'the config keys checkpointEvery and summaries.jsonl are documented',
+      'a b c d camelCaseWord PascalCaseWord snake_case_word kebab-case-word',
+    ];
+    for (const s of survivors) {
+      assert.strictEqual(redactLib.redactDefault(s), s, `false positive on: ${s}`);
+    }
+  });
+  check('redact: session-id UUIDs are never redacted (load-bearing for the hook)', () => {
+    const uuid = '1f0e5d5d-1603-4ea6-8b41-832bf6d27195';
+    assert.strictEqual(redactLib.redactDefault(uuid), uuid);
+    assert.strictEqual(redactLib.redactDefault(`Resumed session ${uuid} after a crash`).includes(uuid), true);
+  });
+  check('redact: entropy catches a standalone token but not the same token in a URL path', () => {
+    assert.ok(redactLib.redactDefault(`x ${ENTROPY_TOKEN} y`).includes('[redacted:high-entropy]'), 'standalone token not caught');
+    // Pinned behavior: a high-entropy segment inside a plain URL path (no
+    // embedded credentials) is treated as a path, not a secret, and survives.
+    const url = `https://cdn.example.com/assets/${ENTROPY_TOKEN}/main.js`;
+    assert.strictEqual(redactLib.redactDefault(url), url, `URL path token was redacted -> ${redactLib.redactDefault(url)}`);
+    assert.ok(redactLib.entropy(ENTROPY_TOKEN) > 4.5, 'test token is not actually high-entropy');
+  });
+  check('redact: redactDefaults:false opts out; redactExtra is additive', () => {
+    const off = digest.redactText(`key ${AWS_KEY}`, digest.compileRedactions({ redactDefaults: false }));
+    assert.ok(off.includes(AWS_KEY), 'defaults not disabled by redactDefaults:false');
+    const extra = digest.redactText('internal CODENAME-BLUEJAY ships', digest.compileRedactions({ redactDefaults: false, redactExtra: ['CODENAME-\\w+'] }));
+    assert.ok(!extra.includes('CODENAME-BLUEJAY') && extra.includes('[redacted]'), `redactExtra not applied -> ${extra}`);
+    // defaults + user patterns compose: both a built-in and an extra match.
+    const both = digest.redactText(`${AWS_KEY} and CODENAME-BLUEJAY`, digest.compileRedactions({ redactExtra: ['CODENAME-\\w+'] }));
+    assert.ok(!both.includes(AWS_KEY) && !both.includes('CODENAME-BLUEJAY'), `compose failed -> ${both}`);
+  });
+
+  // Performance: default regexes compile once per pass, not per event.
+  check('redact: a 200-event render stays well under 200ms', () => {
+    const events = [];
+    for (let i = 0; i < 200; i++) {
+      const ts = `2026-07-15T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}.000Z`;
+      if (i % 3 === 0) events.push({ ts, source: 'Claude Code', kind: 'prompt', text: `Do step ${i} with some ${AWS_KEY} and ${ENTROPY_TOKEN} inline`, session: `s${i % 7}` });
+      else if (i % 3 === 1) events.push({ ts, source: 'Claude Code', kind: 'edit', file: path.join(ROOT, 'projects', 'perf', `f${i}.js`), session: `s${i % 7}` });
+      else events.push({ ts, source: 'Distilled', kind: 'summary', text: `Finished step ${i}; rotated ${ANTHROPIC_KEY} along the way.`, session: `s${i % 7}` });
+    }
+    const proj = { events };
+    const cfg = util.getConfig();
+    const t0 = Date.now();
+    const block = digest.renderBlock(path.join(ROOT, 'projects', 'perf'), proj, cfg, 'CLAUDE.md');
+    memorydb.buildEntries(path.join(ROOT, 'projects', 'perf'), proj, cfg);
+    const ms = Date.now() - t0;
+    assert.ok(ms < 200, `200-event render took ${ms}ms`);
+    assert.ok(!block.includes(AWS_KEY) && !block.includes(ANTHROPIC_KEY), 'secret leaked into the perf render');
+  });
+
+  // End to end: secrets planted in a prompt, a distilled checkpoint, and a todo
+  // item must be redacted in the block, memory.md, the copy digest, and a push.
+  const projRed = path.join(ROOT, 'projects', 'redact-app');
+  fs.mkdirSync(path.join(projRed, '.membridge'), { recursive: true });
+  const redCDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-redact-app');
+  fs.mkdirSync(redCDir, { recursive: true });
+  fs.writeFileSync(path.join(redCDir, 'red1.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: `Rotate the leaked GitHub token ${GH_TOKEN} immediately` }, cwd: projRed, timestamp: '2026-07-15T01:00:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'TodoWrite', input: { todos: [
+      { content: `Revoke Slack token ${SLACK_TOKEN} in the admin panel`, status: 'in_progress', activeForm: 'Revoking Slack token' },
+      { content: 'Ship the rotation script', status: 'pending', activeForm: 'Shipping' },
+    ] } }] }, cwd: projRed, timestamp: '2026-07-15T01:01:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(projRed, 'rotate.js') } }] }, cwd: projRed, timestamp: '2026-07-15T01:02:00.000Z' },
+  ]));
+  fs.writeFileSync(path.join(projRed, '.membridge', 'summaries.jsonl'),
+    JSON.stringify({ session: 'red1', ts: '2026-07-15T01:05:00.000Z', did: `Rotated everything: new key ${ANTHROPIC_KEY} and moved the DB to ${PG_URI}.` }) + '\n');
+  syncOnce();
+
+  const redBlock = () => read(path.join(projRed, 'CLAUDE.md'));
+  const secretsGone = s => !s.includes(GH_TOKEN) && !s.includes(SLACK_TOKEN) && !s.includes(ANTHROPIC_KEY) && !s.includes('hunter2secret');
+  check('redact: block redacts secrets from prompt and distilled checkpoint', () => {
+    const b = redBlock();
+    assert.ok(secretsGone(b), 'a secret survived into the block');
+    assert.ok(b.includes('[redacted:github-token]'), 'github marker missing from Ask line');
+    assert.ok(b.includes('[redacted:anthropic-key]'), 'anthropic marker missing from Result line');
+    assert.ok(b.includes('[redacted:credentials]'), 'connection marker missing from Result line');
+  });
+  check('redact: memory.md and memory.json redact prompt, checkpoint, and todo item', () => {
+    const mem = read(path.join(projRed, '.membridge', 'memory.md'));
+    const db = read(path.join(projRed, '.membridge', 'memory.json'));
+    assert.ok(secretsGone(mem) && secretsGone(db), 'a secret survived into the memory DB');
+    assert.ok(mem.includes('[redacted:github-token]') && mem.includes('[redacted:anthropic-key]'), 'markers missing from memory.md');
+    assert.ok(db.includes('[redacted:slack-token]'), 'todo item Slack token not redacted in memory.json');
+  });
+  check('redact: copy-for-AI digest redacts every planted secret', () => {
+    const state = util.loadState();
+    const key = Object.keys(state.projects).find(k => k.toLowerCase() === projRed.toLowerCase());
+    const copy = memorydb.renderCopyText(projRed, state.projects[key], util.getConfig());
+    assert.ok(secretsGone(copy), 'a secret survived into the copy digest');
+    assert.ok(copy.includes('[redacted:github-token]') && copy.includes('[redacted:anthropic-key]'), 'markers missing from copy digest');
+  });
+
+  const mock5 = createMockSupabase();
+  await new Promise(r => mock5.server.listen(17949, '127.0.0.1', r));
+  process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17949';
+  process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+  try {
+    await teamsync.signup(util.getConfig(), 'red@test.dev', 'pw-r', 'Red');
+    const teamRed = await teamsync.createTeam(util.getConfig(), 'RedTeam');
+    await teamsync.linkProject(util.getConfig(), projRed, teamRed.team_id, 'RedTeam');
+    await teamsync.syncTeams({ project: projRed });
+    check('redact: pushed entries carry only redacted markers, never a secret', () => {
+      const body = JSON.stringify(mock5.entries);
+      assert.ok(!body.includes(GH_TOKEN) && !body.includes(ANTHROPIC_KEY) && !body.includes('hunter2secret'), 'a secret reached the server');
+      const row = mock5.entries.find(e => e.ask.includes('[redacted:github-token]'));
+      assert.ok(row, 'pushed ask not redacted with a named marker');
+      assert.ok(row.summary.includes('[redacted:anthropic-key]'), `pushed summary not redacted -> ${row.summary}`);
+    });
+  } finally {
+    delete process.env.MEMBRIDGE_TEAM_URL;
+    delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    await new Promise(r => mock5.server.close(r));
   }
 
   // --- summary ---

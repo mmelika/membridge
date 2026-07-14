@@ -4,6 +4,11 @@ node_modules/
 dist/
 app/lib/
 
+# web app (Next.js) build + local env
+web/.next/
+web/.env.local
+web/next-env.d.ts
+
 # internal business plan stays local
 BUSINESS.md
 

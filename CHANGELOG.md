@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.0 — 2026-07-13
+
+- **Invite links (team schema v2)**: `membridge team invite` mints a short
+  URL-safe token — shareable as `https://<web app>/join/<token>` or
+  `membridge join <token>` — with optional expiry (`--expires-days`) and use
+  cap (`--max-uses`), revocable with `team revoke-invite`. A redeem can never
+  grant more than the member role; rotating the legacy code also revokes all
+  outstanding links. The legacy UUID invite code keeps working — `join`
+  routes on the input's shape. (`supabase/migrations/002_team_v2.sql` — a
+  migration, so the live backend upgrades without recreating anything.)
+- **`membridge join <link-or-code>`**: one command from invite to member —
+  logs in, or creates the account if it's new (`--email` / `--password`),
+  then joins. The dashboard's team page gains a "Copy invite link" button.
+- **Auto-link, prompt-first**: when a local project's normalized git remote
+  matches a project a teammate already shares, MemBridge *suggests* the link
+  (dashboard card + log line) and shares nothing until you confirm. Opt into
+  fully automatic linking with `"team": { "autoLink": true }` in config.
+- **Roles & management**: `admin` role between owner and member; RPCs for
+  remove_member, set_role, rename_team, rotate_invite, leave_team with
+  owner/admin checks; `team_feed` (keyset pagination + person/project/tool
+  filters) and a `project_stats` view power the web app in one query.
+- **Hosted web workspace (`web/`)**: Next.js + supabase-js + Tailwind, no
+  custom API server — RLS is the authorization layer. Screens: `/join/<token>`
+  invite landing (team name via `peek_invite`, inline signup, auto-join,
+  CLI install nudge), day-grouped team feed with filters, project cards,
+  team settings (members, roles, invite links, rename, leave). Deploys to
+  Vercel from the `web/` folder; the npm package still ships without it.
+- **Privacy hardening**: memory entries now fall back to the *basename* for
+  files outside the project (an absolute path would leak usernames and
+  machine layout to teammates), and a regression test pins that git remote
+  credentials (`https://user:token@…`) are stripped before any URL is
+  uploaded. The suite grows to 82 offline checks.
+
+## 0.4.1 — 2026-07-12
+
+- **Team sync is now zero-config for users.** The Supabase backend is baked
+  into the build (`lib/backend.json`, filled once by whoever operates the
+  MemBridge backend), so end users no longer run `team setup` — they just
+  `membridge signup` and go. `team setup` remains as an advanced override for
+  self-hosting your own backend. (Backend resolution order: env → config →
+  baked default.)
+
+## 0.4.0 — 2026-07-12
+
+- **Team sync (beta)**: link a project to a team and every member's MemBridge
+  pushes its redacted per-project memory entries to a shared Supabase backend
+  (yours — run `supabase/schema.sql` in a free project) and pulls teammates'
+  entries down. The injected context block gains a "Teammates' AI activity"
+  section with author attribution, so your Claude Code knows what a
+  teammate's Codex did. New commands: `team setup/create/join/link/unlink/
+  list`, `signup`, `login`, `logout`. Invite-code joins; clones map to one
+  project row via the normalized git remote (name fallback). Row-level
+  security restricts every row to team members; only already-redacted digest
+  entries ever leave the machine, and only for explicitly linked projects.
+  Auth tokens live in `~/.membridge/credentials.json` (chmod 600). Team sync
+  is best-effort on top of local sync: an unreachable backend never blocks
+  local syncing. (New: `lib/teamsync.js`, `supabase/schema.sql`; the suite
+  gains an offline mock Supabase and now has 60 checks.)
+
 ## 0.3.0 — 2026-07-12
 
 - **Roadmaps (the BYOK upgrade)**: with a key saved, every project's Plan tab
@@ -23,15 +82,17 @@
   config by hand. Interval changes now apply without restarting the daemon.
   (New: `lib/advisor.js`, `GET/POST /api/settings`, `POST /api/settings/test`;
   the key is never sent to the dashboard page.)
-- The project page's Plan tab now reads "Roadmap lives here" with a link to
-  Settings — roadmaps themselves are the next milestone.
 - **Project pages**: the Overview is now a clean projects grid (name, tool
   badges, last activity, paused state) and clicking a card opens a full
   project page — Activity (the complete ask-by-ask history with the files
-  each ask touched), Memory (what gets injected where, a read-only view of
-  the full memory log, pause/resume/delete), and a Plan tab that unlocks
-  with an Anthropic API key once Settings ship. ✕, Esc and browser-back all
+  each ask touched) and Memory (what gets injected where, a read-only view
+  of the full memory log, pause/resume/delete). ✕, Esc and browser-back all
   exit. (New endpoints: `GET /api/project`, `GET /api/project/memory`.)
+- **Neural map**: a second dashboard tab with a force-directed 3D map of
+  every chat across every project, linked by shared files and TF-IDF idea
+  similarity. Events now carry per-chat session ids (state v2 triggers a
+  one-time full rescan from the transcripts). (New: `lib/graph.js`,
+  `GET /api/graph`.)
 - **Copy for AI**: every project page has a Copy for AI button that puts a
   trimmed, redacted digest of recent AI activity on the clipboard, ready to
   paste into ChatGPT / claude.ai / any web AI that can't see your disk. The
