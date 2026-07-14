@@ -409,6 +409,11 @@ async function main() {
       assert.ok(pageHtml.includes("path = '/api/team/' + kind"), 'account auth flow missing');
       assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
       assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
+      assert.ok(pageHtml.includes('/api/team/revoke-invite'), 'invite revoke UI missing');
+      assert.ok(pageHtml.includes("Revoke this invite link?"), 'invite revoke confirmation missing');
+      assert.ok(pageHtml.includes('data-team-form="invite-options"'), 'invite options form missing');
+      assert.ok(pageHtml.includes('expiresDays'), 'invite expiry field missing');
+      assert.ok(pageHtml.includes('maxUses'), 'invite max-uses field missing');
       assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
     });
     check('dashboard page has the Copy for AI button', () => {
@@ -422,6 +427,9 @@ async function main() {
       assert.ok(pageHtml.includes('Syncing'), 'sync section missing');
       assert.ok(pageHtml.includes('Anthropic API key'), 'key section missing');
       assert.ok(pageHtml.includes('Planner model'), 'model section missing');
+      assert.ok(pageHtml.includes('Advanced: self-hosted backend'), 'self-hosted backend card missing');
+      assert.ok(pageHtml.includes('stTeamUrl'), 'self-hosted backend URL field missing');
+      assert.ok(pageHtml.includes('stTeamAnonKey'), 'self-hosted backend anon key field missing');
     });
     const graphRes = await fetch(`${base}/api/graph`);
     const graphText = await graphRes.text();
@@ -632,6 +640,26 @@ async function main() {
     check('settings: invalid minEdits/checkpointEvery are rejected, previous values kept', () => {
       assert.strictEqual(stDistillInvalid.distill.minEdits, 3, 'invalid minEdits (0) was accepted');
       assert.strictEqual(stDistillInvalid.distill.checkpointEvery, 7, 'invalid checkpointEvery (non-numeric) was accepted');
+    });
+    const stTeamBackend = await (await post(`${base}/api/settings`, {
+      team: { url: 'https://selfhost.supabase.co ', anonKey: ' anon-test-key ' },
+    })).json();
+    check('settings: self-hosted team backend is saved and reported', () => {
+      assert.strictEqual(stTeamBackend.team.url, 'https://selfhost.supabase.co');
+      assert.strictEqual(stTeamBackend.team.anonKey, 'anon-test-key');
+      assert.strictEqual(stTeamBackend.team.customBackend, true);
+      const cfg = util.getConfig();
+      assert.strictEqual(cfg.team.url, 'https://selfhost.supabase.co');
+      assert.strictEqual(cfg.team.anonKey, 'anon-test-key');
+    });
+    const stTeamBackendReset = await (await post(`${base}/api/settings`, {
+      team: { url: '', anonKey: '' },
+    })).json();
+    check('settings: self-hosted team backend can reset to default', () => {
+      assert.deepStrictEqual(stTeamBackendReset.team, { url: '', anonKey: '', customBackend: false });
+      const cfg = util.getConfig();
+      assert.strictEqual(cfg.team.url, '');
+      assert.strictEqual(cfg.team.anonKey, '');
     });
     // Leave distill in its default post-first-run-consent-tests-friendly state
     // for any later checks in this file that rely on the default config shape.
@@ -862,6 +890,41 @@ async function main() {
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.accessToken), 'access token exposed');
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.refreshToken), 'refresh token exposed');
     });
+    const PORT4 = 17946;
+    const srv4 = startServer(PORT4, { retries: 0 });
+    try {
+      const base4 = `http://127.0.0.1:${PORT4}`;
+      await waitForHttp(`${base4}/api/status`);
+      const apiInv = await (await fetch(`${base4}/api/team/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ teamId: team.team_id }),
+      })).json();
+      const optInv = await (await fetch(`${base4}/api/team/invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ teamId: team.team_id, expiresDays: '7', maxUses: '3' }),
+      })).json();
+      const revokeRes = await fetch(`${base4}/api/team/revoke-invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: `https://app.membridge.dev/join/${apiInv.token}` }),
+      });
+      const revokeJson = await revokeRes.json();
+      const optRow = mock.invites.get(optInv.token);
+      check('dashboard: /api/team/revoke-invite revokes pasted invite links', () => {
+        assert.strictEqual(revokeRes.status, 200);
+        assert.strictEqual(revokeJson.revoked, true);
+        assert.ok(mock.invites.get(apiInv.token).revokedAt, 'invite was not revoked');
+      });
+      check('dashboard: /api/team/invite passes expiry and max-use options', () => {
+        assert.ok(optRow.expiresAt, 'expiry was not passed');
+        assert.strictEqual(optRow.maxUses, 3);
+        assert.strictEqual(optInv.max_uses, 3);
+      });
+    } finally {
+      srv4.close();
+    }
 
     // proj1 was deleted+revived earlier, so its live history is the single
     // "Ship the checkout flow" ask — enough to prove the push path end to end.
