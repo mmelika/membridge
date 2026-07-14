@@ -467,6 +467,12 @@ async function main() {
       assert.ok(feedRes.entries.every(e => 'summary' in e && 'origin' in e),
         'every entry is normalized (has origin + summary)');
     });
+    const beforeTs = '2099-01-01T00:00:00Z';
+    const feedBefore = await (await fetch(`${base}/api/feed?before=${encodeURIComponent(beforeTs)}&limit=50`)).json();
+    check('/api/feed before= filters local entries inclusively by ts', () => {
+      assert.ok(feedBefore.entries.filter(e => e.origin === 'local').every(e => String(e.ts) <= beforeTs),
+        'all local entries respect the before boundary');
+    });
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
       const p = projects.find(x => x.path.toLowerCase() === proj1.toLowerCase());
