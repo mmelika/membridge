@@ -1227,6 +1227,26 @@ async function main() {
       assert.ok(projectsRes.projects.some(p => p.name === 'shop-app'), 'projects route empty');
       assert.strictEqual(badRes.status, 400, 'missing teamId must 400');
     });
+
+    // Migration 004: team_feed must return teammates' `summary`. Seed a team
+    // entry that carries one, then prove it survives the whole read path:
+    // team_feed RPC -> feed.normalizeTeam -> /api/feed merged read-model.
+    const seedTemplate = feedAll[0]; // a confirmed team_feed row for team.team_id
+    mock.entries.push({
+      ...seedTemplate,
+      id: mock.entries.length + 1,
+      ts: '2026-07-13T10:00:00.000Z',
+      source: 'Claude Code',
+      ask: 'Wire the receipt PDF and refund guardrails',
+      summary: 'Checkout now emails a receipt PDF; refunds are the next milestone.',
+      created_at: new Date(Date.now() + 5000).toISOString(),
+    });
+    const feedSummaryRes = await (await fetch(`${hubBase}/api/feed?limit=50`)).json();
+    check('/api/feed surfaces teammate summaries (migration 004)', () => {
+      const teamEntry = feedSummaryRes.entries.find(e => e.origin === 'team' && e.summary);
+      assert.ok(teamEntry, 'at least one team entry carries a non-null summary');
+      assert.ok(/receipt PDF/.test(teamEntry.summary), `summary text lost: ${teamEntry && teamEntry.summary}`);
+    });
     await new Promise(r => hubSrv.close(r));
 
     // Management runs on a fresh team so rotate/remove cannot disturb the
