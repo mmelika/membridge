@@ -376,9 +376,8 @@ async function main() {
       assert.ok(!pageHtml.includes('id="tab-overview"'), 'obsolete overview tab still present');
       assert.ok(!pageHtml.includes('id="tab-neural"'), 'obsolete neural map tab still present');
     });
-    check('dashboard page has the full Team workspace', () => {
+    check('dashboard page has the account gate and Settings team management', () => {
       assert.ok(pageHtml.includes('view-auth'), 'account gate missing');
-      assert.ok(pageHtml.includes('view-team'), 'team view missing');
       assert.ok(pageHtml.includes("path = '/api/team/' + kind"), 'account auth flow missing');
       assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
       assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
@@ -388,11 +387,14 @@ async function main() {
       assert.ok(pageHtml.includes('expiresDays'), 'invite expiry field missing');
       assert.ok(pageHtml.includes('maxUses'), 'invite max-uses field missing');
       assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
-      assert.ok(pageHtml.includes('hub-grid'), 'team hub layout missing');
-      assert.ok(pageHtml.includes('#team-member='), 'member drill-down route missing');
-      assert.ok(pageHtml.includes('#team-project='), 'team project route missing');
-      assert.ok(pageHtml.includes('/api/team/feed'), 'activity feed wiring missing');
+      // Team management now lives in Settings (the standalone hub, member pages
+      // and #team-project route were removed with the simplified dashboard).
+      assert.ok(pageHtml.includes('teamSettingsRoot'), 'Settings team container missing');
+      assert.ok(pageHtml.includes('data-team-change="switch"'), 'team switcher missing');
       assert.ok(pageHtml.includes('/api/team/members'), 'members wiring missing');
+      assert.ok(!pageHtml.includes('view-team'), 'dead team hub container still present');
+      assert.ok(!pageHtml.includes('#team-member='), 'dead member drill-down route still present');
+      assert.ok(!pageHtml.includes('#team-project='), 'dead team-project route still present');
     });
     check('dashboard page has a persisted three-way theme', () => {
       assert.ok(pageHtml.includes('color-scheme: light dark'), 'color-scheme missing');
