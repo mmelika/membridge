@@ -306,6 +306,7 @@ async function main() {
     questions: ['Should guest checkout ship in v1?'],
   };
   let lastPlanRequest = null;
+  let lastBriefingRequest = null;
   const mockApi = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
@@ -320,14 +321,28 @@ async function main() {
           res.end(AUTH_FAIL);
           return;
         }
-        lastPlanRequest = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          model: lastPlanRequest.model,
-          stop_reason: 'end_turn',
-          content: [{ type: 'text', text: JSON.stringify(CANNED_PLAN) }],
-          usage: { input_tokens: 4200, output_tokens: 900 },
-        }));
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        if (parsed.output_config) {
+          // Roadmap request: structured JSON plan.
+          lastPlanRequest = parsed;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            model: parsed.model,
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: JSON.stringify(CANNED_PLAN) }],
+            usage: { input_tokens: 4200, output_tokens: 900 },
+          }));
+        } else {
+          // Briefing request: free-form prose.
+          lastBriefingRequest = parsed;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            model: parsed.model,
+            stop_reason: 'end_turn',
+            content: [{ type: 'text', text: 'Andrew wired the receipt PDF; Dana added refund guardrails.' }],
+            usage: { input_tokens: 500, output_tokens: 60 },
+          }));
+        }
       } else {
         res.writeHead(404);
         res.end();
@@ -835,6 +850,28 @@ async function main() {
       const p = afterRevive.find(x => x.path.toLowerCase() === proj1.toLowerCase());
       assert.ok(p, 'deleted project did not reappear');
       assert.ok(p.prompts.some(e => e.text.includes('Ship the checkout flow')), 'new prompt missing');
+    });
+
+    process.env.MEMBRIDGE_API_BASE = 'http://127.0.0.1:17944'; // in-process advisor -> the same mock
+    const briefNoKey = await advisorLib.generateBriefing('', 'claude-sonnet-5', { since: null, teammates: [] });
+    const briefOk = await advisorLib.generateBriefing(GOOD_KEY, 'claude-sonnet-5', {
+      since: '2026-07-10T00:00:00.000Z', until: '2026-07-14T00:00:00.000Z',
+      teammates: [
+        { name: 'Andrew', entries: [{ ts: '2026-07-11T09:00:00.000Z', source: 'Claude Code', ask: 'Wire the receipt PDF', summary: 'Receipts now email a PDF', files: ['pay.js'], project: 'shop-app' }] },
+        { name: 'Dana', entries: [{ ts: '2026-07-12T09:00:00.000Z', source: 'Codex', ask: 'Add refund guardrails', summary: null, files: [], project: 'shop-app' }] },
+      ],
+    });
+    check('briefing: generateBriefing needs a key and turns teammate activity into prose', () => {
+      assert.ok(briefNoKey.error && !briefNoKey.text, 'no-key path must return { error }, not text');
+      assert.ok(briefOk.text && !briefOk.error, `expected { text }, got ${JSON.stringify(briefOk)}`);
+      assert.ok(lastBriefingRequest, 'mock never saw a briefing request');
+      assert.ok(!lastBriefingRequest.output_config, 'a briefing must be plain text, never json_schema');
+      assert.strictEqual(lastBriefingRequest.max_tokens, 1200);
+      assert.strictEqual(lastBriefingRequest.thinking.type, 'disabled', 'sonnet must run with thinking off');
+      assert.ok(lastBriefingRequest.system.includes('catch-up'), 'briefing system prompt missing');
+      const userMsg = lastBriefingRequest.messages[0].content;
+      assert.ok(userMsg.includes('Andrew') && userMsg.includes('Dana'), 'teammate activity missing from the prompt');
+      assert.ok(userMsg.includes('Wire the receipt PDF') || userMsg.includes('Receipts now email a PDF'), 'ask/summary missing');
     });
   } finally {
     child.kill();
