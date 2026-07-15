@@ -480,8 +480,8 @@ async function main() {
       assert.ok(!pageHtml.includes('#team-project='), 'dead team-project route still present');
     });
     check('dashboard page has a persisted three-way theme', () => {
-      assert.ok(pageHtml.includes('color-scheme: light dark'), 'color-scheme missing');
-      assert.ok(pageHtml.includes('light-dark('), 'light-dark() colors missing');
+      assert.ok(pageHtml.includes('body[data-theme="dark"]'), 'dark theme token block missing');
+      assert.ok(pageHtml.includes('prefers-color-scheme: dark'), 'system theme fallback missing');
       assert.ok(pageHtml.includes("localStorage.getItem('mb-theme')"), 'theme boot script missing');
       assert.ok(pageHtml.includes('name="stTheme"'), 'appearance control missing');
     });
