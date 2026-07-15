@@ -972,6 +972,14 @@ async function main() {
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.accessToken), 'access token exposed');
       assert.ok(!JSON.stringify(dashboardTeam).includes(credsA.refreshToken), 'refresh token exposed');
     });
+    check('dashboard: team payload surfaces member count and creation date', () => {
+      const t = dashboardTeam.teams.find(x => x.team_id === team.team_id);
+      assert.ok(t, 'team missing from payload');
+      assert.strictEqual(t.memberCount, 1, `expected 1 member, got ${t.memberCount}`);
+      assert.ok(t.createdAt && !Number.isNaN(Date.parse(t.createdAt)), 'createdAt missing or unparseable');
+      // raw RPC columns are preserved for older consumers
+      assert.ok('member_count' in t && 'created_at' in t, 'raw RPC columns dropped');
+    });
     const PORT4 = 17946;
     const srv4 = startServer(PORT4, { retries: 0 });
     try {

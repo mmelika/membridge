@@ -51,7 +51,7 @@ function createMockSupabase() {
   function handleRpc(res, fn, body, userId) {
     if (!userId) return json(res, 401, { message: 'not authenticated' });
     if (fn === 'create_team') {
-      const team = { id: uuid(), name: body.p_name, inviteCode: uuid() };
+      const team = { id: uuid(), name: body.p_name, inviteCode: uuid(), createdAt: new Date().toISOString() };
       teams.set(team.id, team);
       members.push({ teamId: team.id, userId, displayName: body.p_display_name, role: 'owner', joinedAt: new Date().toISOString() });
       return json(res, 200, [{ team_id: team.id, invite_code: team.inviteCode }]);
@@ -77,12 +77,17 @@ function createMockSupabase() {
       return json(res, 200, row.id);
     }
     if (fn === 'my_teams') {
-      const rows = members.filter(m => m.userId === userId).map(m => ({
-        team_id: m.teamId,
-        team_name: teams.get(m.teamId).name,
-        role: m.role,
-        invite_code: teams.get(m.teamId).inviteCode,
-      }));
+      const rows = members.filter(m => m.userId === userId).map(m => {
+        const t = teams.get(m.teamId);
+        return {
+          team_id: m.teamId,
+          team_name: t.name,
+          role: m.role,
+          invite_code: t.inviteCode,
+          member_count: members.filter(x => x.teamId === m.teamId).length,
+          created_at: t.createdAt || null,
+        };
+      });
       return json(res, 200, rows);
     }
     // ---- schema v2 (002_team_v2.sql) ----

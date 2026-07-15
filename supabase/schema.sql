@@ -193,13 +193,26 @@ $$;
 
 -- Teams the calling user belongs to (RLS-safe convenience for the CLI).
 create or replace function public.my_teams()
-returns table (team_id uuid, team_name text, role text, invite_code uuid)
+returns table (
+  team_id uuid,
+  team_name text,
+  role text,
+  invite_code uuid,
+  member_count bigint,
+  created_at timestamptz
+)
 language sql
 security definer
 set search_path = public
 stable
 as $$
-  select t.id, t.name, m.role, t.invite_code
+  select
+    t.id,
+    t.name,
+    m.role,
+    t.invite_code,
+    (select count(*) from public.team_members mc where mc.team_id = t.id),
+    t.created_at
   from public.team_members m
   join public.teams t on t.id = m.team_id
   where m.user_id = auth.uid()
