@@ -454,6 +454,37 @@ async function main() {
       assert.strictEqual(feedSinceFuture.entries.filter(e => e.origin === 'local').length, 0,
         'future since window must exclude every local row');
     });
+
+    // Catch-Up read pointer: GET is pure; mark/undo rewrite it. Run sequentially
+    // so the pointer transitions are deterministic (mark sets prev=old-last).
+    const cu0 = await (await fetch(`${base}/api/catchup`)).json();
+    check('GET /api/catchup returns the empty read pointer', () => {
+      assert.strictEqual(cu0.lastViewedTs, null, 'lastViewedTs should start null');
+      assert.strictEqual(cu0.prevViewedTs, null, 'prevViewedTs should start null');
+      assert.strictEqual(cu0.hasBriefing, false, 'no briefing yet');
+    });
+    const markTs = '2026-07-10T00:00:00.000Z';
+    const cu1 = await (await post(`${base}/api/catchup/mark`, { ts: markTs })).json();
+    check('POST /api/catchup/mark with a ts sets lastViewedTs and clears prev from null', () => {
+      assert.strictEqual(cu1.lastViewedTs, markTs, 'lastViewedTs not set to the given ts');
+      assert.strictEqual(cu1.prevViewedTs, null, 'prevViewedTs should be the old (null) lastViewedTs');
+    });
+    const cu2 = await (await post(`${base}/api/catchup/mark`, {})).json();
+    check('POST /api/catchup/mark without a ts stamps now() and shifts prev', () => {
+      assert.strictEqual(cu2.prevViewedTs, markTs, 'prevViewedTs must capture the previous lastViewedTs');
+      assert.ok(cu2.lastViewedTs && !isNaN(Date.parse(cu2.lastViewedTs)), 'lastViewedTs must be a valid ISO now()');
+      assert.ok(cu2.lastViewedTs > markTs, 'now() must sort after the earlier marked ts');
+    });
+    const cuGet = await (await fetch(`${base}/api/catchup`)).json();
+    check('GET /api/catchup reflects the latest mark', () => {
+      assert.strictEqual(cuGet.lastViewedTs, cu2.lastViewedTs, 'read pointer did not persist');
+    });
+    const cu3 = await (await post(`${base}/api/catchup/undo`, {})).json();
+    check('POST /api/catchup/undo restores the previous pointer', () => {
+      assert.strictEqual(cu3.lastViewedTs, markTs, 'undo must restore lastViewedTs to prevViewedTs');
+      assert.strictEqual(cu3.prevViewedTs, null, 'undo must clear prevViewedTs');
+    });
+
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
       const p = projects.find(x => x.path.toLowerCase() === proj1.toLowerCase());
