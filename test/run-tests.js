@@ -470,10 +470,10 @@ async function main() {
       assert.ok(pageHtml.includes('expiresDays'), 'invite expiry field missing');
       assert.ok(pageHtml.includes('maxUses'), 'invite max-uses field missing');
       assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
-      // Team management now lives in Settings (the standalone hub, member pages
-      // and #team-project route were removed with the simplified dashboard).
-      assert.ok(pageHtml.includes('teamSettingsRoot'), 'Settings team container missing');
-      assert.ok(pageHtml.includes('data-team-change="switch"'), 'team switcher missing');
+      // v3: team management lives on the dedicated Team screen (Settings keeps
+      // only a compact card that links there). The team switcher moved with it.
+      assert.ok(pageHtml.includes('id="teamScreen"'), 'Team screen container missing');
+      assert.ok(pageHtml.includes('data-ts-switch'), 'team switcher missing');
       assert.ok(pageHtml.includes('/api/team/members'), 'members wiring missing');
       assert.ok(!pageHtml.includes('view-team'), 'dead team hub container still present');
       assert.ok(!pageHtml.includes('#team-member='), 'dead member drill-down route still present');
