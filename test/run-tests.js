@@ -1368,6 +1368,38 @@ async function main() {
       assert.ok(md.includes('Andrew · Codex: Refactor checkout validation'), "Andrew's ask missing");
     });
 
+    // Regression: pushProject/pullProject used to drop each entry's session
+    // id entirely, so teamInjectSlice's per-(author, session) dedup silently
+    // fell back to per-(author, source) — collapsing a teammate's genuinely
+    // distinct sessions on the same tool into just the newest one, dropping
+    // real work from the injected block even though the live dashboard feed
+    // (a separate, session-agnostic RPC read) still showed all of it. Drives
+    // the FULL pullProject -> syncOnce -> inject path end to end (no hand-fed
+    // teamEntries) so it actually exercises the wire format, not just
+    // digest.renderBlock's already-correct collapsing logic in isolation.
+    process.env.MEMBRIDGE_HOME = HOME_A;
+    fs.writeFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess2.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Add inventory tracking for warehouse SKUs' }, cwd: proj1, timestamp: tsAgo(5) }) + '\n',
+    );
+    syncOnce(); // fold Marco's new, distinct session into proj1's local history
+    const rA3 = await teamsync.syncTeams(); // home A: push the new session's entry
+    process.env.MEMBRIDGE_HOME = path.join(ROOT, 'home-b'); // Andrew's home (HOME_B is bound later, below)
+    const rB2 = await teamsync.syncTeams(); // home B: pull it
+    for (const k of rB2.changed) syncOnce({ project: k });
+    check("team: a teammate's distinct sessions on the same tool both survive injection", () => {
+      assert.ok(rA3.synced.some(k => sameKey(k, proj1)), `push said: ${JSON.stringify(rA3)}`);
+      assert.ok(rB2.changed.some(k => sameKey(k, projB)), `pull said: ${JSON.stringify(rB2)}`);
+      const md = read(path.join(projB, 'CLAUDE.md'));
+      assert.ok(md.includes('Add inventory tracking for warehouse SKUs'), "Marco's new (sess2) ask missing");
+      // sess1's own latest ask ("Tighten the refund policy checks", pushed
+      // earlier in this section) must still show up alongside sess2's —
+      // without the fix both entries carry no session id, collapse to one
+      // (author, source) key, and only the chronologically newest survives.
+      assert.ok(md.includes('Tighten the refund policy checks'), "Marco's other session (sess1) was wrongly collapsed away by the newer sess2 entry");
+    });
+    process.env.MEMBRIDGE_HOME = HOME_A;
+
     // check() is synchronous (fn() is called and awaited via try/catch only
     // for synchronous throws) — an async fn would resolve after check() has
     // already recorded a pass, making the assertions vacuous. So the async
