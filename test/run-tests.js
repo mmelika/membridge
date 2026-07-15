@@ -19,7 +19,7 @@ delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not 
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
-const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail } = require('../lib/server');
+const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail, planPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
 const advisorLib = require('../lib/advisor');
@@ -226,6 +226,25 @@ async function main() {
     const st2 = util.loadState();
     st2.projects[key].teamEntries = saved;
     util.saveState(st2);
+  });
+  check('planPayload: recentAsks merges + dedupes teammate teamEntries, sorted, capped at 20', () => {
+    const config = util.getConfig();
+    const proj = {
+      events: [{ kind: 'prompt', source: 'Claude Code', session: 's1', ts: '2026-07-10T09:00:00.000Z', text: 'Local ask one' }],
+      teamEntries: [
+        { author: 'Andrew', ts: '2026-07-11T09:00:00.000Z', source: 'Codex', ask: 'Teammate refactor', files: ['src/api.js'] },
+        { author: 'Andrew', ts: '2026-07-11T09:00:00.000Z', source: 'Codex', ask: 'Teammate refactor', files: ['src/api.js'] }, // exact dup
+      ],
+    };
+    const payload = planPayload(proj1, proj, config, 'ship it');
+    const asks = payload.recentAsks.map(e => e.ask);
+    assert.ok(asks.includes('Local ask one'), 'local ask dropped');
+    assert.ok(asks.includes('Teammate refactor'), 'teammate ask not folded in');
+    assert.strictEqual(asks.filter(a => a === 'Teammate refactor').length, 1, 'teammate ask not deduped');
+    assert.ok(payload.recentAsks.length <= 20, 'not capped at 20');
+    const iLocal = payload.recentAsks.findIndex(e => e.ask === 'Local ask one');
+    const iTeam = payload.recentAsks.findIndex(e => e.ask === 'Teammate refactor');
+    assert.ok(iLocal !== -1 && iTeam !== -1 && iLocal < iTeam, 'recentAsks not sorted oldest-first by ts');
   });
   check('file index covers project files and skips ignored dirs', () => {
     const db = JSON.parse(read(path.join(proj1, '.membridge', 'memory.json')));
