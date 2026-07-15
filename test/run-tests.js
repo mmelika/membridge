@@ -178,6 +178,27 @@ async function main() {
     const banned = db.entries.find(e => e.ask.includes('sk-test1234567890abcdef'));
     assert.ok(!banned, 'secret leaked into memory DB');
   });
+  check('projectStats: week-windowed sessions, distinct files, deduped open todos', () => {
+    const now = Date.parse('2026-07-14T12:00:00.000Z');
+    const iso = d => new Date(now - d * 86400000).toISOString();
+    const proj = { events: [
+      { kind: 'prompt', source: 'Claude Code', session: 's1', ts: iso(1), text: 'a' },
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(proj1, 'src/login.js') },
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(proj1, 'src/login.js') }, // dup file
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(proj1, 'src/api.js') },
+      { kind: 'edit', source: 'Claude Code', session: 's1', ts: iso(1), file: path.join(ROOT, 'scratch.js') }, // outside project -> dropped
+      { kind: 'todos', session: 's1', ts: iso(1), items: [ { text: 'x', status: 'completed' }, { text: 'y', status: 'pending' } ] },
+      { kind: 'todos', session: 's1', ts: iso(0.5), items: [ { text: 'x', status: 'completed' }, { text: 'y', status: 'in_progress' }, { text: 'z', status: 'pending' } ] }, // later snapshot -> 2 open
+      { kind: 'prompt', source: 'Codex', session: 's2', ts: iso(2), text: 'b' },
+      { kind: 'todos', session: 's2', ts: iso(2), items: [ { text: 'q', status: 'pending' } ] }, // 1 open
+      { kind: 'prompt', source: 'Claude Code', session: 's3', ts: iso(10), text: 'old' }, // outside 7d window
+      { kind: 'edit', source: 'Claude Code', session: 's3', ts: iso(10), file: path.join(proj1, 'src/old.js') }, // still counts (files are all-time)
+    ] };
+    const stats = memorydb.projectStats(proj1, proj, now);
+    assert.strictEqual(stats.sessionsThisWeek, 2, `sessions ${stats.sessionsThisWeek}`); // s1, s2 in window; s3 excluded
+    assert.strictEqual(stats.filesTouched, 3, `files ${stats.filesTouched}`); // login, api, old (scratch dropped)
+    assert.strictEqual(stats.openTodos, 3, `open ${stats.openTodos}`); // s1 latest snapshot = 2 open, s2 = 1 open
+  });
   check('file index covers project files and skips ignored dirs', () => {
     const db = JSON.parse(read(path.join(proj1, '.membridge', 'memory.json')));
     const paths = db.fileIndex.files.map(f => f.path);
