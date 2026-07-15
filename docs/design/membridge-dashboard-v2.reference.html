@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+<link href="https://fonts.googleapis.com/css2?family=Calistoga&amp;family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet" />
+<style>
+  html,body{margin:0;padding:0}
+  body{background:#FAFAFA;
+    --bg:#FAFAFA; --card:#FFFFFF; --surface2:#F1F5F9; --surface3:#E2E8F0;
+    --text:#0F172A; --text2:#64748B; --text3:#94A3B8;
+    --border:#E2E8F0; --border2:#CBD5E1;
+    --accent:#0052FF; --accent2:#4D7CFF;
+    --accent-soft:rgba(0,82,255,.06); --accent-brd:rgba(0,82,255,.3);
+    --grad:linear-gradient(135deg,#0052FF,#4D7CFF);
+    --inv:#0F172A; --inv-text:#F8FAFC; --inv-text2:rgba(248,250,252,.68);
+    --marco:#0052FF; --andrew:#0D9673;
+    --amber:#C77414; --amber-soft:rgba(199,116,20,.09);
+    --green:#0D9673;
+    --shadow-md:0 4px 6px rgba(0,0,0,.07);
+    --shadow-xl:0 20px 25px rgba(0,0,0,.1);
+    --shadow-accent:0 4px 14px rgba(0,82,255,.25);
+    --shadow-accent-lg:0 8px 24px rgba(0,82,255,.35);
+  }
+  body[data-theme="dark"]{background:#0B1120;
+    --bg:#0B1120; --card:#111A2E; --surface2:#16213A; --surface3:#1E293B;
+    --text:#F1F5F9; --text2:#94A3B8; --text3:#5B6B84;
+    --border:#1E293B; --border2:#334155;
+    --accent:#4D7CFF; --accent2:#7A9DFF;
+    --accent-soft:rgba(77,124,255,.1); --accent-brd:rgba(77,124,255,.35);
+    --grad:linear-gradient(135deg,#2E63FF,#6E93FF);
+    --inv:#111A2E; --inv-text:#F8FAFC; --inv-text2:rgba(248,250,252,.6);
+    --marco:#4D7CFF; --andrew:#22C08F;
+    --amber:#E79A3C; --amber-soft:rgba(231,154,60,.12);
+    --green:#22C08F;
+    --shadow-md:0 4px 10px rgba(0,0,0,.35);
+    --shadow-xl:0 20px 30px rgba(0,0,0,.45);
+    --shadow-accent:0 4px 14px rgba(46,99,255,.35);
+    --shadow-accent-lg:0 8px 24px rgba(46,99,255,.45);
+  }
+  a{color:var(--accent);text-decoration:none}
+  a:hover{color:var(--accent2);text-decoration:underline}
+  @keyframes mbPulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.3);opacity:.7}}
+  @keyframes mbSpin{to{transform:rotate(360deg)}}
+  @keyframes mbFade{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  ::selection{background:rgba(0,82,255,.18)}
+</style>
+</helmet>
+<div style="min-height:100vh;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased">
+
+<sc-if value="{{ isAuth }}" hint-placeholder-val="{{ false }}">
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;position:relative;overflow:hidden">
+    <div style="position:absolute;top:-180px;right:-120px;width:480px;height:480px;border-radius:50%;background:var(--accent);opacity:.05;filter:blur(150px)"></div>
+    <div style="position:absolute;bottom:-180px;left:-120px;width:420px;height:420px;border-radius:50%;background:var(--accent2);opacity:.05;filter:blur(150px)"></div>
+    <div style="width:350px;text-align:center;animation:mbFade .5s cubic-bezier(.16,1,.3,1);position:relative">
+      <div style="display:flex;justify-content:center;margin-bottom:22px">
+        <div style="display:flex;align-items:center">
+          <div style="width:24px;height:24px;border-radius:50%;background:var(--grad);box-shadow:var(--shadow-accent)"></div>
+          <div style="width:24px;height:24px;border-radius:50%;border:2px solid var(--text);margin-left:-9px;background:var(--bg)"></div>
+        </div>
+      </div>
+      <div style="font-family:Calistoga,Georgia,serif;font-size:28px;letter-spacing:-0.01em">Mem<span style="background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent">Bridge</span></div>
+      <div style="color:var(--text2);margin:10px 0 30px;font-size:14.5px">Shared memory for the AI tools your team codes with.</div>
+      <button onClick="{{ signIn }}" style="width:100%;height:48px;border-radius:12px;border:none;background:var(--grad);color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;box-shadow:var(--shadow-accent);transition:all .2s ease-out" style-hover="transform:translateY(-2px);box-shadow:var(--shadow-accent-lg)" style-active="transform:scale(.98)">Sign in with GitHub</button>
+      <button onClick="{{ signIn }}" style="width:100%;height:48px;margin-top:10px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:14px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .2s ease-out" style-hover="border-color:var(--accent-brd);box-shadow:var(--shadow-md)">Continue with email</button>
+      <div style="color:var(--text3);font-size:12px;margin-top:26px">Your session memories stay on your machine until you join a team.</div>
+    </div>
+  </div>
+</sc-if>
+
+<sc-if value="{{ isApp }}" hint-placeholder-val="{{ true }}">
+
+  <!-- ============ HEADER ============ -->
+  <header style="position:sticky;top:0;z-index:40;background:var(--bg);border-bottom:1px solid var(--border)">
+    <div style="max-width:1080px;margin:0 auto;padding:0 28px;height:56px;display:flex;align-items:center;gap:10px">
+      <div onClick="{{ navCatchup }}" style="display:flex;align-items:center;gap:9px;cursor:pointer;padding:6px 9px;margin-left:-9px;border-radius:10px;transition:background .2s" style-hover="background:var(--surface2)">
+        <div style="display:flex;align-items:center">
+          <div style="width:14px;height:14px;border-radius:50%;background:var(--grad)"></div>
+          <div style="width:14px;height:14px;border-radius:50%;border:1.5px solid var(--text);margin-left:-5px;background:var(--bg)"></div>
+        </div>
+        <span style="font-family:Calistoga,Georgia,serif;font-size:16px;letter-spacing:0">MemBridge</span>
+      </div>
+      <div style="flex:1"></div>
+      <div onClick="{{ syncNow }}" title="Click to sync now" style="display:flex;align-items:center;gap:8px;padding:6px 13px;border-radius:99px;border:1px solid var(--accent-brd);background:var(--accent-soft);cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);transition:all .2s" style-hover="box-shadow:var(--shadow-accent)">
+        <span style="{{ syncDotStyle }}"></span>{{ syncLabel }}
+      </div>
+      <div style="position:relative">
+        <button onClick="{{ toggleInvite }}" style="height:34px;padding:0 15px;border-radius:10px;border:none;background:var(--grad);color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;box-shadow:var(--shadow-accent);transition:all .2s ease-out" style-hover="transform:translateY(-1px);box-shadow:var(--shadow-accent-lg)" style-active="transform:scale(.98)">Invite</button>
+        <sc-if value="{{ inviteOpen }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute;right:0;top:42px;width:310px;background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-xl);padding:18px;animation:mbFade .2s cubic-bezier(.16,1,.3,1);z-index:50">
+            <div style="font-weight:600;font-size:13.5px;margin-bottom:4px">Invite to membridge-core</div>
+            <div style="color:var(--text2);font-size:12.5px;margin-bottom:12px">Anyone with the link joins as a member.</div>
+            <div style="display:flex;gap:8px">
+              <div style="flex:1;padding:8px 11px;border-radius:10px;background:var(--surface2);font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">membridge.app/j/9kf2-xq7</div>
+              <button onClick="{{ copyInvite }}" style="padding:8px 14px;border-radius:10px;border:none;background:var(--grad);color:#fff;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit" style-active="transform:scale(.98)">{{ inviteCopyLabel }}</button>
+            </div>
+          </div>
+        </sc-if>
+      </div>
+      <button onClick="{{ toggleTheme }}" title="Toggle theme" style="width:34px;height:34px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text2);cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;transition:all .2s" style-hover="border-color:var(--accent-brd);color:var(--text)">{{ themeGlyph }}</button>
+      <button onClick="{{ navSettings }}" title="Settings" style="width:34px;height:34px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text2);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s" style-hover="border-color:var(--accent-brd);color:var(--text)">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="2.4"></circle><circle cx="8" cy="8" r="6" stroke-dasharray="1.8 2.4"></circle></svg>
+      </button>
+    </div>
+  </header>
+
+  <sc-if value="{{ isOffline }}" hint-placeholder-val="{{ false }}">
+    <div style="background:var(--amber-soft);border-bottom:1px solid var(--border)">
+      <div style="max-width:1080px;margin:0 auto;padding:9px 28px;font-size:12.5px;color:var(--text2);display:flex;gap:9px;align-items:center">
+        <span style="width:7px;height:7px;border-radius:50%;background:var(--amber);flex:none;animation:mbPulse 2s ease infinite"></span>
+        Team sync unreachable — showing your local sessions only. Teammate activity will appear when the connection returns.
+        <span onClick="{{ syncNow }}" style="color:var(--accent);cursor:pointer;font-weight:600">Retry</span>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ============ CATCH-UP ============ -->
+  <sc-if value="{{ isCatchup }}" hint-placeholder-val="{{ true }}">
+  <main style="max-width:780px;margin:0 auto;padding:52px 28px 110px;animation:mbFade .4s cubic-bezier(.16,1,.3,1)">
+
+    <!-- section label -->
+    <div style="display:inline-flex;align-items:center;gap:10px;border-radius:99px;border:1px solid var(--accent-brd);background:var(--accent-soft);padding:6px 16px;margin-bottom:18px">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--accent);animation:mbPulse 2s ease infinite"></span>
+      <span style="font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)">The Catch-Up</span>
+    </div>
+
+    <div style="display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap">
+      <h1 style="margin:0;font-family:Calistoga,Georgia,serif;font-size:42px;font-weight:400;letter-spacing:-0.02em;line-height:1.05">{{ catchupTitlePre }} <span style="position:relative;display:inline-block"><span style="background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent">{{ catchupTitleAccent }}</span><span style="position:absolute;bottom:-2px;left:0;height:10px;width:100%;border-radius:2px;background:linear-gradient(to right,rgba(0,82,255,.15),rgba(77,124,255,.08))"></span></span></h1>
+      <div style="flex:1"></div>
+      <sc-if value="{{ showMarkCaughtUp }}" hint-placeholder-val="{{ true }}">
+        <button onClick="{{ markCaughtUp }}" style="height:38px;padding:0 16px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--text2);font-size:13px;font-weight:500;cursor:pointer;font-family:inherit;margin-bottom:4px;transition:all .2s ease-out" style-hover="border-color:var(--accent-brd);color:var(--text);box-shadow:var(--shadow-md)" style-active="transform:scale(.98)">Mark as caught up</button>
+      </sc-if>
+    </div>
+    <div style="display:flex;align-items:center;gap:7px;color:var(--text3);font-size:12.5px;margin:14px 0 40px;flex-wrap:wrap">
+      <sc-if value="{{ showAnchorLine }}" hint-placeholder-val="{{ true }}">
+        <span>Since you last looked — {{ lastViewedLabel }}</span>
+        <span style="color:var(--border2)">·</span>
+        <span style="display:flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:50%;background:var(--green)"></span>Andrew is caught up through your 3:12 PM session yesterday</span>
+      </sc-if>
+    </div>
+
+    <!-- ALL CAUGHT UP -->
+    <sc-if value="{{ isCaughtUpState }}" hint-placeholder-val="{{ false }}">
+      <div style="text-align:center;padding:60px 24px 70px">
+        <div style="display:flex;justify-content:center;margin-bottom:20px">
+          <div style="width:52px;height:52px;border-radius:16px;background:var(--grad);display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;box-shadow:var(--shadow-accent-lg)">✓</div>
+        </div>
+        <div style="font-family:Calistoga,Georgia,serif;font-size:24px">You're all caught up</div>
+        <div style="color:var(--text2);margin-top:8px;font-size:14px;max-width:390px;margin-left:auto;margin-right:auto">Nothing new from Andrew since {{ caughtUpAt }}. New work will collect here as it happens.</div>
+        <sc-if value="{{ canUndoCaughtUp }}" hint-placeholder-val="{{ false }}">
+          <div onClick="{{ undoCaughtUp }}" style="margin-top:16px;color:var(--accent);font-size:13px;font-weight:600;cursor:pointer;display:inline-block">Undo</div>
+        </sc-if>
+      </div>
+    </sc-if>
+
+    <!-- NO TEAM -->
+    <sc-if value="{{ isNoTeam }}" hint-placeholder-val="{{ false }}">
+      <div style="border:1px solid var(--border);border-radius:20px;background:var(--card);padding:44px 36px;text-align:center;box-shadow:var(--shadow-md);position:relative;overflow:hidden">
+        <div style="position:absolute;top:-120px;right:-80px;width:320px;height:320px;border-radius:50%;background:var(--accent);opacity:.04;filter:blur(100px)"></div>
+        <div style="display:flex;justify-content:center;margin-bottom:18px;position:relative">
+          <div style="display:flex">
+            <div style="width:34px;height:34px;border-radius:50%;background:var(--grad);box-shadow:var(--shadow-accent)"></div>
+            <div style="width:34px;height:34px;border-radius:50%;border:2px dashed var(--border2);margin-left:-9px;background:var(--bg)"></div>
+          </div>
+        </div>
+        <div style="font-family:Calistoga,Georgia,serif;font-size:22px">You're not on a team yet</div>
+        <div style="color:var(--text2);font-size:13.5px;max-width:410px;margin:10px auto 24px">The catch-up comes alive when a teammate joins — their sessions get distilled into your briefing, and yours into theirs. Until then, MemBridge keeps syncing memory into your own tools.</div>
+        <button onClick="{{ toggleInvite }}" style="height:48px;padding:0 24px;border-radius:12px;border:none;background:var(--grad);color:#fff;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;box-shadow:var(--shadow-accent);transition:all .2s ease-out" style-hover="transform:translateY(-2px);box-shadow:var(--shadow-accent-lg)" style-active="transform:scale(.98)">Create an invite link</button>
+        <div style="color:var(--text3);font-size:12px;margin-top:16px">or <span style="color:var(--accent);cursor:pointer;font-weight:600">join an existing team</span> with a code</div>
+      </div>
+    </sc-if>
+
+    <!-- BRAND NEW -->
+    <sc-if value="{{ isFresh }}" hint-placeholder-val="{{ false }}">
+      <div style="border:1px solid var(--border);border-radius:20px;background:var(--card);padding:36px;box-shadow:var(--shadow-md)">
+        <div style="font-family:Calistoga,Georgia,serif;font-size:22px">Welcome to MemBridge</div>
+        <div style="color:var(--text2);font-size:13.5px;margin:8px 0 26px">The daemon is running. Your first briefing appears after a work session in a watched project.</div>
+        <div style="display:grid;gap:0">
+          <div style="display:flex;gap:14px;align-items:center;padding:14px 0;border-top:1px solid var(--border)">
+            <span style="width:24px;height:24px;border-radius:8px;background:var(--grad);color:#fff;font-size:11px;display:flex;align-items:center;justify-content:center;flex:none">✓</span>
+            <div style="flex:1"><span style="font-weight:600;font-size:13.5px">Daemon running</span><span style="color:var(--text3);font-size:12.5px"> — watching for sessions</span></div>
+          </div>
+          <div style="display:flex;gap:14px;align-items:center;padding:14px 0;border-top:1px solid var(--border)">
+            <span style="width:24px;height:24px;border-radius:8px;background:var(--grad);color:#fff;font-size:11px;display:flex;align-items:center;justify-content:center;flex:none">✓</span>
+            <div style="flex:1"><span style="font-weight:600;font-size:13.5px">2 tools detected</span><span style="color:var(--text3);font-size:12.5px"> — Claude Code, Codex</span></div>
+          </div>
+          <div style="display:flex;gap:14px;align-items:center;padding:14px 0;border-top:1px solid var(--border)">
+            <span style="width:24px;height:24px;border-radius:8px;border:1.5px dashed var(--border2);flex:none"></span>
+            <div style="flex:1"><span style="font-weight:600;font-size:13.5px">Add your first project</span><span style="color:var(--text3);font-size:12.5px"> — point MemBridge at a folder you code in</span></div>
+            <button onClick="{{ navSettings }}" style="height:38px;padding:0 15px;border-radius:10px;border:1px solid var(--accent-brd);background:var(--accent-soft);color:var(--accent);font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;transition:all .2s" style-hover="box-shadow:var(--shadow-accent)">Add project</button>
+          </div>
+        </div>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ showCatchupBody }}" hint-placeholder-val="{{ true }}">
+
+      <!-- A · AI BRIEFING — inverted spotlight card -->
+      <sc-if value="{{ showBriefing }}" hint-placeholder-val="{{ true }}">
+        <section style="position:relative;border-radius:20px;background:var(--inv);color:var(--inv-text);padding:28px 30px 26px;margin-bottom:48px;box-shadow:var(--shadow-xl);overflow:hidden">
+          <div style="position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,1) 1px,transparent 1px);background-size:32px 32px;opacity:.04;pointer-events:none"></div>
+          <div style="position:absolute;top:-140px;right:-100px;width:380px;height:380px;border-radius:50%;background:#4D7CFF;opacity:.14;filter:blur(120px);pointer-events:none"></div>
+          <div style="display:flex;align-items:center;gap:9px;margin-bottom:15px;position:relative">
+            <span style="background:linear-gradient(135deg,#6E93FF,#9DB7FF);-webkit-background-clip:text;background-clip:text;color:transparent;font-size:12px">✦</span>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;letter-spacing:.15em;text-transform:uppercase;color:rgba(248,250,252,.5)">Briefing · AI-generated</span>
+            <div style="flex:1"></div>
+            <span onClick="{{ regenerate }}" style="font-size:12px;color:rgba(248,250,252,.45);cursor:pointer;display:flex;align-items:center;gap:5px;transition:color .2s" style-hover="color:rgba(248,250,252,.8)"><span style="{{ regenStyle }}">↻</span>{{ regenLabel }}</span>
+          </div>
+          <p style="margin:0;font-size:16.5px;line-height:1.7;color:var(--inv-text);text-wrap:pretty;position:relative;opacity:{{ briefingOpacity }};transition:opacity .3s">Since yesterday afternoon, Andrew shipped the <strong style="font-weight:600;background:linear-gradient(135deg,#6E93FF,#9DB7FF);-webkit-background-clip:text;background-clip:text;color:transparent">unified feed API</strong> and fixed the distiller bug that was dropping final todo state. He's midway through the <strong style="font-weight:600;background:linear-gradient(135deg,#6E93FF,#9DB7FF);-webkit-background-clip:text;background-clip:text;color:transparent">Supabase migration</strong> in membridge-daemon — the sync writer still points at the old store. The <strong style="font-weight:600;background:linear-gradient(135deg,#6E93FF,#9DB7FF);-webkit-background-clip:text;background-clip:text;color:transparent">API-key rotation is waiting on you</strong>; pick up in <code style="font-family:'JetBrains Mono',monospace;font-size:13px;background:rgba(255,255,255,.09);padding:2px 7px;border-radius:6px">lib/teamsync.js</code>.</p>
+        </section>
+      </sc-if>
+      <sc-if value="{{ showNoKeyHint }}" hint-placeholder-val="{{ false }}">
+        <div style="color:var(--text3);font-size:12.5px;margin-bottom:40px;padding:12px 16px;border:1px dashed var(--border2);border-radius:12px">AI briefing off — <span onClick="{{ navSettings }}" style="color:var(--accent);cursor:pointer;font-weight:600">add an API key</span> in Settings to get a written summary here. The headlines below tell the same story.</div>
+      </sc-if>
+
+      <!-- B · HEADLINES -->
+      <section style="margin-bottom:56px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <div style="display:inline-flex;align-items:center;gap:8px;border-radius:99px;border:1px solid var(--accent-brd);background:var(--accent-soft);padding:4px 13px">
+            <span style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></span>
+            <span style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)">{{ headlinesTitle }}</span>
+          </div>
+          <div style="flex:1"></div>
+          <span onClick="{{ navFeed }}" style="font-size:13px;color:var(--accent);cursor:pointer;font-weight:600;display:inline-flex;align-items:center;gap:4px" style-hover="color:var(--accent2)">See everything <span style="display:inline-block;transition:transform .2s">→</span></span>
+        </div>
+        <sc-if value="{{ isOffline }}" hint-placeholder-val="{{ false }}">
+          <div style="color:var(--text3);font-size:12.5px;margin:8px 0 4px">Andrew's sessions are unavailable offline. Your own recent work:</div>
+        </sc-if>
+
+        <sc-for list="{{ headlines }}" as="s" hint-placeholder-count="3">
+          <article style="border-bottom:1px solid var(--border)">
+            <div onClick="{{ s.toggle }}" style="display:flex;gap:14px;align-items:flex-start;padding:17px 12px 17px 4px;margin:0 -12px 0 -4px;cursor:pointer;border-radius:14px;transition:background .2s" style-hover="background:var(--surface2)">
+              <div style="width:28px;height:28px;border-radius:10px;background:{{ s.color }};color:#fff;font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center;flex:none;margin-top:1px;box-shadow:var(--shadow-md)">{{ s.initial }}</div>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:15px;font-weight:600;letter-spacing:-0.01em;line-height:1.45;text-wrap:pretty">
+                  <sc-if value="{{ s.wip }}" hint-placeholder-val="{{ false }}"><span style="color:var(--amber)">Working on:&nbsp;</span></sc-if>{{ s.summary }}
+                </div>
+                <div style="display:flex;align-items:center;gap:9px;margin-top:7px;font-size:12px;color:var(--text3);flex-wrap:wrap">
+                  <span style="color:var(--text2);font-weight:500">{{ s.author }}</span>
+                  <span style="padding:2px 9px;border-radius:99px;border:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.04em;color:var(--text2)">{{ s.tool }}</span>
+                  <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text3)">{{ s.project }}</span>
+                  <sc-if value="{{ s.wip }}" hint-placeholder-val="{{ false }}">
+                    <span style="display:flex;align-items:center;gap:5px;color:var(--amber);font-weight:600;font-size:11.5px"><span style="width:6px;height:6px;border-radius:50%;background:var(--amber);animation:mbPulse 2s ease infinite"></span>in progress · {{ s.todoLabel }}</span>
+                  </sc-if>
+                  <span style="margin-left:auto;flex:none">{{ s.time }}</span>
+                  <span style="color:var(--text3);font-size:10px;transform:{{ s.chev }};transition:transform .2s">▾</span>
+                </div>
+              </div>
+            </div>
+
+            <sc-if value="{{ s.expanded }}" hint-placeholder-val="{{ false }}">
+              <div style="margin:2px 0 20px 42px;padding:20px 22px;border-radius:16px;background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow-md);animation:mbFade .25s cubic-bezier(.16,1,.3,1)">
+                <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">The ask</div>
+                <p style="margin:0 0 18px;font-size:13.5px;color:var(--text2);line-height:1.65;max-width:58ch;border-left:none;font-style:italic">“{{ s.ask }}”</p>
+
+                <sc-if value="{{ s.hasCheckpoints }}" hint-placeholder-val="{{ false }}">
+                  <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:9px">Checkpoints</div>
+                  <div style="margin:0 0 18px;display:grid;gap:8px">
+                    <sc-for list="{{ s.checkpoints }}" as="c" hint-placeholder-count="3">
+                      <div style="display:flex;gap:11px;font-size:13px;color:var(--text2);line-height:1.5">
+                        <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;flex:none;margin-top:2px;font-weight:500">{{ c.n }}</span>
+                        <span>{{ c.t }}</span>
+                      </div>
+                    </sc-for>
+                  </div>
+                </sc-if>
+
+                <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:9px">Todos · {{ s.todoLabel }}</div>
+                <div style="height:4px;border-radius:2px;background:var(--surface3);max-width:220px;margin-bottom:11px"><div style="height:4px;border-radius:2px;background:{{ s.todoBar }};width:{{ s.todoPct }};transition:width .4s"></div></div>
+                <div style="display:grid;gap:6px;margin-bottom:18px">
+                  <sc-for list="{{ s.todoItems }}" as="t" hint-placeholder-count="2">
+                    <div style="display:flex;gap:9px;font-size:13px;align-items:baseline;color:{{ t.color }}">
+                      <span style="font-size:11px;flex:none">{{ t.mark }}</span><span style="text-decoration:{{ t.deco }}">{{ t.t }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+
+                <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:9px">Files touched</div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">
+                  <sc-for list="{{ s.files }}" as="f" hint-placeholder-count="3">
+                    <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px;padding:4px 9px;border-radius:8px;background:var(--surface2);color:var(--text2)">{{ f }}</span>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+          </article>
+        </sc-for>
+      </section>
+
+      <!-- C · PROJECT STATE -->
+      <section>
+        <div style="display:inline-flex;align-items:center;gap:8px;border-radius:99px;border:1px solid var(--accent-brd);background:var(--accent-soft);padding:4px 13px;margin-bottom:10px">
+          <span style="width:6px;height:6px;border-radius:50%;background:var(--accent)"></span>
+          <span style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)">Projects — what changed</span>
+        </div>
+        <div style="display:grid;gap:14px">
+          <sc-for list="{{ projects }}" as="p" hint-placeholder-count="3">
+            <div onClick="{{ p.open }}" style="display:flex;gap:15px;padding:18px 20px;border:1px solid var(--border);border-radius:16px;background:var(--card);cursor:pointer;align-items:flex-start;box-shadow:var(--shadow-md);transition:all .25s ease-out" style-hover="box-shadow:var(--shadow-xl);transform:translateY(-2px);border-color:var(--accent-brd)">
+              <div style="width:30px;height:30px;border-radius:10px;background:var(--grad);display:flex;align-items:center;justify-content:center;font-family:'JetBrains Mono',monospace;font-size:10.5px;color:#fff;flex:none;margin-top:1px;box-shadow:var(--shadow-accent)">{{ p.glyph }}</div>
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:baseline;gap:9px;flex-wrap:wrap">
+                  <span style="font-size:15px;font-weight:600;letter-spacing:-0.01em">{{ p.name }}</span>
+                  <sc-if value="{{ p.shared }}" hint-placeholder-val="{{ true }}"><span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--text3)">shared</span></sc-if>
+                  <sc-if value="{{ p.local }}" hint-placeholder-val="{{ false }}"><span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);border:1px dashed var(--border2);border-radius:99px;padding:1px 8px">local only</span></sc-if>
+                  <span style="margin-left:auto;font-size:12px;color:var(--text3);flex:none">{{ p.lastTouched }}</span>
+                </div>
+                <div style="font-size:13px;color:var(--text2);margin-top:4px">{{ p.delta }}</div>
+                <sc-if value="{{ p.activeNow }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;align-items:center;gap:7px;margin-top:9px;font-size:12.5px;color:var(--green);font-weight:600"><span style="width:7px;height:7px;border-radius:50%;background:var(--green);animation:mbPulse 2s ease infinite"></span>{{ p.activeLabel }}</div>
+                </sc-if>
+                <sc-if value="{{ p.hasTodos }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:grid;gap:5px;margin-top:11px">
+                    <sc-for list="{{ p.todos }}" as="t" hint-placeholder-count="2">
+                      <div style="display:flex;gap:9px;font-size:12.5px;align-items:baseline">
+                        <span style="width:12px;height:12px;border:1.5px solid var(--border2);border-radius:4px;flex:none;position:relative;top:1px"></span>
+                        <span style="color:var(--text2)">{{ t.t }}</span>
+                        <span style="font-size:11.5px;color:{{ t.whoColor }};font-weight:600;flex:none">{{ t.who }}</span>
+                      </div>
+                    </sc-for>
+                  </div>
+                </sc-if>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+      </section>
+
+    </sc-if>
+  </main>
+  </sc-if>
+
+  <!-- ============ FULL FEED ============ -->
+  <sc-if value="{{ isFeed }}" hint-placeholder-val="{{ false }}">
+  <main style="max-width:780px;margin:0 auto;padding:48px 28px 110px;animation:mbFade .4s cubic-bezier(.16,1,.3,1)">
+    <div onClick="{{ navCatchup }}" style="font-size:12.5px;color:var(--text3);cursor:pointer;margin-bottom:16px;display:inline-block;transition:color .2s" style-hover="color:var(--text2)">← Catch-Up</div>
+    <h1 style="margin:0 0 22px;font-family:Calistoga,Georgia,serif;font-size:36px;font-weight:400;letter-spacing:-0.02em">Every<span style="background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent">thing</span></h1>
+    <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:28px">
+      <sc-for list="{{ feedChips }}" as="c" hint-placeholder-count="6">
+        <span onClick="{{ c.click }}" style="padding:5px 14px;border-radius:99px;font-size:12.5px;cursor:pointer;border:1px solid {{ c.border }};background:{{ c.bg }};color:{{ c.color }};font-weight:{{ c.weight }};transition:all .2s;box-shadow:{{ c.shadow }}" style-hover="border-color:var(--accent-brd)">{{ c.label }}</span>
+      </sc-for>
+    </div>
+    <sc-for list="{{ feedGroups }}" as="g" hint-placeholder-count="2">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin:28px 0 4px">{{ g.label }}</div>
+      <sc-for list="{{ g.items }}" as="s" hint-placeholder-count="3">
+        <div onClick="{{ s.toggle }}" style="display:flex;gap:14px;align-items:flex-start;padding:14px 12px 14px 4px;margin:0 -12px 0 -4px;border-bottom:1px solid var(--border);cursor:pointer;border-radius:12px;transition:background .2s" style-hover="background:var(--surface2)">
+          <div style="width:26px;height:26px;border-radius:9px;background:{{ s.color }};color:#fff;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center;flex:none;margin-top:1px">{{ s.initial }}</div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:14px;font-weight:600;line-height:1.45;text-wrap:pretty"><sc-if value="{{ s.wip }}" hint-placeholder-val="{{ false }}"><span style="color:var(--amber)">Working on:&nbsp;</span></sc-if>{{ s.summary }}</div>
+            <div style="display:flex;align-items:center;gap:9px;margin-top:5px;font-size:12px;color:var(--text3);flex-wrap:wrap">
+              <span style="color:var(--text2);font-weight:500">{{ s.author }}</span>
+              <span style="padding:1.5px 9px;border-radius:99px;border:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text2)">{{ s.tool }}</span>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:10.5px">{{ s.project }}</span>
+              <span style="margin-left:auto">{{ s.time }}</span>
+            </div>
+          </div>
+        </div>
+      </sc-for>
+    </sc-for>
+  </main>
+  </sc-if>
+
+  <!-- ============ PROJECT PAGE ============ -->
+  <sc-if value="{{ isProject }}" hint-placeholder-val="{{ false }}">
+  <main style="max-width:780px;margin:0 auto;padding:48px 28px 110px;animation:mbFade .4s cubic-bezier(.16,1,.3,1)">
+    <div onClick="{{ navCatchup }}" style="font-size:12.5px;color:var(--text3);cursor:pointer;margin-bottom:16px;display:inline-block;transition:color .2s" style-hover="color:var(--text2)">← Catch-Up</div>
+
+    <div style="display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap">
+      <div style="flex:1;min-width:260px">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <h1 style="margin:0;font-family:Calistoga,Georgia,serif;font-size:34px;font-weight:400;letter-spacing:-0.02em">{{ proj.name }}</h1>
+          <sc-if value="{{ proj.shared }}" hint-placeholder-val="{{ true }}"><span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent-brd);background:var(--accent-soft);border-radius:99px;padding:3px 11px">shared · membridge-core</span></sc-if>
+        </div>
+        <div style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:var(--text3);margin-top:8px">{{ proj.path }}</div>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:14px;font-size:12.5px;color:var(--text2)">
+          <span style="display:flex">
+            <span style="width:22px;height:22px;border-radius:50%;background:var(--marco);color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;border:2px solid var(--bg)">M</span>
+            <span style="width:22px;height:22px;border-radius:50%;background:var(--andrew);color:#fff;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;border:2px solid var(--bg);margin-left:-7px">A</span>
+          </span>
+          <span>Marco &amp; Andrew</span><span style="color:var(--border2)">·</span><span>{{ proj.lastTouched }}</span>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;position:relative">
+        <button onClick="{{ copyForAI }}" style="height:38px;padding:0 16px;border-radius:12px;border:none;background:var(--grad);color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;box-shadow:var(--shadow-accent);transition:all .2s ease-out" style-hover="transform:translateY(-1px);box-shadow:var(--shadow-accent-lg)" style-active="transform:scale(.98)">{{ copyAiLabel }}</button>
+        <button onClick="{{ toggleMenu }}" style="width:38px;height:38px;border-radius:12px;border:1px solid var(--border);background:var(--card);color:var(--text2);cursor:pointer;font-size:16px;line-height:1;transition:all .2s" style-hover="border-color:var(--accent-brd);color:var(--text)">⋯</button>
+        <sc-if value="{{ menuOpen }}" hint-placeholder-val="{{ false }}">
+          <div style="position:absolute;right:0;top:44px;width:240px;background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-xl);padding:6px;z-index:50;animation:mbFade .2s cubic-bezier(.16,1,.3,1)">
+            <div onClick="{{ menuClose }}" style="padding:9px 12px;border-radius:10px;font-size:13px;cursor:pointer;transition:background .15s" style-hover="background:var(--surface2)">Open memory log</div>
+            <div onClick="{{ togglePause }}" style="padding:9px 12px;border-radius:10px;font-size:13px;cursor:pointer;transition:background .15s" style-hover="background:var(--surface2)">{{ pauseLabel }}</div>
+            <div onClick="{{ menuClose }}" style="padding:9px 12px;border-radius:10px;font-size:13px;cursor:pointer;transition:background .15s" style-hover="background:var(--surface2)">Copy share link</div>
+            <div style="height:1px;background:var(--border);margin:6px 8px"></div>
+            <sc-if value="{{ confirmingDelete }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:9px 12px;font-size:12.5px;color:var(--text2)">Delete this project and its memory for the whole team?
+                <div style="display:flex;gap:10px;margin-top:9px">
+                  <span onClick="{{ doDelete }}" style="color:#DC2626;font-weight:600;cursor:pointer">Delete</span>
+                  <span onClick="{{ cancelDelete }}" style="color:var(--text3);cursor:pointer">Cancel</span>
+                </div>
+              </div>
+            </sc-if>
+            <sc-if value="{{ notConfirmingDelete }}" hint-placeholder-val="{{ true }}">
+              <div onClick="{{ askDelete }}" style="padding:9px 12px;border-radius:10px;font-size:13px;cursor:pointer;color:#DC2626;transition:background .15s" style-hover="background:var(--surface2)">Delete project…</div>
+            </sc-if>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <sc-if value="{{ projPaused }}" hint-placeholder-val="{{ false }}">
+      <div style="margin-top:18px;padding:10px 16px;border-radius:12px;background:var(--amber-soft);font-size:12.5px;color:var(--text2)">Watching is paused — new sessions in this project aren't being recorded. <span onClick="{{ togglePause }}" style="color:var(--accent);cursor:pointer;font-weight:600">Resume</span></div>
+    </sc-if>
+
+    <!-- state strip -->
+    <div style="display:flex;gap:0;margin:28px 0 10px;border:1px solid var(--border);border-radius:16px;background:var(--card);box-shadow:var(--shadow-md);overflow:hidden;flex-wrap:wrap">
+      <div style="flex:1;min-width:120px;padding:16px 20px;border-right:1px solid var(--border)"><div style="font-family:Calistoga,Georgia,serif;font-size:24px">{{ proj.statSessions }}</div><div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-top:2px">sessions this week</div></div>
+      <div style="flex:1;min-width:120px;padding:16px 20px;border-right:1px solid var(--border)"><div style="font-family:Calistoga,Georgia,serif;font-size:24px">{{ proj.statFiles }}</div><div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-top:2px">files touched</div></div>
+      <div style="flex:1;min-width:120px;padding:16px 20px"><div style="font-family:Calistoga,Georgia,serif;font-size:24px;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;display:inline-block">{{ proj.statTodos }}</div><div style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text3);margin-top:2px">open todos</div></div>
+      <sc-if value="{{ proj.activeNow }}" hint-placeholder-val="{{ false }}">
+        <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--green);font-weight:600;padding:16px 20px;border-left:1px solid var(--border)"><span style="width:7px;height:7px;border-radius:50%;background:var(--green);animation:mbPulse 2s ease infinite"></span>{{ proj.activeLabel }}</div>
+      </sc-if>
+    </div>
+
+    <!-- roadmap -->
+    <div style="border:1px solid var(--border);border-radius:16px;background:var(--card);margin:18px 0 8px;overflow:hidden;box-shadow:var(--shadow-md)">
+      <div onClick="{{ toggleRoadmap }}" style="display:flex;align-items:center;gap:11px;padding:15px 18px;cursor:pointer;transition:background .2s" style-hover="background:var(--surface2)">
+        <span style="color:var(--text3);font-size:10px;transform:{{ roadmapChev }};transition:transform .2s">▸</span>
+        <span style="font-size:13.5px;font-weight:600">Roadmap</span>
+        <span style="font-size:12px;color:var(--text3)">generated from this project's memory</span>
+        <div style="flex:1"></div>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)">✦ uses your API key</span>
+      </div>
+      <sc-if value="{{ roadmapOpen }}" hint-placeholder-val="{{ false }}">
+        <div style="padding:4px 18px 20px 39px;border-top:1px solid var(--border)">
+          <sc-if value="{{ roadmapIdle }}" hint-placeholder-val="{{ true }}">
+            <div style="padding-top:14px;font-size:13px;color:var(--text2)">Distill the merged history into a short where-we-are / what's-next.
+              <div style="margin-top:14px"><button onClick="{{ genRoadmap }}" style="height:40px;padding:0 18px;border-radius:12px;border:none;background:var(--grad);color:#fff;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;box-shadow:var(--shadow-accent);transition:all .2s ease-out" style-hover="transform:translateY(-1px);box-shadow:var(--shadow-accent-lg)" style-active="transform:scale(.98)">Generate roadmap</button></div>
+            </div>
+          </sc-if>
+          <sc-if value="{{ roadmapLoading }}" hint-placeholder-val="{{ false }}">
+            <div style="padding-top:16px;font-size:13px;color:var(--text3);display:flex;gap:9px;align-items:center"><span style="width:13px;height:13px;border:2px solid var(--surface3);border-top-color:var(--accent);border-radius:50%;animation:mbSpin .8s linear infinite;display:inline-block"></span>Reading 31 session memories…</div>
+          </sc-if>
+          <sc-if value="{{ roadmapDone }}" hint-placeholder-val="{{ false }}">
+            <div style="padding-top:16px;font-size:13.5px;line-height:1.7;color:var(--text2);animation:mbFade .3s ease;max-width:60ch">
+              <p style="margin:0 0 10px"><strong style="font-weight:600;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent">Now</strong> — feed API is unified and stable; distiller edge cases closed. Sync storage is mid-migration to Supabase.</p>
+              <p style="margin:0 0 10px"><strong style="font-weight:600;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent">Next</strong> — finish the sync-writer cutover, rotate API keys, then QA pagination at 1k-session scale.</p>
+              <p style="margin:0"><strong style="font-weight:600;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent">Later</strong> — invite-link roles, third-tool support (Cursor), menubar quick-glance.</p>
+            </div>
+          </sc-if>
+        </div>
+      </sc-if>
+    </div>
+
+    <!-- merged stream -->
+    <sc-for list="{{ projGroups }}" as="g" hint-placeholder-count="2">
+      <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin:30px 0 4px">{{ g.label }}</div>
+      <sc-for list="{{ g.items }}" as="s" hint-placeholder-count="2">
+        <div onClick="{{ s.toggle }}" style="display:flex;gap:14px;align-items:flex-start;padding:14px 12px 14px 4px;margin:0 -12px 0 -4px;border-bottom:1px solid var(--border);cursor:pointer;border-radius:12px;transition:background .2s" style-hover="background:var(--surface2)">
+          <div style="width:26px;height:26px;border-radius:9px;background:{{ s.color }};color:#fff;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center;flex:none;margin-top:1px">{{ s.initial }}</div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:14px;font-weight:600;line-height:1.45;text-wrap:pretty"><sc-if value="{{ s.wip }}" hint-placeholder-val="{{ false }}"><span style="color:var(--amber)">Working on:&nbsp;</span></sc-if>{{ s.summary }}</div>
+            <div style="display:flex;align-items:center;gap:9px;margin-top:5px;font-size:12px;color:var(--text3)">
+              <span style="color:var(--text2);font-weight:500">{{ s.author }}</span>
+              <span style="padding:1.5px 9px;border-radius:99px;border:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text2)">{{ s.tool }}</span>
+              <span style="margin-left:auto">{{ s.time }}</span>
+            </div>
+          </div>
+        </div>
+      </sc-for>
+    </sc-for>
+  </main>
+  </sc-if>
+
+  <!-- ============ SETTINGS ============ -->
+  <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+  <main style="max-width:660px;margin:0 auto;padding:48px 28px 110px;animation:mbFade .4s cubic-bezier(.16,1,.3,1)">
+    <div onClick="{{ navCatchup }}" style="font-size:12.5px;color:var(--text3);cursor:pointer;margin-bottom:16px;display:inline-block;transition:color .2s" style-hover="color:var(--text2)">← Catch-Up</div>
+    <h1 style="margin:0 0 36px;font-family:Calistoga,Georgia,serif;font-size:36px;font-weight:400;letter-spacing:-0.02em">Settings</h1>
+
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">Team</div>
+    <div style="border:1px solid var(--border);border-radius:16px;background:var(--card);margin-bottom:34px;overflow:hidden;box-shadow:var(--shadow-md)">
+      <div style="display:flex;align-items:center;gap:12px;padding:15px 18px;border-bottom:1px solid var(--border)">
+        <div style="flex:1"><div style="font-weight:600;font-size:14px">membridge-core</div><div style="font-size:12px;color:var(--text3)">2 members · created March 2026</div></div>
+        <button style="height:34px;padding:0 13px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text2);font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .2s" style-hover="border-color:var(--accent-brd);color:var(--text)">Rename</button>
+        <button style="height:34px;padding:0 13px;border-radius:10px;border:1px solid var(--border);background:var(--card);color:var(--text2);font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;transition:all .2s" style-hover="border-color:var(--accent-brd);color:var(--text)">Switch team</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:13px;padding:13px 18px;border-bottom:1px solid var(--border)">
+        <div style="width:28px;height:28px;border-radius:10px;background:var(--marco);color:#fff;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">M</div>
+        <div style="flex:1"><span style="font-size:13.5px;font-weight:600">Marco</span> <span style="font-size:12px;color:var(--text3)">you · marco@membridge.app</span></div>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent-brd);background:var(--accent-soft);border-radius:99px;padding:3px 10px">owner</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:13px;padding:13px 18px;border-bottom:1px solid var(--border)">
+        <div style="width:28px;height:28px;border-radius:10px;background:var(--andrew);color:#fff;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">A</div>
+        <div style="flex:1"><span style="font-size:13.5px;font-weight:600">Andrew</span> <span style="font-size:12px;color:var(--text3)">andrew@membridge.app</span></div>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);border:1px solid var(--border);border-radius:99px;padding:3px 10px">member</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;padding:13px 18px">
+        <span onClick="{{ toggleInvite }}" style="font-size:13px;color:var(--accent);cursor:pointer;font-weight:600">+ Invite with a link</span>
+        <div style="flex:1"></div>
+        <span style="font-size:12.5px;color:var(--text3);cursor:pointer;transition:color .2s" style-hover="color:#DC2626">Leave team</span>
+      </div>
+    </div>
+
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">Watched projects</div>
+    <div style="border:1px solid var(--border);border-radius:16px;background:var(--card);margin-bottom:34px;overflow:hidden;box-shadow:var(--shadow-md)">
+      <sc-for list="{{ settingsProjects }}" as="p" hint-placeholder-count="3">
+        <div style="display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--border)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13.5px;font-weight:600">{{ p.name }} <span style="font-family:'JetBrains Mono',monospace;font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--text3);font-weight:400">{{ p.badge }}</span></div>
+            <div style="font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--text3);margin-top:3px">{{ p.path }}</div>
+          </div>
+          <span onClick="{{ p.togglePause }}" style="font-size:12px;color:var(--text2);cursor:pointer;font-weight:500;transition:color .2s" style-hover="color:var(--text)">{{ p.pauseLabel }}</span>
+          <span onClick="{{ p.remove }}" style="font-size:12px;color:var(--text3);cursor:pointer;transition:color .2s" style-hover="color:#DC2626">{{ p.removeLabel }}</span>
+        </div>
+      </sc-for>
+      <div style="display:flex;align-items:center;gap:12px;padding:13px 18px">
+        <span style="font-size:13px;color:var(--accent);cursor:pointer;font-weight:600">+ Add a project…</span>
+        <div style="flex:1"></div>
+        <span style="font-size:12px;color:var(--text3)">Tools detected: Claude Code ✓ · Codex ✓ · Cursor —</span>
+      </div>
+    </div>
+
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">AI briefings &amp; roadmaps</div>
+    <div style="border:1px solid var(--border);border-radius:16px;background:var(--card);margin-bottom:34px;padding:16px 18px;box-shadow:var(--shadow-md)">
+      <div style="font-size:13px;color:var(--text2);margin-bottom:12px">Bring your own key. Used only to write your briefing and roadmaps — session memories never leave your team's sync.</div>
+      <div style="display:flex;gap:9px;align-items:center">
+        <input value="{{ apiKey }}" onChange="{{ onApiKey }}" placeholder="sk-ant-…" spellCheck="{{ false }}" style="flex:1;height:44px;padding:0 13px;border-radius:12px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;outline:none" style-focus="border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)" />
+        <span style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:{{ keyStatusColor }};font-weight:500;flex:none">{{ keyStatus }}</span>
+      </div>
+      <div style="font-size:11.5px;color:var(--text3);margin-top:9px">Clear the key to see the dashboard degrade gracefully — headlines and project state stay.</div>
+    </div>
+
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">Account</div>
+    <div style="border:1px solid var(--border);border-radius:16px;background:var(--card);padding:14px 18px;display:flex;align-items:center;gap:13px;box-shadow:var(--shadow-md)">
+      <div style="width:28px;height:28px;border-radius:10px;background:var(--marco);color:#fff;font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">M</div>
+      <div style="flex:1"><div style="font-size:13.5px;font-weight:600">marco@membridge.app</div><div style="font-size:12px;color:var(--text3)">Signed in via GitHub</div></div>
+      <span onClick="{{ logOut }}" style="font-size:12.5px;color:var(--text2);cursor:pointer;font-weight:500;transition:color .2s" style-hover="color:var(--text)">Log out</span>
+    </div>
+  </main>
+  </sc-if>
+
+  <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:var(--grad);color:#fff;padding:10px 20px;border-radius:99px;font-size:13px;font-weight:600;box-shadow:var(--shadow-accent-lg);animation:mbFade .25s cubic-bezier(.16,1,.3,1);z-index:60">{{ toast }}</div>
+  </sc-if>
+
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{
+  &quot;$preview&quot;: {&quot;width&quot;: &quot;100%&quot;, &quot;height&quot;: 900},
+  &quot;theme&quot;: {&quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;light&quot;, &quot;dark&quot;], &quot;default&quot;: &quot;light&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;Appearance&quot;},
+  &quot;scenario&quot;: {&quot;editor&quot;: &quot;enum&quot;, &quot;options&quot;: [&quot;normal&quot;, &quot;all-caught-up&quot;, &quot;no-team&quot;, &quot;brand-new&quot;, &quot;offline&quot;, &quot;no-api-key&quot;, &quot;signed-out&quot;], &quot;default&quot;: &quot;normal&quot;, &quot;tsType&quot;: &quot;string&quot;, &quot;section&quot;: &quot;State&quot;}
+}">
+class Component extends DCLogic {
+  state = {
+    screen: 'catchup',
+    theme: null,
+    scenarioOverride: null,
+    expandedId: 's1',
+    caughtUp: false,
+    inviteOpen: false,
+    inviteCopied: false,
+    menuOpen: false,
+    confirmDelete: false,
+    roadmapOpen: false,
+    roadmapState: 'idle',
+    projectId: 'p1',
+    paused: {},
+    removed: {},
+    syncing: false,
+    regenerating: false,
+    copiedAI: false,
+    apiKey: 'sk-ant-api03-mB7v…kQ2',
+    feedPerson: 'All', feedProject: 'All projects', feedTool: 'All tools',
+    toast: null,
+  };
+
+  componentDidMount() { this.applyTheme(); }
+  componentDidUpdate() { this.applyTheme(); }
+  applyTheme() {
+    const t = this.state.theme ?? this.props.theme ?? 'light';
+    document.body.dataset.theme = t;
+  }
+  showToast(msg) {
+    this.setState({ toast: msg });
+    clearTimeout(this._tt);
+    this._tt = setTimeout(() => this.setState({ toast: null }), 1800);
+  }
+
+  data() {
+    const S = [
+      { id:'s1', author:'Andrew', who:'andrew', tool:'Claude Code', project:'membridge', pid:'p1', day:'Today', time:'2h ago', wip:false,
+        summary:'Shipped the unified feed API — local and teammate sessions now merge into one cursor-paginated endpoint',
+        ask:'Merge the local session log and the teamsync feed into a single API the dashboard can page through. Keep ordering stable when the two machines\u2019 clocks disagree.',
+        files:['server/api/feed.ts','lib/teamsync.js','lib/feed-merge.js','lib/cursor.js','test/feed-merge.test.js'],
+        todos:[['Design merge cursor (lamport + wall clock)',1],['Merge iterator over both stores',1],['Cursor pagination + resume token',1],['Dedupe sessions synced from both sides',1],['Backfill test fixtures',1],['Wire dashboard to new endpoint',1]],
+        checkpoints:['Settled on a hybrid cursor: lamport counter first, wall clock as tiebreaker','Wrote the two-store merge iterator; found and fixed a dupe when a session syncs from both machines','Added resume tokens so the feed can page backwards','Ported the dashboard fetch layer; deleted the old /local and /team endpoints','Full test pass, including the clock-skew fixtures'] },
+      { id:'s2', author:'Andrew', who:'andrew', tool:'Codex', project:'membridge-daemon', pid:'p2', day:'Today', time:'4h ago', wip:true,
+        summary:'Supabase migration — schema and auth are wired, the sync writer still points at the old store',
+        ask:'Move team sync storage off the JSON blob store onto Supabase so two people can\u2019t clobber each other\u2019s writes.',
+        files:['daemon/store/supabase.ts','daemon/store/schema.sql','daemon/auth.ts'],
+        todos:[['Schema: teams, projects, sessions, checkpoints',1],['Row-level security per team',1],['Auth token exchange in daemon',1],['Point sync writer at Supabase',0],['Backfill existing team data',0]],
+        checkpoints:['Schema drafted; sessions are append-only, checkpoints reference them','RLS policies pass the two-team isolation test','Daemon exchanges the app token for a scoped service key'] },
+      { id:'s3', author:'Andrew', who:'andrew', tool:'Claude Code', project:'membridge', pid:'p1', day:'Yesterday', time:'Yesterday, 6:12 PM', wip:false,
+        summary:'Fixed the distiller dropping final todo state when a session ends mid-write',
+        ask:'Sessions killed mid-write lose their last todo update — the memory says 4/6 when it was really 6/6. Find it and fix it.',
+        files:['daemon/distill.js','daemon/session-tail.js'],
+        todos:[['Reproduce with a killed session',1],['Flush todo state on tail close',1]], checkpoints:null },
+      { id:'s4', author:'Andrew', who:'andrew', tool:'Codex', project:'membridge', pid:'p1', day:'Yesterday', time:'Yesterday, 11:05 AM', wip:false,
+        summary:'Sync pill now retries with backoff and surfaces daemon crashes instead of going quietly stale',
+        ask:'The menubar pill sometimes shows \u201csynced\u201d hours after the daemon died. Make failure visible.',
+        files:['app/menubar/pill.tsx','daemon/heartbeat.js','app/ipc.ts'],
+        todos:[['Heartbeat over IPC',1],['Backoff retry',1],['Crash state in pill',1],['Click-to-restart daemon',1]], checkpoints:null },
+      { id:'m1', author:'Marco', who:'marco', tool:'Claude Code', project:'membridge', pid:'p1', day:'Yesterday', time:'Yesterday, 3:12 PM', wip:false, mine:true,
+        summary:'Rebuilt the catch-up ranking — sessions sort by impact score instead of pure recency',
+        ask:'A one-line typo fix shouldn\u2019t outrank the feed API rewrite just because it\u2019s newer. Rank by what matters.',
+        files:['lib/rank.js','lib/impact.js','test/rank.test.js'],
+        todos:[['Impact score: files \u00d7 todos \u00d7 checkpoint depth',1],['Recency decay curve',1],['Pin in-progress work to top',1]], checkpoints:null },
+      { id:'m2', author:'Marco', who:'marco', tool:'Claude Code', project:'membridge-site', pid:'p3', day:'Monday', time:'Mon, 4:40 PM', wip:false, mine:true,
+        summary:'Drafted the landing page narrative and wired the waitlist form',
+        ask:'Write the landing story around the catch-up moment, not the feature list.',
+        files:['site/index.astro','site/waitlist.ts'],
+        todos:[['Hero copy',1],['Waitlist endpoint',1],['OG image placeholder',1]], checkpoints:null },
+    ];
+    const P = [
+      { id:'p1', name:'membridge', glyph:'mb', path:'~/code/membridge', shared:true,
+        lastTouched:'2h ago · Andrew', delta:'3 sessions · 14 files · 2 open todos since you last looked',
+        activeNow:false, activeLabel:'', statSessions:'11', statFiles:'38', statTodos:'2',
+        todos:[{t:'Rotate the Anthropic API keys', who:'waiting on you', you:true},{t:'QA feed pagination on 1k-session projects', who:'unclaimed', you:false}] },
+      { id:'p2', name:'membridge-daemon', glyph:'dm', path:'~/code/membridge-daemon', shared:true,
+        lastTouched:'4h ago · Andrew', delta:'1 session · 6 files · 2 open todos since you last looked',
+        activeNow:true, activeLabel:'Andrew is in a session here now', statSessions:'6', statFiles:'19', statTodos:'2',
+        todos:[{t:'Point sync writer at Supabase', who:'Andrew · in progress', you:false},{t:'Backfill migration for existing teams', who:'unclaimed', you:false}] },
+      { id:'p3', name:'membridge-site', glyph:'st', path:'~/code/membridge-site', shared:false,
+        lastTouched:'Mon · you', delta:'No changes since you last looked',
+        activeNow:false, activeLabel:'', statSessions:'2', statFiles:'5', statTodos:'0', todos:[] },
+    ];
+    return { S, P };
+  }
+
+  vm(s) {
+    const expanded = this.state.expandedId === s.id;
+    const done = s.todos.filter(t => t[1]).length;
+    return {
+      id: s.id, author: s.author, tool: s.tool, project: s.project, time: s.time,
+      wip: s.wip, summary: s.summary, ask: s.ask, files: s.files,
+      initial: s.author[0],
+      color: s.who === 'marco' ? 'var(--marco)' : 'var(--andrew)',
+      expanded, chev: expanded ? 'rotate(180deg)' : 'none',
+      toggle: () => this.setState({ expandedId: expanded ? null : s.id }),
+      hasCheckpoints: !!(s.checkpoints && s.checkpoints.length),
+      checkpoints: (s.checkpoints || []).map((t, i) => ({ n: String(i + 1).padStart(2, '0'), t })),
+      todoLabel: done + ' of ' + s.todos.length + ' todos done',
+      todoPct: Math.round(100 * done / s.todos.length) + '%',
+      todoBar: s.wip ? 'var(--amber)' : 'var(--grad)',
+      todoItems: s.todos.map(([t, d]) => ({
+        t, mark: d ? '✓' : '○',
+        color: d ? 'var(--text3)' : 'var(--text)',
+        deco: d ? 'line-through' : 'none',
+      })),
+    };
+  }
+
+  dayGroups(list) {
+    const order = [];
+    const map = {};
+    list.forEach(s => {
+      if (!map[s.day]) { map[s.day] = []; order.push(s.day); }
+      map[s.day].push(this.vm(s));
+    });
+    return order.map(label => ({ label, items: map[label] }));
+  }
+
+  renderVals() {
+    const { S, P } = this.data();
+    const st = this.state;
+    const scenario = st.scenarioOverride ?? this.props.scenario ?? 'normal';
+    const isAuth = scenario === 'signed-out';
+    const isOffline = scenario === 'offline';
+    const noTeam = scenario === 'no-team';
+    const fresh = scenario === 'brand-new';
+    const noKey = scenario === 'no-api-key' || !st.apiKey.trim();
+    const caughtUp = scenario === 'all-caught-up' || st.caughtUp;
+
+    const nav = (screen) => () => this.setState({ screen, inviteOpen:false, menuOpen:false, confirmDelete:false });
+
+    const newSessions = S.filter(s => !s.mine && ['s1','s2','s3','s4'].includes(s.id));
+    const headlineSrc = isOffline ? S.filter(s => s.mine && s.id === 'm1') : newSessions;
+    const headlines = headlineSrc.map(s => this.vm(s));
+
+    const chip = (val, current, setter) => {
+      const active = val === current;
+      return {
+        label: val,
+        click: () => this.setState({ [setter]: val }),
+        border: active ? 'transparent' : 'var(--border)',
+        bg: active ? 'var(--grad)' : 'transparent',
+        color: active ? '#fff' : 'var(--text2)',
+        weight: active ? '600' : '400',
+        shadow: active ? 'var(--shadow-accent)' : 'none',
+      };
+    };
+    const feedChips = [
+      ...['All','Marco','Andrew'].map(v => chip(v, st.feedPerson, 'feedPerson')),
+      ...['All projects','membridge','membridge-daemon','membridge-site'].map(v => chip(v, st.feedProject, 'feedProject')),
+      ...['All tools','Claude Code','Codex'].map(v => chip(v, st.feedTool, 'feedTool')),
+    ];
+    const feedList = S.filter(s =>
+      (st.feedPerson === 'All' || s.author === st.feedPerson) &&
+      (st.feedProject === 'All projects' || s.project === st.feedProject) &&
+      (st.feedTool === 'All tools' || s.tool === st.feedTool));
+
+    const projects = P.map(p => ({
+      ...p,
+      local: !p.shared,
+      hasTodos: p.todos.length > 0,
+      todos: p.todos.map(t => ({ t: t.t, who: t.who, whoColor: t.you ? 'var(--amber)' : 'var(--text3)' })),
+      open: () => this.setState({ screen:'project', projectId:p.id, menuOpen:false, roadmapOpen:false, roadmapState:'idle' }),
+    }));
+
+    const proj = P.find(p => p.id === st.projectId) || P[0];
+    const projGroups = this.dayGroups(S.filter(s => s.pid === proj.id));
+
+    const settingsProjects = P.filter(p => !st.removed[p.id]).map(p => ({
+      name: p.name,
+      path: p.path,
+      badge: p.shared ? 'shared' : 'local only',
+      pauseLabel: st.paused[p.id] ? 'Resume' : 'Pause',
+      togglePause: () => this.setState(s2 => ({ paused: { ...s2.paused, [p.id]: !s2.paused[p.id] } })),
+      removeLabel: st.confirmDelete === p.id ? 'Really delete?' : 'Delete',
+      remove: () => {
+        if (st.confirmDelete === p.id) { this.setState(s2 => ({ removed: { ...s2.removed, [p.id]: true }, confirmDelete:false })); this.showToast('Project removed for the whole team'); }
+        else this.setState({ confirmDelete: p.id });
+      },
+    }));
+
+    const theme = st.theme ?? this.props.theme ?? 'light';
+
+    const title = caughtUp ? 'All clear' : (noTeam || fresh ? 'Good morning, Marco' : 'While you were out');
+    const words = title.split(' ');
+    const catchupTitleAccent = words.pop();
+    const catchupTitlePre = words.join(' ');
+
+    return {
+      isAuth, isApp: !isAuth,
+      isCatchup: st.screen === 'catchup',
+      isFeed: st.screen === 'feed',
+      isProject: st.screen === 'project',
+      isSettings: st.screen === 'settings',
+      navCatchup: nav('catchup'), navFeed: nav('feed'), navSettings: nav('settings'),
+      signIn: () => this.setState({ scenarioOverride: 'normal', screen: 'catchup' }),
+      logOut: () => this.setState({ scenarioOverride: 'signed-out' }),
+      themeGlyph: theme === 'dark' ? '☀' : '☾',
+      toggleTheme: () => this.setState({ theme: theme === 'dark' ? 'light' : 'dark' }),
+
+      syncLabel: isOffline ? 'Offline' : (st.syncing ? 'Syncing' : 'Synced'),
+      syncDotStyle: {
+        width:7, height:7, borderRadius:'50%', flex:'none',
+        background: isOffline ? 'var(--amber)' : 'var(--green)',
+        animation: st.syncing ? 'mbPulse .8s ease infinite' : 'mbPulse 3s ease infinite',
+      },
+      syncNow: () => {
+        if (isOffline) { this.showToast('Still unreachable — retrying in the background'); return; }
+        this.setState({ syncing:true });
+        setTimeout(() => this.setState({ syncing:false }), 1200);
+      },
+
+      inviteOpen: st.inviteOpen,
+      toggleInvite: () => this.setState(s2 => ({ inviteOpen: !s2.inviteOpen, inviteCopied:false })),
+      inviteCopyLabel: st.inviteCopied ? 'Copied' : 'Copy',
+      copyInvite: () => { try { navigator.clipboard.writeText('https://membridge.app/j/9kf2-xq7'); } catch(e){} this.setState({ inviteCopied:true }); },
+
+      isOffline,
+      catchupTitlePre, catchupTitleAccent,
+      lastViewedLabel: 'yesterday, 3:40 PM',
+      showAnchorLine: !noTeam && !fresh && !caughtUp,
+      showMarkCaughtUp: !noTeam && !fresh && !caughtUp && !isOffline,
+      markCaughtUp: () => { this.setState({ caughtUp:true }); this.showToast('Caught up — Andrew will see it'); },
+      undoCaughtUp: () => this.setState({ caughtUp:false }),
+      canUndoCaughtUp: st.caughtUp,
+      caughtUpAt: st.caughtUp ? 'just now' : 'yesterday, 6:12 PM',
+      isCaughtUpState: caughtUp && !noTeam && !fresh,
+      isNoTeam: noTeam,
+      isFresh: fresh,
+      showCatchupBody: !caughtUp && !noTeam && !fresh,
+      showBriefing: !noKey && !isOffline && !caughtUp && !noTeam && !fresh,
+      showNoKeyHint: noKey && !isOffline && !caughtUp && !noTeam && !fresh,
+      briefingOpacity: st.regenerating ? 0.35 : 1,
+      regenLabel: st.regenerating ? 'Thinking…' : 'Regenerate',
+      regenStyle: { display:'inline-block', animation: st.regenerating ? 'mbSpin .8s linear infinite' : 'none' },
+      regenerate: () => { this.setState({ regenerating:true }); setTimeout(() => this.setState({ regenerating:false }), 1100); },
+      headlinesTitle: isOffline ? 'Your local sessions' : 'What happened · ' + headlines.length + ' sessions',
+      headlines,
+      projects,
+
+      feedChips,
+      feedGroups: this.dayGroups(feedList),
+
+      proj,
+      projGroups,
+      projPaused: !!st.paused[proj.id],
+      pauseLabel: st.paused[proj.id] ? 'Resume watching' : 'Pause watching',
+      togglePause: () => this.setState(s2 => ({ paused: { ...s2.paused, [proj.id]: !s2.paused[proj.id] }, menuOpen:false })),
+      menuOpen: st.menuOpen,
+      toggleMenu: () => this.setState(s2 => ({ menuOpen: !s2.menuOpen, confirmDelete:false })),
+      menuClose: () => this.setState({ menuOpen:false }),
+      confirmingDelete: st.confirmDelete === true,
+      notConfirmingDelete: st.confirmDelete !== true,
+      askDelete: () => this.setState({ confirmDelete:true }),
+      cancelDelete: () => this.setState({ confirmDelete:false }),
+      doDelete: () => { this.setState({ menuOpen:false, confirmDelete:false, screen:'catchup' }); this.showToast('Project and its team memory deleted'); },
+      copyAiLabel: st.copiedAI ? 'Copied ✓' : 'Copy for AI',
+      copyForAI: () => {
+        try { navigator.clipboard.writeText('# ' + proj.name + ' — MemBridge context\n\nRecent sessions, state and open todos…'); } catch(e){}
+        this.setState({ copiedAI:true }); this.showToast('Project context copied — paste into any AI tool');
+        setTimeout(() => this.setState({ copiedAI:false }), 1800);
+      },
+      roadmapOpen: st.roadmapOpen,
+      roadmapChev: st.roadmapOpen ? 'rotate(90deg)' : 'none',
+      toggleRoadmap: () => this.setState(s2 => ({ roadmapOpen: !s2.roadmapOpen })),
+      roadmapIdle: st.roadmapState === 'idle',
+      roadmapLoading: st.roadmapState === 'loading',
+      roadmapDone: st.roadmapState === 'done',
+      genRoadmap: () => { this.setState({ roadmapState:'loading' }); setTimeout(() => this.setState({ roadmapState:'done' }), 1400); },
+
+      settingsProjects,
+      apiKey: st.apiKey,
+      onApiKey: (e) => this.setState({ apiKey: e.target.value }),
+      keyStatus: st.apiKey.trim() ? 'active' : 'no key',
+      keyStatusColor: st.apiKey.trim() ? 'var(--green)' : 'var(--text3)',
+
+      toast: st.toast,
+    };
+  }
+}
+</script>
+</body>
+</html>
