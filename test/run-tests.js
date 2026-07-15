@@ -435,6 +435,25 @@ async function main() {
       assert.deepStrictEqual(st.catchup, { lastViewedTs: null, prevViewedTs: null, briefing: null },
         `catchup default missing: ${JSON.stringify(st.catchup)}`);
     });
+    // Derive the window from the feed's own timestamps so the test does not
+    // depend on which fixtures have been written by this point in the suite.
+    const feedAllLocal = await (await fetch(`${base}/api/feed?limit=50`)).json();
+    const localAll = feedAllLocal.entries.filter(e => e.origin === 'local');
+    const distinctTs = [...new Set(localAll.map(e => String(e.ts)))].sort();
+    const sinceTs = distinctTs[1]; // second-oldest: guarantees the oldest entry is excluded
+    const feedSince = await (await fetch(`${base}/api/feed?since=${encodeURIComponent(sinceTs)}&limit=50`)).json();
+    check('/api/feed since= keeps only local entries at or after the window', () => {
+      assert.ok(distinctTs.length >= 2, 'fixture needs >=2 distinct local timestamps to exercise the window');
+      const localRows = feedSince.entries.filter(e => e.origin === 'local');
+      assert.ok(localRows.length >= 1, 'expected at least one entry inside the window');
+      assert.ok(localRows.every(e => String(e.ts) >= sinceTs), 'a local entry older than since= leaked through');
+      assert.ok(localRows.length < localAll.length, 'since= did not exclude the older entries');
+    });
+    const feedSinceFuture = await (await fetch(`${base}/api/feed?since=2099-01-01T00:00:00.000Z&limit=50`)).json();
+    check('/api/feed since= in the future drops all local entries', () => {
+      assert.strictEqual(feedSinceFuture.entries.filter(e => e.origin === 'local').length, 0,
+        'future since window must exclude every local row');
+    });
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
       const p = projects.find(x => x.path.toLowerCase() === proj1.toLowerCase());
@@ -1209,6 +1228,19 @@ async function main() {
       const teamEntry = feedSummaryRes.entries.find(e => e.origin === 'team' && e.summary);
       assert.ok(teamEntry, 'at least one team entry carries a non-null summary');
       assert.ok(/receipt PDF/.test(teamEntry.summary), `summary text lost: ${teamEntry && teamEntry.summary}`);
+    });
+
+    // Phase 1: /api/feed?since threads through to the team_feed RPC p_since arg.
+    // The receipt-PDF row above (ts 2026-07-13T10:00Z) is the recent fixture.
+    const teamSinceHit = await (await fetch(
+      `${hubBase}/api/feed?since=2026-07-13T09:00:00.000Z&limit=50`)).json();
+    const teamSinceMiss = await (await fetch(
+      `${hubBase}/api/feed?since=2099-01-01T00:00:00.000Z&limit=50`)).json();
+    check('/api/feed since= forwards to team_feed p_since (both directions)', () => {
+      assert.ok(teamSinceHit.entries.some(e => e.origin === 'team' && /receipt PDF/.test(e.summary || '')),
+        'recent team row should pass the since window');
+      assert.strictEqual(teamSinceMiss.entries.filter(e => e.origin === 'team').length, 0,
+        'future since window must exclude every team row');
     });
 
     // Regression (Critical): the project page filters /api/feed by a local
