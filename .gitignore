@@ -20,3 +20,4 @@ AGENTS.md
 
 .worktrees/
 .superpowers/
+.claude/settings.local.json

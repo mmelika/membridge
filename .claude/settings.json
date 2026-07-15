@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node test/run-tests.js)",
+      "Bash(npm test)",
+      "mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_screenshot"
+    ]
+  }
+}

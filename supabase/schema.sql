@@ -148,9 +148,11 @@ begin
   if v_team.id is null then
     raise exception 'invalid invite code';
   end if;
+  -- No conflict target: naming team_id here is ambiguous with the OUT column
+  -- of the same name, and the composite PK is the table's only constraint.
   insert into public.team_members (team_id, user_id, display_name)
     values (v_team.id, auth.uid(), p_display_name)
-    on conflict (team_id, user_id) do nothing;
+    on conflict do nothing;
   return query select v_team.id, v_team.name;
 end;
 $$;

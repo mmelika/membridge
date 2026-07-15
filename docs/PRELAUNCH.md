@@ -62,7 +62,7 @@ Status legend: `todo` · `in progress` · `blocked` · `done`
   <on|off>`.
 - **⚠ Deploy gate — DO THIS BEFORE SHIPPING THE CLIENT:** the default upload
   sends `ask: null` into a `not null` column. Apply
-  `supabase/migrations/003_ask_nullable.sql` to the **live** Supabase first
+  `supabase/migrations/005_ask_nullable.sql` to the **live** Supabase first
   (Fable had put the change only in `schema.sql`, which does not touch a live
   DB). Migration → then client. Tests pass regardless because the mock accepts
   nulls, so this won't be caught by CI.

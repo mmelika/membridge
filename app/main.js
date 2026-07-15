@@ -1,7 +1,7 @@
 'use strict';
-// MemBridge tray app: a macOS menu-bar app (dock-hidden) that also runs in the
-// Windows/Linux system tray. Wraps the same sync engine + local dashboard as
-// the CLI daemon — the tray is just a face on it.
+// MemBridge desktop app: lives in the macOS menu bar AND the Dock (or the
+// Windows/Linux system tray). Wraps the same sync engine + local dashboard as
+// the CLI daemon — the app shell is just a face on it.
 const fs = require('fs');
 const path = require('path');
 const { app, Tray, Menu, BrowserWindow, nativeImage, dialog } = require('electron');
@@ -152,9 +152,6 @@ if (!gotLock) {
   app.quit();
 } else {
   app.whenReady().then(async () => {
-    // pure menu-bar app on macOS: no dock icon
-    if (process.platform === 'darwin' && app.dock) app.dock.hide();
-
     util.ensureConfig();
     takeOverDaemon();
     const config = util.getConfig();
@@ -204,7 +201,12 @@ if (!gotLock) {
 }
 
 // keep living in the tray when the dashboard window is closed
+// Keep running with no windows (the tray/daemon is the app); clicking the
+// Dock icon (re)opens the dashboard window.
 app.on('window-all-closed', () => {});
+app.on('activate', () => {
+  openDashboard();
+});
 
 app.on('before-quit', () => {
   try {

@@ -5,22 +5,23 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-// 16x16 suspension-bridge glyph
+// 16x16 MemBridge "M-bridge" mark (matches docs/brand/svg/membridge-mark-*.svg:
+// an M whose strokes stand as bridge towers over the crossbar deck).
 const GLYPH = [
   '................',
-  '................',
-  '..#..........#..',
   '..#..........#..',
   '..##........##..',
   '..#.#......#.#..',
   '..#..#....#..#..',
-  '..#...####...#..',
+  '..#...#..#...#..',
+  '..#....##....#..',
+  '..#....##....#..',
+  '..#..........#..',
+  '..#..........#..',
   '.##############.',
   '..#..........#..',
   '..#..........#..',
-  '..##........##..',
-  '................',
-  '................',
+  '..#..........#..',
   '................',
   '................',
 ];
@@ -90,8 +91,8 @@ fs.mkdirSync(outDir, { recursive: true });
 // macOS menu bar: black "Template" images auto-adapt to light/dark menu bars
 fs.writeFileSync(path.join(outDir, 'trayTemplate.png'), render(1, [0, 0, 0]));
 fs.writeFileSync(path.join(outDir, 'trayTemplate@2x.png'), render(2, [0, 0, 0]));
-// Windows/Linux tray: mid-blue reads on light and dark taskbars
-fs.writeFileSync(path.join(outDir, 'tray.png'), render(2, [110, 150, 210]));
-// App icon (dmg/about): 512px
-fs.writeFileSync(path.join(outDir, 'icon.png'), render(32, [24, 95, 165]));
+// Windows/Linux tray: brand blue (#3B82F6) reads on light and dark taskbars
+fs.writeFileSync(path.join(outDir, 'tray.png'), render(2, [59, 130, 246]));
+// app/assets/icon.png is NOT generated: it is the brand app icon, copied from
+// docs/brand/png/membridge-app-icon-512.png.
 console.log(`icons written to ${outDir}`);

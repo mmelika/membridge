@@ -19,7 +19,6 @@ delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not 
 const util = require('../lib/util');
 const { syncOnce } = require('../lib/scan');
 const digest = require('../lib/digest');
-const { buildGraph } = require('../lib/graph');
 const { startServer, teamPayload, teamProjectsPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
 const { createMockSupabase } = require('./mock-supabase');
@@ -29,6 +28,7 @@ const claudeAdapter = require('../lib/adapters/claude-code');
 const codexAdapter = require('../lib/adapters/codex');
 const hooks = require('../lib/hooks');
 const redactLib = require('../lib/redact');
+const feed = require('../lib/feed');
 
 const BIN = path.join(__dirname, '..', 'bin', 'membridge.js');
 const proj1 = path.join(ROOT, 'projects', 'shop-app');
@@ -242,7 +242,7 @@ async function main() {
     assert.ok(!fs.existsSync(path.join(proj1, '.membridge')), 'memory DB not removed');
   });
 
-  // --- 4. session ids, state migration, neural graph ---
+  // --- 4. session ids, state migration ---
   check('events carry per-chat session ids from the transcript filename', () => {
     const state = util.loadState();
     const key = Object.keys(state.projects).find(k => k.toLowerCase() === proj1.toLowerCase());
@@ -272,45 +272,6 @@ async function main() {
     const md = claudeMd();
     assert.strictEqual(count(md, digest.BEGIN), 1, 'duplicate block');
     assert.strictEqual(count(md, 'Build the login page with OAuth'), 1, 'duplicate prompt');
-  });
-
-  // A second Claude Code session in the same project: same idea (OAuth login),
-  // same file — the graph must connect it to sess1.
-  fs.writeFileSync(path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess3.jsonl'), jsonl([
-    { type: 'user', message: { role: 'user', content: 'Improve the OAuth login redirect error handling' }, cwd: proj1, timestamp: '2026-07-09T10:20:00.000Z' },
-    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(proj1, 'src', 'login.js') } }] }, cwd: proj1, timestamp: '2026-07-09T10:21:00.000Z' },
-  ]));
-  syncOnce();
-
-  const graph = buildGraph(util.loadState(), util.getConfig());
-  check('graph: project node exists with >=3 distinct chat nodes', () => {
-    const pNode = graph.nodes.find(n => n.type === 'project' && String(n.path).toLowerCase() === proj1.toLowerCase());
-    assert.ok(pNode, 'proj1 project node missing');
-    assert.ok(pNode.chats >= 3, `expected >=3 chats on project node, got ${pNode.chats}`);
-    const chats = graph.nodes.filter(n => n.type === 'chat' && String(n.project).toLowerCase() === proj1.toLowerCase());
-    assert.ok(chats.length >= 3, `expected >=3 chat nodes, got ${chats.length}`);
-    assert.strictEqual(new Set(chats.map(c => c.id)).size, chats.length, 'chat ids not distinct');
-  });
-  check('graph: every chat node has a member link to its project', () => {
-    const chats = graph.nodes.filter(n => n.type === 'chat');
-    assert.ok(chats.length, 'no chat nodes at all');
-    for (const c of chats) {
-      assert.ok(
-        graph.links.some(l => l.type === 'member' && l.source === c.id && l.target === 'p:' + c.project),
-        `no member link for ${c.id}`,
-      );
-    }
-  });
-  check('graph: sess1 and sess3 are related by shared file and oauth terms', () => {
-    const rel = graph.links.find(l => l.type === 'related' &&
-      ((l.source === 'c:sess1' && l.target === 'c:sess3') || (l.source === 'c:sess3' && l.target === 'c:sess1')));
-    assert.ok(rel, 'related link between sess1 and sess3 missing');
-    assert.ok(rel.sharedFiles.some(f => f.includes('login.js')), `sharedFiles lack login.js: ${JSON.stringify(rel.sharedFiles)}`);
-    assert.ok(rel.similarity > 0, `similarity not positive: ${rel.similarity}`);
-    assert.ok(rel.terms.some(t => /^(oauth|login|redirect)/.test(t)), `no oauth-family term: ${JSON.stringify(rel.terms)}`);
-  });
-  check('graph: redacted secret never appears in graph output', () => {
-    assert.ok(!JSON.stringify(graph).includes('sk-test1234567890abcdef'), 'secret leaked into graph');
   });
 
   // Strip everything again so the daemon section starts from the same clean
@@ -411,13 +372,16 @@ async function main() {
       assert.ok(embeddedScript, 'embedded dashboard script missing');
       assert.strictEqual(scriptCheck.status, 0, scriptCheck.stderr || scriptCheck.stdout);
     });
-    check('dashboard page has Overview and Neural map tabs', () => {
-      assert.ok(pageHtml.includes('Overview'), 'Overview tab missing');
-      assert.ok(pageHtml.includes('Neural map'), 'Neural map tab missing');
+    check('dashboard page has the simplified three-route shell', () => {
+      assert.ok(pageHtml.includes('id="view-home"'), 'home feed view missing');
+      assert.ok(pageHtml.includes('id="goHome"'), 'home logo button missing');
+      assert.ok(pageHtml.includes('id="openInvite"'), 'invite button missing');
+      assert.ok(pageHtml.includes("return 'home'"), 'home default route missing');
+      assert.ok(!pageHtml.includes('id="tab-overview"'), 'obsolete overview tab still present');
+      assert.ok(!pageHtml.includes('id="tab-neural"'), 'obsolete neural map tab still present');
     });
-    check('dashboard page has the full Team workspace', () => {
+    check('dashboard page has the account gate and Settings team management', () => {
       assert.ok(pageHtml.includes('view-auth'), 'account gate missing');
-      assert.ok(pageHtml.includes('view-team'), 'team view missing');
       assert.ok(pageHtml.includes("path = '/api/team/' + kind"), 'account auth flow missing');
       assert.ok(pageHtml.includes('/api/team/create'), 'team creation UI missing');
       assert.ok(pageHtml.includes('/api/team/link'), 'project linking UI missing');
@@ -427,11 +391,20 @@ async function main() {
       assert.ok(pageHtml.includes('expiresDays'), 'invite expiry field missing');
       assert.ok(pageHtml.includes('maxUses'), 'invite max-uses field missing');
       assert.ok(pageHtml.includes("return 'auth'"), 'protected-route gate missing');
-      assert.ok(pageHtml.includes('hub-grid'), 'team hub layout missing');
-      assert.ok(pageHtml.includes('#team-member='), 'member drill-down route missing');
-      assert.ok(pageHtml.includes('#team-project='), 'team project route missing');
-      assert.ok(pageHtml.includes('/api/team/feed'), 'activity feed wiring missing');
+      // Team management now lives in Settings (the standalone hub, member pages
+      // and #team-project route were removed with the simplified dashboard).
+      assert.ok(pageHtml.includes('teamSettingsRoot'), 'Settings team container missing');
+      assert.ok(pageHtml.includes('data-team-change="switch"'), 'team switcher missing');
       assert.ok(pageHtml.includes('/api/team/members'), 'members wiring missing');
+      assert.ok(!pageHtml.includes('view-team'), 'dead team hub container still present');
+      assert.ok(!pageHtml.includes('#team-member='), 'dead member drill-down route still present');
+      assert.ok(!pageHtml.includes('#team-project='), 'dead team-project route still present');
+    });
+    check('dashboard page has a persisted three-way theme', () => {
+      assert.ok(pageHtml.includes('color-scheme: light dark'), 'color-scheme missing');
+      assert.ok(pageHtml.includes('light-dark('), 'light-dark() colors missing');
+      assert.ok(pageHtml.includes("localStorage.getItem('mb-theme')"), 'theme boot script missing');
+      assert.ok(pageHtml.includes('name="stTheme"'), 'appearance control missing');
     });
     check('dashboard page has the Copy for AI button', () => {
       assert.ok(pageHtml.includes('Copy for AI'), 'Copy for AI button missing');
@@ -448,14 +421,18 @@ async function main() {
       assert.ok(pageHtml.includes('stTeamUrl'), 'self-hosted backend URL field missing');
       assert.ok(pageHtml.includes('stTeamAnonKey'), 'self-hosted backend anon key field missing');
     });
-    const graphRes = await fetch(`${base}/api/graph`);
-    const graphText = await graphRes.text();
-    check('dashboard /api/graph serves nodes and links, secrets redacted', () => {
-      assert.strictEqual(graphRes.status, 200);
-      const g = JSON.parse(graphText);
-      assert.ok(Array.isArray(g.nodes) && g.nodes.some(n => n.type === 'chat'), 'chat nodes missing');
-      assert.ok(Array.isArray(g.links) && g.links.some(l => l.type === 'member'), 'member links missing');
-      assert.ok(!graphText.includes('sk-test1234567890abcdef'), 'secret leaked over HTTP');
+    const feedRes = await (await fetch(`${base}/api/feed?limit=50`)).json();
+    check('/api/feed returns a merged entries array with a degradation flag', () => {
+      assert.ok(Array.isArray(feedRes.entries), 'entries is an array');
+      assert.ok('teamUnavailable' in feedRes, 'response carries the teamUnavailable flag');
+      assert.ok(feedRes.entries.every(e => 'summary' in e && 'origin' in e),
+        'every entry is normalized (has origin + summary)');
+    });
+    const beforeTs = '2099-01-01T00:00:00Z';
+    const feedBefore = await (await fetch(`${base}/api/feed?before=${encodeURIComponent(beforeTs)}&limit=50`)).json();
+    check('/api/feed before= filters local entries inclusively by ts', () => {
+      assert.ok(feedBefore.entries.filter(e => e.origin === 'local').every(e => String(e.ts) <= beforeTs),
+        'all local entries respect the before boundary');
     });
     const projects = await (await fetch(`${base}/api/projects`)).json();
     check('dashboard /api/projects lists the project with prompts', () => {
@@ -983,6 +960,7 @@ async function main() {
       id: mock.entries.length + 1, created_at: new Date().toISOString(),
     });
 
+
     // Andrew: second machine (own MemBridge home), same repo basename, joins
     // by invite code — link_project maps his clone to the same project row.
     const projB = path.join(ROOT, 'projects-b', 'shop-app');
@@ -1054,6 +1032,30 @@ async function main() {
       assert.ok(!md.includes('sk-tamper111122223333') && !md.includes('sk-tamper444455556666'),
         'raw secret reached the rendered block');
       assert.ok(count(md, '[redacted') >= 3, 'redaction markers missing');
+    });
+
+    // Merge cleanup: drop the planted tamper row so it can't pollute the
+    // shared mock read by later feed tests.
+    for (let ti = mock.entries.length - 1; ti >= 0; ti--) {
+      if (String(mock.entries[ti].ask).includes('sk-tamper111122223333')) mock.entries.splice(ti, 1);
+    }
+
+    // A hosted backend whose schema predates the summary column must not kill
+    // the push — the client drops the field and retries.
+    fs.appendFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Tighten the refund policy checks' }, cwd: proj1, timestamp: tsAgo(20) }) + '\n',
+    );
+    syncOnce();
+    mock.flags.rejectSummary = true;
+    const rLegacy = await teamsync.syncTeams();
+    mock.flags.rejectSummary = false;
+    check('team: push falls back to summary-less rows on a pre-summary backend', () => {
+      assert.strictEqual((rLegacy.errors || []).length, 0, `push errored: ${JSON.stringify(rLegacy.errors)}`);
+      assert.ok(rLegacy.synced.some(k => sameKey(k, proj1)), `synced said: ${JSON.stringify(rLegacy)}`);
+      const row = mock.entries.find(e => (e.ask || '').includes('Tighten the refund policy checks'));
+      assert.ok(row, 'new entry never reached the server');
+      assert.ok(!('summary' in row), 'summary field still sent to a backend without the column');
     });
 
     // Injection trimming knobs, against renderBlock directly: the cap, the age
@@ -1298,6 +1300,119 @@ async function main() {
       assert.ok(projectsRes.projects.some(p => p.name === 'shop-app'), 'projects route empty');
       assert.strictEqual(badRes.status, 400, 'missing teamId must 400');
     });
+
+    // Migration 004: team_feed must return teammates' `summary`. Seed a team
+    // entry that carries one, then prove it survives the whole read path:
+    // team_feed RPC -> feed.normalizeTeam -> /api/feed merged read-model.
+    const seedTemplate = feedAll[0]; // a confirmed team_feed row for team.team_id
+    mock.entries.push({
+      ...seedTemplate,
+      id: mock.entries.length + 1,
+      ts: '2026-07-13T10:00:00.000Z',
+      source: 'Claude Code',
+      ask: 'Wire the receipt PDF and refund guardrails',
+      summary: 'Checkout now emails a receipt PDF; refunds are the next milestone.',
+      created_at: new Date(Date.now() + 5000).toISOString(),
+    });
+    const feedSummaryRes = await (await fetch(`${hubBase}/api/feed?limit=50`)).json();
+    // NOTE: exercises the read path (team_feed RPC -> normalizeTeam -> /api/feed). The mock cannot model Postgres's create-or-replace return-type constraint, so migration 004 itself must be validated against real Postgres before deploy.
+    check('/api/feed surfaces teammate summaries end-to-end (read path)', () => {
+      const teamEntry = feedSummaryRes.entries.find(e => e.origin === 'team' && e.summary);
+      assert.ok(teamEntry, 'at least one team entry carries a non-null summary');
+      assert.ok(/receipt PDF/.test(teamEntry.summary), `summary text lost: ${teamEntry && teamEntry.summary}`);
+    });
+
+    // Regression (Critical): the project page filters /api/feed by a local
+    // filesystem path (`?project=/abs/path`), but team_feed's p_project is a
+    // uuid. feedPayload must resolve a LINKED local path -> its team-project
+    // uuid before querying, or every teammate row for the project silently
+    // vanishes. proj1 is linked to linkA.projectId (shop-app); the mock's
+    // team_feed filters rows by p_project, so a path that isn't resolved
+    // matches nothing.
+    const feedByPath = await (await fetch(
+      `${hubBase}/api/feed?project=${encodeURIComponent(proj1)}&limit=50`)).json();
+    check('/api/feed resolves a linked local path to the team uuid so teammate rows survive', () => {
+      assert.strictEqual(feedByPath.teamUnavailable, false, 'team query must not be flagged unavailable');
+      const teamRow = feedByPath.entries.find(e => e.origin === 'team');
+      assert.ok(teamRow, 'no team-origin row for the linked project — path was not resolved to its uuid');
+    });
+
+    // Regression: the feed is a READ path over server rows — a hostile or
+    // legacy backend row holding unredacted text must be re-redacted at the
+    // normalize boundary, mirroring the injection path's render-side tamper
+    // test above. Planted straight into the mock, never through push scrub.
+    mock.entries.push({
+      ...seedTemplate,
+      id: mock.entries.length + 1,
+      ts: '2026-07-13T10:05:00.000Z',
+      source: 'Codex',
+      ask: 'tampered feed ask, rotate api_key=sk-feedtamper1111 today',
+      summary: 'tampered feed summary stored api_key=sk-feedtamper2222 in plain text',
+      created_at: new Date(Date.now() + 6000).toISOString(),
+    });
+    // A prompt-gated row (ask null): redaction must not turn it into "null".
+    mock.entries.push({
+      ...seedTemplate,
+      id: mock.entries.length + 1,
+      ts: '2026-07-13T10:06:00.000Z',
+      source: 'Claude Code',
+      ask: null,
+      summary: 'gated row: summary only',
+      created_at: new Date(Date.now() + 7000).toISOString(),
+    });
+    const feedTamperRes = await (await fetch(`${hubBase}/api/feed?limit=50`)).json();
+    check('/api/feed re-redacts server-row ask and summary (read-side defense in depth)', () => {
+      const row = feedTamperRes.entries.find(e => e.origin === 'team' && e.ask.includes('tampered feed ask'));
+      assert.ok(row, 'planted feed-tamper row missing from /api/feed');
+      assert.ok(row.ask.includes('[redacted'), `tampered ask not redacted: ${row.ask}`);
+      assert.ok(row.summary.includes('[redacted'), `tampered summary not redacted: ${row.summary}`);
+      const body = JSON.stringify(feedTamperRes);
+      assert.ok(!body.includes('sk-feedtamper1111') && !body.includes('sk-feedtamper2222'),
+        'raw planted secret surfaced in the /api/feed response');
+      // Redaction must be surgical: the clean seeded summary passes untouched.
+      const clean = feedTamperRes.entries.find(e => e.origin === 'team' && /receipt PDF;/.test(e.summary || ''));
+      assert.ok(clean && /refunds are the next milestone/.test(clean.summary), 'clean summary was altered by redaction');
+    });
+    check('/api/feed keeps a null ask falsy for the "(prompt not shared)" rendering', () => {
+      const gated = feedTamperRes.entries.find(e => e.origin === 'team' && e.summary === 'gated row: summary only');
+      assert.ok(gated, 'gated null-ask row missing from /api/feed');
+      assert.strictEqual(gated.ask, '', `null ask must normalize to '', got: ${JSON.stringify(gated.ask)}`);
+    });
+    const teamFeedTamperRes = await (await fetch(`${hubBase}/api/team/feed?teamId=${team.team_id}&limit=50`)).json();
+    check('/api/team/feed re-redacts server-row ask and summary too', () => {
+      const body = JSON.stringify(teamFeedTamperRes);
+      assert.ok(!body.includes('sk-feedtamper1111') && !body.includes('sk-feedtamper2222'),
+        'raw secret surfaced in the /api/team/feed response');
+      const row = teamFeedTamperRes.entries.find(e => e.ask && e.ask.includes('tampered feed ask'));
+      assert.ok(row && row.ask.includes('[redacted') && row.summary.includes('[redacted'),
+        'tampered row not redacted on /api/team/feed');
+      const gated = teamFeedTamperRes.entries.find(e => e.summary === 'gated row: summary only');
+      assert.ok(gated && gated.ask === null, 'null ask must survive /api/team/feed unchanged');
+    });
+
+    // Same hole, third surface: /api/project embeds pulled teamEntries, which
+    // pullProject stores RAW in state — plant a tampered pulled row and prove
+    // projectDetail re-redacts it before it crosses the local HTTP boundary.
+    {
+      const st = util.loadState();
+      const k = Object.keys(st.projects).find(p => sameKey(p, proj1));
+      st.projects[k].teamEntries = (st.projects[k].teamEntries || []).concat({
+        author: 'Tamper', ts: tsAgo(5), source: 'Codex',
+        ask: 'pulled tampered ask api_key=sk-feedtamper3333 here',
+        files: [], summary: 'pulled tampered summary api_key=sk-feedtamper4444 stored raw',
+      });
+      util.saveState(st);
+    }
+    const detailTamperRes = await (await fetch(`${hubBase}/api/project?path=${encodeURIComponent(proj1)}`)).json();
+    check('/api/project re-redacts pulled teamEntries ask and summary', () => {
+      const body = JSON.stringify(detailTamperRes);
+      assert.ok(!body.includes('sk-feedtamper3333') && !body.includes('sk-feedtamper4444'),
+        'raw secret surfaced in the /api/project response');
+      const row = (detailTamperRes.teamEntries || []).find(e => e.author === 'Tamper');
+      assert.ok(row, 'planted pulled row missing from /api/project teamEntries');
+      assert.ok(row.ask.includes('[redacted') && row.summary.includes('[redacted'),
+        `pulled row not redacted: ${row.ask} / ${row.summary}`);
+    });
     await new Promise(r => hubSrv.close(r));
 
     // Management runs on a fresh team so rotate/remove cannot disturb the
@@ -1373,14 +1488,14 @@ async function main() {
       const s = util.loadState().projects[danaApi].teamSuggestion;
       assert.ok(s && s.teamName === 'Acme' && s.repoUrl === 'github.com/acme/api-server', `suggestion was ${JSON.stringify(s)}`);
       assert.ok(!teamsync.loadTeamLink(danaApi), 'project was linked without consent');
-      assert.ok(!mock.entries.some(e => e.ask.includes('rate limiting')), 'entries pushed without consent');
+      assert.ok(!mock.entries.some(e => e.ask && e.ask.includes('rate limiting')), 'entries pushed without consent');
     });
     const danaLink = await teamsync.resolveSuggestion(util.getConfig(), danaApi, true);
     await teamsync.syncTeams();
     check('auto-link: accepting the suggestion links the clone to the same project row', () => {
       assert.strictEqual(danaLink.projectId, apiLink.projectId, 'clone got a different project row');
       assert.ok(!util.loadState().projects[danaApi].teamSuggestion, 'suggestion not cleared');
-      assert.ok(mock.entries.some(e => e.ask.includes('rate limiting')), 'entries not pushed after accept');
+      assert.ok(mock.entries.some(e => e.ask && e.ask.includes('rate limiting')), 'entries not pushed after accept');
     });
 
     // Erin opts into full auto-link: her clone links without a prompt.
@@ -1836,12 +1951,73 @@ async function main() {
     assert.strictEqual(setup1.status, 0, setup1.stderr);
     assert.strictEqual(afterSetup.hooks.Stop.length, 2, 'membridge entry not appended');
     assert.strictEqual(JSON.stringify(afterSetup.hooks.Stop[0]), JSON.stringify(seedSettings.hooks.Stop[0]), 'user Stop hook changed');
-    assert.ok(JSON.stringify(afterSetup.hooks.Stop[1]).includes('membridge hook stop'), 'membridge command missing');
+    assert.strictEqual(afterSetup.hooks.Stop[1].hooks[0].command, hooks.hookCommand(), 'membridge command missing or not the resolved absolute form');
     assert.deepStrictEqual(afterSetup.hooks.PreToolUse, seedSettings.hooks.PreToolUse, 'unrelated hooks changed');
     assert.strictEqual(afterSetup.model, 'opus');
     assert.deepStrictEqual(afterSetup.feedbackSurveyState, seedSettings.feedbackSurveyState, 'unknown keys lost');
     assert.ok(/already installed/.test(setup2.stdout), `second run said: ${setup2.stdout}`);
     assert.strictEqual(afterSetup2.hooks.Stop.length, 2, 'setup-hooks duplicated the entry');
+  });
+  check('distill: hook command is absolute and needs no PATH', () => {
+    const cmd = hooks.hookCommand();
+    assert.ok(cmd.includes(`"${process.execPath}"`), `command lacks the quoted runtime binary: ${cmd}`);
+    const script = cmd.match(/"([^"]*membridge-hook\.js)"/);
+    assert.ok(script, `command lacks a quoted membridge-hook.js path: ${cmd}`);
+    assert.ok(path.isAbsolute(script[1]), 'hook script path is not absolute');
+    assert.ok(fs.existsSync(script[1]), 'hook script does not exist on disk');
+  });
+  check('distill: membridge-hook.js entry behaves like `membridge hook stop`', () => {
+    const entry = path.join(__dirname, '..', 'lib', 'membridge-hook.js');
+    const out = spawnSync(process.execPath, [entry], {
+      input: JSON.stringify(stopPayload('sessNoSummaryYet')), encoding: 'utf8', env: { ...process.env },
+    });
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.strictEqual(out.stdout, '', 'no-edit session should not block'); // worthiness gate
+    const blocked = spawnSync(process.execPath, [entry], {
+      input: 'garbage', encoding: 'utf8', env: { ...process.env },
+    });
+    assert.strictEqual(blocked.status, 0, 'entry must fail open on garbage stdin');
+  });
+  check('distill: setup-hooks upgrades a stale PATH-based command in place', () => {
+    const staleFile = path.join(ROOT, 'claude-settings-stale.json');
+    fs.writeFileSync(staleFile, JSON.stringify({
+      hooks: { Stop: [
+        { hooks: [{ type: 'command', command: 'echo user-stop' }] },
+        { hooks: [{ type: 'command', command: 'membridge hook stop', timeout: 10 }] },
+      ] },
+    }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: staleFile };
+    const out = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.ok(/Updated the MemBridge Stop hook command/.test(out.stdout), `said: ${out.stdout}`);
+    const after = JSON.parse(read(staleFile));
+    assert.strictEqual(after.hooks.Stop.length, 2, 'entry count changed');
+    assert.strictEqual(after.hooks.Stop[0].hooks[0].command, 'echo user-stop', 'user hook touched');
+    assert.strictEqual(after.hooks.Stop[1].hooks[0].command, hooks.hookCommand(), 'stale command not upgraded');
+    assert.strictEqual(after.hooks.Stop[1].hooks[0].timeout, 10, 'sibling fields lost in upgrade');
+    const again = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    assert.ok(/already installed/.test(again.stdout), `upgrade not idempotent: ${again.stdout}`);
+  });
+  check('distill: isHookInstalled is false when the hook executable does not resolve', () => {
+    const deadFile = path.join(ROOT, 'claude-settings-dead.json');
+    fs.writeFileSync(deadFile, JSON.stringify({
+      hooks: { Stop: [{ hooks: [{ type: 'command', command: '/nonexistent/bin/membridge hook stop', timeout: 10 }] }] },
+    }, null, 2));
+    const prev = process.env.MEMBRIDGE_CLAUDE_SETTINGS;
+    process.env.MEMBRIDGE_CLAUDE_SETTINGS = deadFile;
+    try {
+      assert.strictEqual(hooks.isHookInstalled(), false, 'dead absolute path reported as installed');
+      fs.writeFileSync(deadFile, JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'membridge-no-such-cli hook stop', timeout: 10 }] }] },
+      }, null, 2));
+      assert.strictEqual(hooks.isHookInstalled(), false, 'unresolvable PATH command reported as installed');
+      fs.writeFileSync(deadFile, JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: hooks.hookCommand(), timeout: 10 }] }] },
+      }, null, 2));
+      assert.strictEqual(hooks.isHookInstalled(), true, 'resolvable absolute command reported as missing');
+    } finally {
+      process.env.MEMBRIDGE_CLAUDE_SETTINGS = prev;
+    }
   });
   check('distill: status reports the Distill line with hook install state', () => {
     const out = spawnSync(process.execPath, [BIN, 'status'], { env: envHook, encoding: 'utf8' });
@@ -2479,6 +2655,123 @@ async function main() {
     rc.distill.consent = savedConsent;
     util.saveUserConfig(rc);
   }
+
+  // --- 13. feed read-model (lib/feed.js) ---
+  check('feed.normalizeLocal maps a buildEntries entry to the normalized shape', () => {
+    const e = { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'fix the bug',
+      summary: 'Fixed the null deref', distilled: true, files: ['a.js', 'b.js'],
+      tasks: { done: 1, total: 2, items: [] } };
+    const n = feed.normalizeLocal(e, { projectPath: '/Users/x/proj', projectName: 'proj', projectId: 'uuid-1' });
+    assert.strictEqual(n.origin, 'local');
+    assert.strictEqual(n.self, true);
+    assert.strictEqual(n.author, 'You');
+    assert.strictEqual(n.summary, 'Fixed the null deref');
+    assert.strictEqual(n.ask, 'fix the bug');
+    assert.strictEqual(n.distilled, true);
+    assert.strictEqual(n.project, 'proj');
+    assert.strictEqual(n.projectPath, '/Users/x/proj');
+    assert.strictEqual(n.projectId, 'uuid-1');
+    assert.deepStrictEqual(n.files, ['a.js', 'b.js']);
+    assert.strictEqual(n.cursor, null);
+  });
+  check('feed.normalizeLocal picks up meta.authorId when provided', () => {
+    const e = { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'x', files: [] };
+    const withId = feed.normalizeLocal(e, { projectPath: '/p', projectName: 'p', projectId: null, authorId: 'me' });
+    assert.strictEqual(withId.authorId, 'me');
+    // Backward compatible: meta without authorId stays null (self identity unchanged).
+    const noId = feed.normalizeLocal(e, { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(noId.authorId, null);
+  });
+  check('feed.normalizeLocal treats a missing summary as in-progress (summary=null)', () => {
+    const n = feed.normalizeLocal({ ts: '2026-07-14T06:00:00Z', source: 'Codex', ask: 'do a thing', files: [] },
+      { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(n.summary, null);
+    assert.strictEqual(n.distilled, false);
+    assert.strictEqual(n.projectId, null);
+  });
+  check('feed.normalizeTeam maps a team_feed row and detects self by author id', () => {
+    const row = { id: 42, project_id: 'uuid-9', project_name: 'shared', author_id: 'me',
+      author_name: 'Marco', ts: '2026-07-14T05:00:00Z', source: 'Claude Code',
+      ask: 'ship it', summary: 'Shipped', files: ['x.js'], created_at: '2026-07-14T05:00:01Z' };
+    const mine = feed.normalizeTeam(row, { selfUserId: 'me' });
+    assert.strictEqual(mine.origin, 'team');
+    assert.strictEqual(mine.self, true);
+    assert.strictEqual(mine.author, 'You');
+    assert.strictEqual(mine.summary, 'Shipped');
+    assert.strictEqual(mine.projectId, 'uuid-9');
+    assert.strictEqual(mine.projectPath, null);
+    assert.deepStrictEqual(mine.cursor, { createdAt: '2026-07-14T05:00:01Z', id: 42 });
+    const theirs = feed.normalizeTeam(row, { selfUserId: 'someone-else' });
+    assert.strictEqual(theirs.self, false);
+    assert.strictEqual(theirs.author, 'Marco');
+  });
+  check('feed.normalizeTeam tolerates a summary-less row (pre-migration backend)', () => {
+    const n = feed.normalizeTeam({ id: 1, project_id: 'p', project_name: 'p', author_id: 'a',
+      author_name: 'A', ts: '2026-07-14T05:00:00Z', source: 'Codex', ask: 'q', files: [],
+      created_at: '2026-07-14T05:00:00Z' }, { selfUserId: 'me' });
+    assert.strictEqual(n.summary, null);
+  });
+  check('feed.buildFeed merges newest-first and drops the team dup of local self work', () => {
+    const local = [feed.normalizeLocal(
+      { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'same ask', summary: 'local rich', files: [] },
+      { projectPath: '/p', projectName: 'p', projectId: 'uuid-1' })];
+    const team = [
+      feed.normalizeTeam({ id: 5, project_id: 'uuid-1', project_name: 'p', author_id: 'me', author_name: 'Marco',
+        ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'same ask', summary: 'team copy',
+        files: [], created_at: '2026-07-14T06:00:02Z' }, { selfUserId: 'me' }),
+      feed.normalizeTeam({ id: 6, project_id: 'uuid-2', project_name: 'other', author_id: 'you', author_name: 'Andrew',
+        ts: '2026-07-14T07:00:00Z', source: 'Codex', ask: 'their ask', summary: 'their work',
+        files: [], created_at: '2026-07-14T07:00:01Z' }, { selfUserId: 'me' }),
+    ];
+    const res = feed.buildFeed({ local, team, teamUnavailable: false, limit: 50 });
+    assert.strictEqual(res.entries.length, 2, 'the duplicated self team row is dropped');
+    assert.strictEqual(res.entries[0].ask, 'their ask', 'newest first');
+    assert.strictEqual(res.entries[1].summary, 'local rich', 'local copy kept over team dup');
+    assert.strictEqual(res.teamUnavailable, false);
+  });
+  check('feed.buildFeed honors limit and returns a nextBefore cursor', () => {
+    const team = [1, 2, 3].map(i => feed.normalizeTeam(
+      { id: i, project_id: 'p', project_name: 'p', author_id: 'x', author_name: 'X',
+        ts: '2026-07-14T0' + i + ':00:00Z', source: 'Codex', ask: 'a' + i, summary: 's' + i,
+        files: [], created_at: '2026-07-14T0' + i + ':00:00Z' }, { selfUserId: 'me' }));
+    const res = feed.buildFeed({ local: [], team, teamUnavailable: false, limit: 2 });
+    assert.strictEqual(res.entries.length, 2);
+    assert.strictEqual(res.entries[0].ask, 'a3');
+    assert.strictEqual(res.nextBefore, res.entries[1].ts, 'cursor is the ts of the last returned entry');
+  });
+  check('feed.buildFeed passes through the teamUnavailable degradation flag', () => {
+    const res = feed.buildFeed({ local: [], team: [], teamUnavailable: true, limit: 50 });
+    assert.strictEqual(res.teamUnavailable, true);
+    assert.deepStrictEqual(res.entries, []);
+    assert.strictEqual(res.nextBefore, null);
+  });
+  check('feed.buildFeed does not mutate its input arrays or their entries', () => {
+    const local = [feed.normalizeLocal(
+      { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'local ask', summary: 'l', files: ['a.js', 'b.js'] },
+      { projectPath: '/p', projectName: 'p', projectId: 'uuid-1' })];
+    const team = [feed.normalizeTeam(
+      { id: 9, project_id: 'uuid-2', project_name: 'other', author_id: 'you', author_name: 'Andrew',
+        ts: '2026-07-14T07:00:00Z', source: 'Codex', ask: 'team ask', summary: 't',
+        files: ['x.js', 'y.js'], created_at: '2026-07-14T07:00:01Z' }, { selfUserId: 'me' })];
+    const localCopy = local.slice();
+    const teamCopy = team.slice();
+    const localFilesCopy = local[0].files.slice();
+    const teamFilesCopy = team[0].files.slice();
+    feed.buildFeed({ local, team, teamUnavailable: false, limit: 50 });
+    assert.deepStrictEqual(local, localCopy, 'local array was mutated');
+    assert.deepStrictEqual(team, teamCopy, 'team array was mutated');
+    assert.deepStrictEqual(local[0].files, localFilesCopy, 'a local entry files array was reordered/emptied');
+    assert.deepStrictEqual(team[0].files, teamFilesCopy, 'a team entry files array was reordered/emptied');
+  });
+  check('feed.buildFeed returns nextBefore=null when merged length equals limit exactly', () => {
+    const team = [1, 2].map(i => feed.normalizeTeam(
+      { id: i, project_id: 'p', project_name: 'p', author_id: 'x', author_name: 'X',
+        ts: '2026-07-14T0' + i + ':00:00Z', source: 'Codex', ask: 'a' + i, summary: 's' + i,
+        files: [], created_at: '2026-07-14T0' + i + ':00:00Z' }, { selfUserId: 'me' }));
+    const res = feed.buildFeed({ local: [], team, teamUnavailable: false, limit: 2 });
+    assert.strictEqual(res.entries.length, 2);
+    assert.strictEqual(res.nextBefore, null, 'no cursor when exactly limit entries remain');
+  });
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);
