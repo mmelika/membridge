@@ -3120,6 +3120,23 @@ async function main() {
     assert.deepStrictEqual(digest.sessionSummaries(harvOnly, 's').map(e => e.text), ['only harvested']);
   });
 
+  check('hooks: stop targets the resolved project, not the launch cwd', () => {
+    const parent = path.dirname(proj1);
+    fs.mkdirSync(path.join(proj1, '.membridge'), { recursive: true });
+    const state = util.loadState();
+    state.projects[proj1] = state.projects[proj1] || { events: [] };
+    state.projects[proj1].events.push(
+      { ts: '2026-07-16T12:00:00.000Z', source: 'Claude Code', kind: 'edit', session: 'hook-sess', file: path.join(proj1, 'src', 'login.js') });
+    util.saveState(state);
+    const payload = JSON.stringify({ session_id: 'hook-sess', cwd: parent });
+    const res = spawnSync('node', [BIN, 'hook', 'stop'], { input: payload, env: process.env, encoding: 'utf8' });
+    if (res.stdout && res.stdout.trim()) {
+      const out = JSON.parse(res.stdout.trim());
+      assert.ok(out.reason.includes(path.join(proj1, '.membridge', 'summaries.jsonl')), 'hook targets resolved proj1');
+      assert.ok(!out.reason.includes(path.join(parent, '.membridge')), 'not the cwd');
+    }
+  });
+
   // Three distilled checkpoints in one session, driven end to end.
   const projSeq = path.join(ROOT, 'projects', 'seq-app');
   fs.mkdirSync(path.join(projSeq, 'src'), { recursive: true });
