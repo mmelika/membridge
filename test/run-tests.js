@@ -2745,15 +2745,22 @@ async function main() {
     }
     setGoalEntry(90, 'gsess1', 'Wire up goal tracking', 'the goal field plumbing');
     await teamsync.syncTeams({ project: projG });
-    check('teamsync: goal gated by sharePrompts; change model ships in files', () => {
+    check('teamsync: goal gated by sharePrompts; change model ships in its own column', () => {
       const row = mockG.entries.find(e => e.session === 'gsess1');
       assert.ok(row, 'entry not pushed');
       assert.strictEqual(row.goal, null, 'goal leaked with sharePrompts off');
+      // files stays a plain string[] (filenames), never objects.
       assert.ok(Array.isArray(row.files) && row.files.length, 'files missing');
-      assert.ok(row.files.every(f => f && typeof f === 'object' && 'file' in f),
-        `files should be the change model (objects), got: ${JSON.stringify(row.files)}`);
-      assert.ok(row.files.some(f => f.file === 'src/goal.js'), 'expected file missing from change model');
-      assert.ok(row.files.some(f => f.note && f.note.includes('goal field plumbing')), 'change note missing');
+      assert.ok(row.files.every(f => typeof f === 'string'),
+        `files must stay string[], got: ${JSON.stringify(row.files)}`);
+      assert.ok(row.files.includes('src/goal.js'), 'expected filename missing from files');
+      // the change model rides in a dedicated `changes` column, as objects.
+      assert.ok(Array.isArray(row.changes) && row.changes.length,
+        `changes column missing the model, got: ${JSON.stringify(row.changes)}`);
+      assert.ok(row.changes.every(c => c && typeof c === 'object' && 'file' in c),
+        `changes should be objects, got: ${JSON.stringify(row.changes)}`);
+      assert.ok(row.changes.some(c => c.file === 'src/goal.js'), 'expected file missing from change model');
+      assert.ok(row.changes.some(c => c.note && c.note.includes('goal field plumbing')), 'change note missing');
     });
 
     // Flip sharePrompts on: a fresh entry's goal must ship, scrubbed.
@@ -2766,6 +2773,20 @@ async function main() {
       const row2 = mockG.entries.find(e => e.session === 'gsess2');
       assert.ok(row2, 'second entry not pushed');
       assert.ok(row2.goal && row2.goal.includes('Add persistent goal field'), `goal was: ${row2.goal}`);
+    });
+
+    // A secret planted in a change note must be scrubbed at the push boundary,
+    // exactly like ask/summary — the note leaves the machine redacted.
+    setGoalEntry(20, 'gsess3', 'Rotate the deploy secret', 'rotate api_key=sk-change-note-SECRET77 in the vault');
+    await teamsync.syncTeams({ project: projG });
+    check('teamsync: a secret in a change note is redacted before push', () => {
+      const row3 = mockG.entries.find(e => e.session === 'gsess3');
+      assert.ok(row3, 'third entry not pushed');
+      assert.ok(Array.isArray(row3.changes) && row3.changes[0], 'change model missing');
+      assert.ok(row3.changes[0].note && row3.changes[0].note.includes('[redacted'),
+        `change note not redacted: ${row3.changes[0].note}`);
+      assert.ok(!JSON.stringify(mockG.entries).includes('sk-change-note-SECRET77'),
+        'secret from a change note reached the server');
     });
 
     // Pull: a second identity joins the team and pulls Goalie's rows back —
@@ -2781,15 +2802,19 @@ async function main() {
     const joinedG = await teamsync.joinTeam(util.getConfig(), teamG.invite_code);
     await teamsync.linkProject(util.getConfig(), projGB, joinedG.team_id, joinedG.team_name);
     await teamsync.syncTeams({ project: projGB });
-    check('teamsync: goal and change-model files are pulled back intact', () => {
+    check('teamsync: goal and the change model are pulled back intact', () => {
       const st = util.loadState();
       const key = Object.keys(st.projects).find(k => path.resolve(k) === path.resolve(projGB));
       assert.ok(key, 'pulled project missing from state');
       const pulled = (st.projects[key].teamEntries || []).find(e => e.session === 'gsess2');
       assert.ok(pulled, 'pulled entry missing');
       assert.ok(pulled.goal && pulled.goal.includes('Add persistent goal field'), `pulled goal was: ${pulled.goal}`);
-      assert.ok(Array.isArray(pulled.files) && pulled.files.some(f => f.file === 'src/goal.js'),
-        `pulled files should carry the change model, got: ${JSON.stringify(pulled.files)}`);
+      // files is string[]; the change model lands in its own `changes` field.
+      assert.ok(Array.isArray(pulled.files) && pulled.files.every(f => typeof f === 'string'),
+        `pulled files must stay string[], got: ${JSON.stringify(pulled.files)}`);
+      assert.ok(pulled.files.includes('src/goal.js'), 'pulled filename missing');
+      assert.ok(Array.isArray(pulled.changes) && pulled.changes.some(c => c.file === 'src/goal.js'),
+        `pulled changes should carry the model, got: ${JSON.stringify(pulled.changes)}`);
     });
   } finally {
     process.env.MEMBRIDGE_HOME = HOME_A;
@@ -3473,16 +3498,18 @@ async function main() {
     assert.ok(noted, 'a change carries the highlight note');
     assert.ok(!/SECRET123/.test(noted.note), 'secret is redacted from the note');
   });
-  check('feed: normalizeTeam carries goal + change-model from files, redacted', () => {
+  check('feed: normalizeTeam carries goal + change-model from changes, redacted', () => {
     const redact = t => t.replace(/SECRET123/g, '[redacted]');
     const row = {
       author_name: 'Andrew', ts: '2026-07-16T00:00:00.000Z', source: 'Claude Code',
       goal: 'Ship SECRET123 feature', summary: 'did it',
-      files: [{ file: 'lib/mcp.js', status: 'new', add: 10, del: 0, note: 'uses SECRET123', dep: false }],
+      files: ['lib/mcp.js'],
+      changes: [{ file: 'lib/mcp.js', status: 'new', add: 10, del: 0, note: 'uses SECRET123', dep: false }],
     };
     const out = require('../lib/feed').normalizeTeam(row, { redact });
     assert.ok(!/SECRET123/.test(out.goal), 'goal redacted');
-    assert.strictEqual(out.changes.length, 1, 'change-model derived from files');
+    assert.deepStrictEqual(out.files, ['lib/mcp.js'], 'files stays string[]');
+    assert.strictEqual(out.changes.length, 1, 'change-model read from the changes column');
     assert.strictEqual(out.changes[0].file, 'lib/mcp.js');
     assert.ok(!/SECRET123/.test(out.changes[0].note), 'note redacted');
   });
@@ -3491,6 +3518,17 @@ async function main() {
       { author_name: 'A', ts: '2026-07-16T00:00:00.000Z', source: 'x', files: ['lib/a.js', 'lib/b.js'] }, {});
     assert.deepStrictEqual(out.changes, []);
     assert.deepStrictEqual(out.files, ['lib/a.js', 'lib/b.js']);
+  });
+  check('renderBlock: pulled teammate changes render, no [object Object]', () => {
+    const proj = { events: [], teamEntries: [
+      { author: 'Andrew', ts: '2026-07-16T00:00:00.000Z', source: 'Claude Code',
+        goal: 'Ship MCP', summary: 'Built the server.',
+        files: ['lib/mcp.js'],
+        changes: [{ file: 'lib/mcp.js', status: 'new', add: 10, del: 0, note: null, dep: false }] },
+    ] };
+    const block = digest.renderBlock('/repo', proj, { team: {} }, 'CLAUDE.md');
+    assert.ok(/Changes:.*lib\/mcp\.js/.test(block), 'renders the change file');
+    assert.ok(!/\[object Object\]/.test(block), 'no stringified objects');
   });
   check('feed.buildFeed merges newest-first and drops the team dup of local self work', () => {
     const local = [feed.normalizeLocal(
