@@ -31,6 +31,7 @@ const redactLib = require('../lib/redact');
 const feed = require('../lib/feed');
 const mcpMod = require('../lib/mcp');
 const changesLib = require('../lib/changes');
+const projectResolve = require('../lib/project-resolve');
 const { Client: McpClient } = require('@modelcontextprotocol/sdk/client/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
@@ -3956,6 +3957,39 @@ async function main() {
       assert.ok(!out.stdout.includes('UNREACHABLE'), 'execution continued past process.exit');
     });
   }
+
+  check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-resolve-'));
+    const repo = path.join(base, 'repo');
+    fs.mkdirSync(path.join(repo, '.membridge'), { recursive: true });
+    fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+    const tracked = new Set([require('../lib/util').normPath(repo)]);
+    assert.strictEqual(
+      projectResolve.resolveRoot(path.join(repo, 'src', 'a.js'), tracked), repo);
+    assert.strictEqual(
+      projectResolve.resolveRoot(path.join(base, 'loose', 'b.js'), new Set()), null);
+    assert.strictEqual(
+      projectResolve.resolveRoot(path.join(repo, 'src', 'a.js'), new Set()), repo);
+  });
+
+  check('project-resolve: rehomeEvents splits edits by root, prompt follows dominant', () => {
+    const A = '/root/repoA', B = '/root/repoB';
+    const tracked = new Set([require('../lib/util').normPath(A), require('../lib/util').normPath(B)]);
+    const resolveRoot = f => (f.startsWith(A) ? A : f.startsWith(B) ? B : null);
+    const events = [
+      { kind: 'prompt', project: '/home', session: 's1', text: 'go' },
+      { kind: 'edit', project: '/home', session: 's1', file: A + '/x.js' },
+      { kind: 'edit', project: '/home', session: 's1', file: A + '/y.js' },
+      { kind: 'edit', project: '/home', session: 's1', file: B + '/z.js' },
+      { kind: 'summary', project: '/home', session: 's1', text: 'did' },
+      { kind: 'edit', project: '/home', session: 's2', file: '/elsewhere/u.js' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot });
+    const by = k => events.filter(e => e.kind === k);
+    assert.deepStrictEqual(by('edit').map(e => e.project), [A, A, B, '/home']);
+    assert.strictEqual(by('prompt')[0].project, A);
+    assert.strictEqual(by('summary')[0].project, A);
+  });
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);
