@@ -3342,6 +3342,22 @@ async function main() {
       created_at: '2026-07-14T05:00:00Z' }, { selfUserId: 'me' });
     assert.strictEqual(n.summary, null);
   });
+  check('feed: local entry carries goal + changes', () => {
+    const proj = { events: [
+      { ts: '2026-07-16T00:00:00.000Z', source: 'Claude Code', kind: 'prompt', session: 's1', text: 'mcp thing' },
+      { ts: '2026-07-16T00:01:00.000Z', source: 'Claude Code', kind: 'edit', session: 's1', file: path.join(proj1, 'src', 'login.js') },
+      { ts: '2026-07-16T00:02:00.000Z', source: 'Distilled', kind: 'summary', session: 's1',
+        text: 'Did the thing.', goal: 'Ship MCP', decisions: 'read-only', gotchas: '', highlights: [] },
+    ] };
+    const entries = memorydb.buildEntries(proj1, proj, {});
+    const withSummary = entries.find(e => e.summary);
+    assert.strictEqual(withSummary.goal, 'Ship MCP');
+    assert.strictEqual(withSummary.decisions, 'read-only');
+    assert.ok(Array.isArray(withSummary.changes), 'changes array attached');
+    const norm = require('../lib/feed').normalizeLocal(withSummary, { projectName: 'p' });
+    assert.strictEqual(norm.goal, 'Ship MCP');
+    assert.ok(Array.isArray(norm.changes));
+  });
   check('feed.buildFeed merges newest-first and drops the team dup of local self work', () => {
     const local = [feed.normalizeLocal(
       { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'same ask', summary: 'local rich', files: [] },
