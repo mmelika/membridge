@@ -4047,6 +4047,23 @@ async function main() {
     assert.strictEqual(events[0].project, repo, 'relative edit resolves under its project');
   });
 
+  check('project-resolve: untracked git repo under a tracked parent is a boundary, not captured', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-boundary-'));
+    const parent = path.join(base, 'workspace');
+    fs.mkdirSync(path.join(parent, '.membridge'), { recursive: true }); // tracked parent
+    const child = path.join(parent, 'newrepo');
+    fs.mkdirSync(path.join(child, '.git'), { recursive: true });        // untracked git repo
+    fs.mkdirSync(path.join(child, 'src'), { recursive: true });
+    const tracked = new Set([require('../lib/util').normPath(parent)]);
+    // the .git boundary stops the walk — child work does NOT get captured by the parent
+    assert.strictEqual(projectResolve.resolveRoot(path.join(child, 'src', 'a.js'), tracked), null);
+    // a file directly under the tracked parent (no nearer marker) still resolves to it
+    assert.strictEqual(projectResolve.resolveRoot(path.join(parent, 'top.js'), tracked), parent);
+    // if the child later becomes tracked, it wins over its own .git boundary
+    const trackedChild = new Set([require('../lib/util').normPath(parent), require('../lib/util').normPath(child)]);
+    assert.strictEqual(projectResolve.resolveRoot(path.join(child, 'src', 'a.js'), trackedChild), child);
+  });
+
   // --- summary ---
   const failed = results.filter(([, e]) => e);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
