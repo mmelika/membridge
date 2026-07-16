@@ -30,6 +30,7 @@ const hooks = require('../lib/hooks');
 const redactLib = require('../lib/redact');
 const feed = require('../lib/feed');
 const mcpMod = require('../lib/mcp');
+const changesLib = require('../lib/changes');
 const { Client: McpClient } = require('@modelcontextprotocol/sdk/client/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
@@ -214,6 +215,34 @@ async function main() {
     assert.strictEqual(digest.relativeLabel(iso(1), now), 'yesterday');
     assert.strictEqual(digest.relativeLabel(iso(3), now), '3 days ago');
     assert.strictEqual(digest.relativeLabel(null, now), 'no activity yet');
+  });
+  check('changes: git status + numstat → grouped model', () => {
+    const runGit = args => {
+      if (args[0] === 'status') return '?? lib/mcp.js\n M bin/membridge.js\n D old.js\n';
+      if (args[0] === 'diff') return '312\t0\tlib/mcp.js\n28\t4\tbin/membridge.js\n0\t9\told.js\n';
+      return '';
+    };
+    const out = changesLib.deriveChanges('/repo',
+      ['bin/membridge.js', 'lib/mcp.js', 'old.js', 'package.json'],
+      [{ file: 'lib/mcp.js', note: 'the MCP server' }],
+      { runGit });
+    // order: new, edited, deleted, then deps last
+    assert.deepStrictEqual(out.map(c => c.file), ['lib/mcp.js', 'bin/membridge.js', 'old.js', 'package.json']);
+    assert.strictEqual(out[0].status, 'new');
+    assert.strictEqual(out[0].add, 312);
+    assert.strictEqual(out[0].note, 'the MCP server');
+    assert.strictEqual(out[1].status, 'edited');
+    assert.strictEqual(out[2].status, 'deleted');
+    assert.strictEqual(out[3].dep, true);
+    assert.strictEqual(out[3].add, null); // deps: counts suppressed
+  });
+  check('changes: git failure degrades to filename-only', () => {
+    const runGit = () => { throw new Error('not a git repo'); };
+    const out = changesLib.deriveChanges('/repo', ['lib/a.js', 'package.json'], [], { runGit });
+    assert.strictEqual(out.length, 2);
+    assert.strictEqual(out[0].status, 'edited');
+    assert.strictEqual(out[0].add, null);
+    assert.strictEqual(out[1].dep, true);
   });
   check('projectDetail: a teammate touch drives team-aware lastTouched + activeLabel + stats', () => {
     const state = util.loadState();
