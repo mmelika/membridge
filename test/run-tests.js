@@ -3666,6 +3666,34 @@ async function main() {
     assert.ok(noted, 'a change carries the highlight note');
     assert.ok(!/SECRET123/.test(noted.note), 'secret is redacted from the note');
   });
+  // Task 9 perf fix: deriveChanges (which spawns git subprocesses) must only
+  // run for entries that survive the maxEntries slice — never for distilled
+  // entries discarded by it. Build more distilled entries than maxEntries
+  // allows, then confirm the surviving one still gets a correct change model
+  // and no returned entry leaks the temporary _highlights stash field.
+  check('buildEntries: change model is derived only for entries surviving the maxEntries slice', () => {
+    const mkEvents = (n, session, file, note) => ([
+      { ts: `2026-07-16T00:${String(n).padStart(2, '0')}:00.000Z`, source: 'Claude Code', kind: 'prompt', session, text: `ask ${n}` },
+      { ts: `2026-07-16T00:${String(n).padStart(2, '0')}:01.000Z`, source: 'Claude Code', kind: 'edit', session, file: path.join(proj1, 'src', file) },
+      { ts: `2026-07-16T00:${String(n).padStart(2, '0')}:02.000Z`, source: 'Distilled', kind: 'summary', session,
+        text: `did ${n}`, highlights: [{ file: `src/${file}`, note }] },
+    ]);
+    const events = [
+      ...mkEvents(1, 'sA', 'discarded1.js', 'discarded change one'),
+      ...mkEvents(2, 'sB', 'discarded2.js', 'discarded change two'),
+      ...mkEvents(3, 'sC', 'login.js', 'surviving change'),
+    ];
+    const proj = { events };
+    // Force slicing: maxEntries smaller than the 3 distilled entries above.
+    const entries = memorydb.buildEntries(proj1, proj, { maxEntries: 2 });
+    assert.strictEqual(entries.length, 2, `expected slice to cap at 2, got ${entries.length}`);
+    assert.ok(!entries.some(e => 'discarded1.js' === (e.files || [])[0]), 'the oldest, sliced-away entry survived the slice');
+    const survivor = entries.find(e => (e.files || []).includes('src/login.js'));
+    assert.ok(survivor, 'surviving distilled entry missing its change model');
+    assert.ok(survivor.changes.some(c => c.file === 'src/login.js'), 'surviving change model missing the edited file');
+    assert.ok(survivor.changes.some(c => c.note && c.note.includes('surviving change')), 'surviving change model missing the highlight note');
+    assert.ok(entries.every(e => !('_highlights' in e)), 'temporary _highlights field leaked into a returned entry');
+  });
   check('feed: normalizeTeam carries goal + change-model from changes, redacted', () => {
     const redact = t => t.replace(/SECRET123/g, '[redacted]');
     const row = {
