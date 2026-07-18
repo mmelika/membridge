@@ -5,7 +5,7 @@ _Single source of truth for what we're building toward. Supersedes the dated
 both AI sessions read the same thing. **This is human-owned — do not confuse it
 with the auto-generated `CLAUDE.md` block, which MemBridge rewrites.**_
 
-_Last updated: 2026-07-14 · Owners: Andrew, Marco_
+_Last updated: 2026-07-17 · Owners: Andrew, Marco_
 
 ## How to use this doc
 
@@ -60,12 +60,14 @@ Status legend: `todo` · `in progress` · `blocked` · `done`
   fixed: null-ask rendering in the injected block + both dashboards, and a
   settings/CLI bug that discarded the opt-in. CLI: `membridge team share-prompts
   <on|off>`.
-- **⚠ Deploy gate — DO THIS BEFORE SHIPPING THE CLIENT:** the default upload
-  sends `ask: null` into a `not null` column. Apply
-  `supabase/migrations/005_ask_nullable.sql` to the **live** Supabase first
-  (Fable had put the change only in `schema.sql`, which does not touch a live
-  DB). Migration → then client. Tests pass regardless because the mock accepts
-  nulls, so this won't be caught by CI.
+- **✅ Deploy gate — VERIFIED 2026-07-17:** `memory_entries.ask` is nullable
+  in the **live** DB (checked directly against production; Marco's Part A
+  summary columns — summary/goal/decisions/gotchas/changes — are live too),
+  so the default `ask: null` upload is safe to ship. The change is
+  version-controlled as `supabase/migrations/007_memory_ask_nullable.sql`
+  (this doc previously pointed at `005_ask_nullable.sql`; the migration lives
+  at 007). Note the live DB has no migration history, so "applied" can only be
+  confirmed by inspecting the schema — see #10.
 
 ### 3. Cryptographer review
 - **Status:** todo · **Owner:** TBD · **Branch:** —
@@ -78,6 +80,31 @@ Status legend: `todo` · `in progress` · `blocked` · `done`
 - **Definition of done:** documented scheme — trust-on-first-use + out-of-band
   verification (Signal-style safety numbers) or keys derived from a
   team-controlled secret. Keys never uploaded to us. Study Syncthing's model.
+
+### 9. Invite token weakness
+- **Status:** in progress (migration written, awaiting review + apply) ·
+  **Owner:** Andrew · **Branch:** local, uncommitted —
+  `supabase/migrations/010_security_hardening.sql`
+- **Why:** `gen_invite_token()` (002) draws `floor(random() * 58)` positions
+  over a **54**-char alphabet, so ~7% of draws append `''` — measured on live
+  data: ~50% of tokens are shorter than 10 chars, shortest observed 6. And
+  `random()` is a seeded PRNG, not a CSPRNG. Compounding it, `peek_invite` is
+  an anon-callable, previously unthrottled "is this token valid" oracle. An
+  invite token **is** team membership — a guessed token hands over the team's
+  whole memory feed. P0 by this doc's own bar: it's exactly the class of
+  finding a B2B security reviewer leads with (same story as #1), and it's
+  cheap to fix now — rotating tokens today breaks two people's links; after
+  launch it breaks customers'.
+- **Definition of done:** migration 010 reviewed and applied to the live DB.
+  It (a) rewrites the generator on pgcrypto's CSPRNG with bias-free rejection
+  sampling at a fixed 16 chars (54^16 ≈ 6e27), self-checked in-migration
+  (500 generations: length, alphabet, uniqueness); (b) **rotates every live
+  invite token — outstanding invite links die; re-send them after applying**;
+  (c) throttles `peek_invite`/`redeem_invite` at 10 attempts/min per caller
+  IP (SQL can't count failed `redeem` calls — raises roll their attempt rows
+  back; Auth rate limits in #11 are the backstop there); (d) revokes anon
+  EXECUTE across the RPC surface except `peek_invite` + `is_team_member`
+  (~20 linter warnings — verified non-exploitable, so defense-in-depth).
 
 ---
 
@@ -108,6 +135,29 @@ Status legend: `todo` · `in progress` · `blocked` · `done`
 - **Status:** done (pushed `fix/checkpoint-sequence`, 176/176) · **Owner:**
   Andrew · **Branch:** `fix/checkpoint-sequence`
 - **Definition of done:** PR reviewed and merged into `marco-ui`.
+
+### 10. Migration tracking
+- **Status:** todo · **Owner:** TBD · **Branch:** —
+- **Why:** the live DB has **no migration history** (`supabase_migrations` is
+  empty — checked 2026-07-17): every file in `supabase/migrations/` was
+  applied by hand, so nothing can verify that repo and prod agree, and the
+  E2E cutover (#1) would be flying blind against an unverifiable schema.
+- **Definition of done:** adopt tracked migrations (supabase CLI `db push`
+  with recorded history), or at minimum record the applied state and diff it
+  once against the live schema — so "what is actually on prod" is answerable
+  from the repo.
+
+### 11. Supabase dashboard hardening (manual steps, not code)
+- **Status:** todo · **Owner:** Andrew or Marco · **Branch:** — (dashboard
+  settings only; nothing to commit)
+- **Definition of done — two checkboxes in the Supabase dashboard:**
+  1. Enable leaked-password protection (Auth settings), so sign-ups can't use
+     known-breached passwords.
+  2. Review the Auth rate limits for sign-in/OTP (Supabase-managed). Also the
+     real backstop for invite brute-force via `redeem_invite`: the SQL
+     throttle can't count calls that raise and roll back (see 010's
+     comments), but every redeem needs an authenticated session, which these
+     limits gate.
 
 ---
 
