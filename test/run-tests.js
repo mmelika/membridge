@@ -3410,6 +3410,23 @@ async function main() {
     assert.ok(!Buffer.from(enc.ciphertext, 'base64').toString('latin1').includes('src/login.js'), 'file path leaked into ciphertext');
     assert.notStrictEqual(teamcrypto.encrypt(payload, teamKey).ciphertext, enc.ciphertext, 'nonce reused');
   });
+  // Private-key storage. The real keychain only exists on macOS, so off-darwin
+  // this asserts the fail-closed contract instead of skipping blind.
+  const keychain = require('../lib/keychain');
+  check('keychain: store/load/remove round trip on macOS; fails closed elsewhere', () => {
+    if (!keychain.available()) {
+      assert.strictEqual(keychain.load('anything'), null, 'unavailable load must be null');
+      assert.strictEqual(keychain.store('a', 'b'), false, 'unavailable store must be false');
+      return; // no `security` binary: fail-closed contract verified, nothing more to test
+    }
+    const acct = 'membridge.test.' + Date.now();
+    assert.ok(keychain.store(acct, 'SECRET-VALUE'), 'store failed');
+    assert.strictEqual(keychain.load(acct), 'SECRET-VALUE', 'load round trip');
+    assert.ok(keychain.store(acct, 'SECOND'), 're-store (update) failed');
+    assert.strictEqual(keychain.load(acct), 'SECOND', 'update round trip');
+    assert.ok(keychain.remove(acct), 'remove failed');
+    assert.strictEqual(keychain.load(acct), null, 'load after remove must be null');
+  });
   check('redact: every default pattern removes the secret and emits a named marker', () => {
     for (const [name, input, secret] of cases) {
       const out = redactLib.redactDefault(input);
