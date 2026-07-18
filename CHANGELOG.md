@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Session summaries are now cumulative and outcome-phrased.** Every
+  checkpoint rewrites the whole-session summary (newest line wins on every
+  surface) as *what changed in the project*, not AI activity — so a long
+  session's card no longer shows only its last increment. The summary turn
+  is discreet: one pre-approved `membridge-hook.js append` command (narrow
+  `permissions.allow` rule installed/removed by `setup-hooks`/`remove-hooks`),
+  no narration, no permission prompt.
+
 ## 0.7.0 — 2026-07-14
 
 - **Simplified dashboard — three surfaces, one feed.** The desktop dashboard
