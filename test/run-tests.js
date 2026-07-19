@@ -17,7 +17,7 @@ process.env.MEMBRIDGE_INTERVAL = '3600'; // daemon ticks once at boot, then stay
 delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not leak into settings tests
 
 const util = require('../lib/util');
-const { syncOnce } = require('../lib/scan');
+const { syncOnce, filterTrackedSessions } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail, planPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
@@ -58,6 +58,10 @@ const count = (hay, needle) => hay.split(needle).length - 1;
 
 function setupFixtures() {
   for (const p of [proj1, proj2, proj3]) fs.mkdirSync(p, { recursive: true });
+  // The ingestion gate only keeps sessions landing in an already-tracked root.
+  // proj1 is the tracked project; proj2/proj3 stay untracked on purpose (their
+  // exclusion/marker tests assert no .membridge is ever created for them).
+  fs.mkdirSync(path.join(proj1, '.membridge'), { recursive: true });
   fs.writeFileSync(path.join(proj1, 'CLAUDE.md'), '# Shop app\n\nOriginal notes that must survive.\n');
   fs.mkdirSync(path.join(proj1, 'src'), { recursive: true });
   fs.writeFileSync(path.join(proj1, 'src', 'login.js'), 'export const login = () => {};\n');
@@ -143,7 +147,16 @@ async function main() {
   const agentsMd = () => read(path.join(proj1, 'AGENTS.md'));
 
   check('fresh sync finds events from all three tools', () => {
-    assert.ok(r1.newEvents >= 6, `expected >=6 events, got ${r1.newEvents}`);
+    // proj1's five events survive the ingestion gate; proj2/proj3 sessions are
+    // dropped (untracked cwds) and asserted absent in the gate section below.
+    assert.ok(r1.newEvents >= 5, `expected >=5 events, got ${r1.newEvents}`);
+  });
+  check('untracked fixture cwds never become projects', () => {
+    const st = util.loadState();
+    for (const p of [proj2, proj3]) {
+      assert.ok(!Object.keys(st.projects || {}).some(k => util.normPath(k) === util.normPath(p)),
+        `${p} should not have been auto-created`);
+    }
   });
   check('CLAUDE.md gets the memory block and keeps original content', () => {
     const md = claudeMd();
@@ -383,7 +396,11 @@ async function main() {
   });
 
   // Simulate a pre-v2 state file: stripping `version` must trigger a full
-  // rescan of every transcript from byte 0 on the next sync.
+  // rescan of every transcript from byte 0 on the next sync. The remove step
+  // above untracked proj1 on disk, and a discarded state has no project keys,
+  // so re-track proj1 first (as the dashboard "add" would) — the ingestion
+  // gate only rebuilds projects that are still tracked.
+  fs.mkdirSync(path.join(proj1, '.membridge'), { recursive: true });
   const v1State = JSON.parse(read(util.statePath()));
   delete v1State.version;
   fs.writeFileSync(util.statePath(), JSON.stringify(v1State, null, 2));
@@ -434,7 +451,7 @@ async function main() {
 
   // --- 4b. extra targets: opt-in injection into Gemini/Cursor/Windsurf/Copilot ---
   const projX = path.join(ROOT, 'projects', 'multi-tool-app');
-  fs.mkdirSync(projX, { recursive: true });
+  fs.mkdirSync(path.join(projX, '.membridge'), { recursive: true }); // tracked, so the gate ingests it
   const xtDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-multi-tool-app');
   fs.mkdirSync(xtDir, { recursive: true });
   fs.writeFileSync(path.join(xtDir, 'sessX.jsonl'), jsonl([
@@ -1063,18 +1080,31 @@ async function main() {
       assert.ok(!afterDel.some(x => x.path.toLowerCase() === proj1.toLowerCase()), 'project still listed');
     });
 
-    // new activity in a deleted project must bring it back (offsets were
-    // already consumed, so only the appended event returns)
+    // The ingestion gate means a deleted project stays deleted: new activity
+    // in its (now untracked) cwd is dropped, never auto-revived. Re-adding the
+    // project through the dashboard, plus fresh activity, brings it back.
     fs.appendFileSync(
       path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
-      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship the checkout flow' }, cwd: proj1, timestamp: '2026-07-09T12:00:00.000Z' }) + '\n',
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Dropped while deleted' }, cwd: proj1, timestamp: '2026-07-09T12:00:00.000Z' }) + '\n',
+    );
+    await post(`${base}/api/sync`);
+    const afterDrop = await (await fetch(`${base}/api/projects`)).json();
+    check('deleted project does NOT reappear from new activity alone (ingestion gate)', () => {
+      assert.ok(!afterDrop.some(x => x.path.toLowerCase() === proj1.toLowerCase()), 'deleted project auto-revived from an untracked cwd');
+    });
+
+    await post(`${base}/api/projects/add`, { path: proj1 });
+    fs.appendFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship the checkout flow' }, cwd: proj1, timestamp: '2026-07-09T12:01:00.000Z' }) + '\n',
     );
     await post(`${base}/api/sync`);
     const afterRevive = await (await fetch(`${base}/api/projects`)).json();
-    check('deleted project reappears with new activity', () => {
+    check('re-added project picks up new activity again', () => {
       const p = afterRevive.find(x => x.path.toLowerCase() === proj1.toLowerCase());
       assert.ok(p, 'deleted project did not reappear');
       assert.ok(p.prompts.some(e => e.text.includes('Ship the checkout flow')), 'new prompt missing');
+      assert.ok(!p.prompts.some(e => e.text.includes('Dropped while deleted')), 'gate-dropped prompt resurfaced');
     });
 
     process.env.MEMBRIDGE_API_BASE = 'http://127.0.0.1:17944'; // in-process advisor -> the same mock
@@ -2244,7 +2274,7 @@ async function main() {
 
   // --- 9. rich signals: todos + agent summaries ---
   const projR = path.join(ROOT, 'projects', 'rich-app');
-  fs.mkdirSync(projR, { recursive: true });
+  fs.mkdirSync(path.join(projR, '.membridge'), { recursive: true }); // tracked, so the gate ingests it
   const rDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-rich-app');
   fs.mkdirSync(rDir, { recursive: true });
   const OLD_SUMMARY = 'Refactored the payment retry queue: exponential backoff with jitter is in, the dead-letter queue is wired, and idempotency is covered by tests. Rotated api_key=sk-test1234567890abcdef.';
@@ -4270,8 +4300,10 @@ async function main() {
     assert.deepStrictEqual(out.files, ['lib/a.js', 'lib/b.js']);
   });
   check('renderBlock: pulled teammate changes render, no [object Object]', () => {
+    // relative ts: teamInjectSlice drops entries older than teamMaxAgeHours
+    // (72h), so a hardcoded date turns into a time bomb.
     const proj = { events: [], teamEntries: [
-      { author: 'Andrew', ts: '2026-07-16T00:00:00.000Z', source: 'Claude Code',
+      { author: 'Andrew', ts: new Date(Date.now() - 3600000).toISOString(), source: 'Claude Code',
         goal: 'Ship MCP', summary: 'Built the server.',
         files: ['lib/mcp.js'],
         changes: [{ file: 'lib/mcp.js', status: 'new', add: 10, del: 0, note: null, dep: false }] },
@@ -4346,7 +4378,7 @@ async function main() {
   {
     const mcpTsAgo = sec => new Date(Date.now() - sec * 1000).toISOString();
     const projMcp = path.join(ROOT, 'projects', 'mcp-app');
-    fs.mkdirSync(projMcp, { recursive: true });
+    fs.mkdirSync(path.join(projMcp, '.membridge'), { recursive: true }); // tracked, so the gate ingests it
     const mcpTxDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-mcp-app');
     fs.mkdirSync(mcpTxDir, { recursive: true });
     fs.writeFileSync(path.join(mcpTxDir, 'sessM.jsonl'), jsonl([
@@ -5189,6 +5221,129 @@ async function main() {
     ];
     assert.strictEqual(projectResolve.sessionDominantRoot(events, 's1', new Set()), repo);
     assert.strictEqual(projectResolve.sessionDominantRoot(events, 's2', new Set()), null);
+  });
+
+  // --- 30. ingestion gate: only sessions landing in a tracked root are kept ---
+  // Pure cases mirror syncOnce's pipeline: rehomeEvents first, then
+  // filterTrackedSessions with the same tracked set. hasMembridge is injected
+  // so nothing touches the disk.
+  check('gate: session editing a file inside a tracked root keeps all its events', () => {
+    const A = '/gate/repoA';
+    const tracked = new Set([util.normPath(A)]);
+    const events = [
+      { kind: 'prompt', project: A, session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'go' },
+      { kind: 'edit', project: A, session: 's1', ts: '2026-07-10T10:01:00.000Z', file: A + '/src/x.js' },
+      { kind: 'summary', project: A, session: 's1', ts: '2026-07-10T10:02:00.000Z', text: 'did' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: f => (f.startsWith(A) ? A : null) });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.strictEqual(kept.length, 3, 'all events of a tracked-root session survive');
+    assert.ok(kept.every(e => util.normPath(e.project) === util.normPath(A)));
+  });
+
+  check('gate: prompt-only session in an untracked cwd is dropped entirely', () => {
+    const tracked = new Set([util.normPath('/gate/repoA')]);
+    const events = [
+      { kind: 'prompt', project: '/home/personal', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'life advice pls' },
+      { kind: 'summary', project: '/home/personal', session: 's1', ts: '2026-07-10T10:05:00.000Z', text: 'chatted' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: () => null });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.deepStrictEqual(kept, [], 'no event of an untracked personal session survives');
+  });
+
+  check('gate: session editing only files under an untracked cwd is dropped', () => {
+    const tracked = new Set([util.normPath('/gate/repoA')]);
+    const events = [
+      { kind: 'prompt', project: '/home/personal', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'tweak my notes' },
+      { kind: 'edit', project: '/home/personal', session: 's1', ts: '2026-07-10T10:01:00.000Z', file: '/home/personal/notes.txt' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: () => null });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.deepStrictEqual(kept, [], 'untracked edits must not spawn a project');
+  });
+
+  check('gate: multi-repo session keeps only its tracked-root portion', () => {
+    const A = '/gate/repoA';
+    const tracked = new Set([util.normPath(A)]);
+    const events = [
+      { kind: 'prompt', project: '/home', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'go' },
+      { kind: 'edit', project: '/home', session: 's1', ts: '2026-07-10T10:01:00.000Z', file: A + '/x.js' },
+      { kind: 'edit', project: '/home', session: 's1', ts: '2026-07-10T10:02:00.000Z', file: A + '/y.js' },
+      { kind: 'edit', project: '/home', session: 's1', ts: '2026-07-10T10:03:00.000Z', file: '/elsewhere/u.js' },
+      { kind: 'summary', project: '/home', session: 's1', ts: '2026-07-10T10:04:00.000Z', text: 'did' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: f => (f.startsWith(A) ? A : null) });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.strictEqual(kept.length, 4, 'tracked edits + prompt + summary survive, untracked edit dropped');
+    assert.ok(kept.every(e => util.normPath(e.project) === util.normPath(A)), 'kept events all file under the tracked root');
+    assert.ok(!kept.some(e => e.file === '/elsewhere/u.js'), 'the untracked edit is gone');
+  });
+
+  check('gate: a dir with .membridge counts as tracked even before it is a state key', () => {
+    const M = '/gate/marker-repo';
+    const events = [
+      { kind: 'prompt', project: M, session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'go' },
+    ];
+    const kept = filterTrackedSessions(events, new Set(), { hasMembridge: d => util.normPath(d) === util.normPath(M) });
+    assert.strictEqual(kept.length, 1, '.membridge marker keeps the session');
+  });
+
+  check('gate: defensive — bad events or a throwing resolver drop, never throw', () => {
+    const tracked = new Set([util.normPath('/gate/repoA')]);
+    assert.deepStrictEqual(filterTrackedSessions(null, tracked, {}), [], 'null events -> []');
+    assert.deepStrictEqual(filterTrackedSessions(undefined, tracked, {}), [], 'undefined events -> []');
+    const events = [
+      null,
+      { kind: 'prompt', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'no project field' },
+      { kind: 'prompt', project: '/boom', session: 's2', ts: '2026-07-10T10:01:00.000Z', text: 'resolver throws' },
+    ];
+    let kept;
+    assert.doesNotThrow(() => {
+      kept = filterTrackedSessions(events, tracked, { hasMembridge: () => { throw new Error('disk on fire'); } });
+    });
+    assert.deepStrictEqual(kept, [], 'unresolvable events are dropped, not thrown');
+  });
+
+  // e2e: a personal session in an untracked dir must neither create a project
+  // nor surface in the feed; a tracked project's session still ingests.
+  const untrackedDir = path.join(ROOT, 'untracked-dir');
+  fs.mkdirSync(untrackedDir, { recursive: true });
+  const gateSlug = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-untracked-dir');
+  fs.mkdirSync(gateSlug, { recursive: true });
+  fs.writeFileSync(path.join(gateSlug, 'gate-personal.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'GATE-PERSONAL what should I cook tonight' }, cwd: untrackedDir, timestamp: '2026-07-10T09:00:00.000Z' },
+  ]));
+  const gateRegSess = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'gate-regression.jsonl');
+  fs.writeFileSync(gateRegSess, jsonl([
+    { type: 'user', message: { role: 'user', content: 'GATE-REGRESSION polish the checkout page' }, cwd: proj1, timestamp: '2026-07-10T09:10:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(proj1, 'src', 'login.js') } }] }, cwd: proj1, timestamp: '2026-07-10T09:11:00.000Z' },
+  ]));
+  syncOnce();
+  const gateState = util.loadState();
+  const gateFeed = await feedPayload({ limit: 200 });
+
+  check('gate e2e: untracked-dir session creates no state.projects entry', () => {
+    const hit = Object.keys(gateState.projects || {}).find(k => util.normPath(k) === util.normPath(untrackedDir));
+    assert.ok(!hit, `untracked cwd became a project: ${hit}`);
+    const leaked = Object.values(gateState.projects || {}).some(p =>
+      (p.events || []).some(e => (e.text || '').includes('GATE-PERSONAL')));
+    assert.ok(!leaked, 'personal prompt leaked into some project history');
+  });
+
+  check('gate e2e: /api/feed shows nothing from the untracked session', () => {
+    const entries = gateFeed.entries || gateFeed.local || [];
+    const leaked = JSON.stringify(entries).includes('GATE-PERSONAL');
+    assert.ok(!leaked, 'personal session surfaced in the feed');
+    assert.ok(!JSON.stringify(gateFeed).includes(util.normPath(untrackedDir) + '"'), 'untracked dir appears as a feed project');
+  });
+
+  check('gate e2e: tracked project session still ingests exactly as before', () => {
+    const key = Object.keys(gateState.projects || {}).find(k => util.normPath(k) === util.normPath(proj1));
+    assert.ok(key, 'proj1 missing from state');
+    const evs = gateState.projects[key].events || [];
+    assert.ok(evs.some(e => (e.text || '').includes('GATE-REGRESSION')), 'tracked prompt missing');
+    assert.ok(evs.some(e => e.kind === 'edit' && (e.file || '').includes('login.js') && e.ts === '2026-07-10T09:11:00.000Z'), 'tracked edit missing');
   });
 
   // --- summary ---
