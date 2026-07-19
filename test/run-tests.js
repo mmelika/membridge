@@ -698,6 +698,11 @@ async function main() {
     check('dashboard page has the project view', () => {
       assert.ok(pageHtml.includes('view-project'), 'project view missing');
     });
+    check('dashboard ⋯ project menu dismisses on outside click and Escape', () => {
+      assert.ok(embeddedScript.includes('data-px-menu-pop'), 'menu popover marker missing');
+      assert.ok(embeddedScript.includes("closest('[data-px-menu-pop]')"), 'outside-click dismiss check missing');
+      assert.ok(/Escape[\s\S]{0,600}pxMenuId = null/.test(embeddedScript), 'Escape-key menu dismiss missing');
+    });
     check('dashboard page has the Settings screen with BYOK', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
       assert.ok(pageHtml.includes('id="settingsRoot"'), 'settings host missing');
