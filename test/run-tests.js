@@ -5882,6 +5882,56 @@ async function main() {
     assert.ok(evs.some(e => e.kind === 'edit' && (e.file || '').includes('login.js') && e.ts === '2026-07-10T09:11:00.000Z'), 'tracked edit missing');
   });
 
+  // --- 31. saveState: atomic write (temp file + rename) ---
+  // The app and CLI daemons can both rewrite state.json; a crash or a write
+  // error mid-save must never destroy the previously-good file. We prove
+  // this by letting the real write actually land (so old direct-write code
+  // truly mutates the file) and then forcing the underlying call to raise —
+  // an atomic (write-temp, then rename) implementation only ever writes the
+  // temp path, so the real state.json is untouched no matter when the
+  // injected failure fires.
+  {
+    const priorRaw = read(util.statePath());
+
+    check('saveState: a failed write leaves the previous state.json byte-for-byte intact', () => {
+      const realWriteFileSync = fs.writeFileSync;
+      fs.writeFileSync = function (...args) {
+        const result = realWriteFileSync.apply(fs, args); // the write itself really happens...
+        throw new Error('simulated disk failure after write'); // ...but the call still reports failure
+      };
+      try {
+        assert.throws(
+          () => util.saveState({ version: util.STATE_VERSION, files: {}, projects: { marker: { events: [] } } }),
+          /simulated disk failure/,
+          'saveState swallowed the write failure instead of propagating it'
+        );
+      } finally {
+        fs.writeFileSync = realWriteFileSync;
+      }
+      assert.strictEqual(read(util.statePath()), priorRaw,
+        'state.json changed even though the save reported failure — writes are not atomic');
+      const leftovers = fs.readdirSync(util.homeDir()).filter(f => f.endsWith('.tmp'));
+      assert.deepStrictEqual(leftovers, [], 'a temp file was left behind after a failed save');
+    });
+
+    check('saveState: happy path still round-trips through loadState', () => {
+      const fresh = {
+        version: util.STATE_VERSION,
+        files: {},
+        projects: { '/tmp/atomic-roundtrip-project': { events: [{ kind: 'prompt', session: 's1', ts: '2026-07-18T00:00:00.000Z', text: 'atomic write check' }] } },
+        catchup: { ...util.DEFAULT_CATCHUP },
+      };
+      util.saveState(fresh);
+      assert.deepStrictEqual(util.loadState(), fresh, 'state did not round-trip through save/load');
+      const leftovers = fs.readdirSync(util.homeDir()).filter(f => f.endsWith('.tmp'));
+      assert.deepStrictEqual(leftovers, [], 'a temp file was left behind after a successful save');
+    });
+
+    // Restore the real accumulated state so nothing after this section (just
+    // the summary print below) is affected by these probes.
+    fs.writeFileSync(util.statePath(), priorRaw);
+  }
+
   // --- summary ---
   const failed = results.filter(([, e]) => e);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
