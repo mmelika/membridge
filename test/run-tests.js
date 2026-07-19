@@ -752,6 +752,22 @@ async function main() {
         assert.deepStrictEqual(partialResult.deleted, ['/a', '/c']);
         assert.deepStrictEqual(partialResult.failed, ['/b']);
       });
+      // The server's top-level catch answers a throwing deleteProject with an
+      // HTTP 500 (lib/server.js) — fetch RESOLVES on that, so a resolved but
+      // not-ok response must land in failed, never in deleted.
+      let httpCalls = 0;
+      const httpFailResult = await deleteProjectsBulk(['/a', '/b', '/c'], (url, opts) => {
+        httpCalls++;
+        const body = JSON.parse(opts.body);
+        return body.path === '/b'
+          ? Promise.resolve({ ok: false, status: 500 })
+          : Promise.resolve({ ok: true, status: 200 });
+      });
+      check('deleteProjectsBulk: a resolved non-2xx response counts as failed, loop continues', () => {
+        assert.strictEqual(httpCalls, 3, `loop stopped early on an http error (only ${httpCalls} calls)`);
+        assert.deepStrictEqual(httpFailResult.deleted, ['/a', '/c']);
+        assert.deepStrictEqual(httpFailResult.failed, ['/b']);
+      });
       let fetchCalledOnEmpty = false;
       const emptyResult = await deleteProjectsBulk([], () => { fetchCalledOnEmpty = true; return Promise.resolve({ ok: true }); });
       check('deleteProjectsBulk: empty selection is a no-op', () => {
