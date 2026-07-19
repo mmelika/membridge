@@ -4775,30 +4775,33 @@ async function main() {
       return { calls, deps: { runGit: args => { calls.push(args); return handler(args); } } };
     };
 
-    check('commits: readCommit parses committer ts and changed files from git show --numstat', () => {
+    check('commits: readCommit parses committer ts, committer email, and changed files from git show --numstat', () => {
       assert.ok(commits && commits.readCommit, 'readCommit missing');
-      // Real shape of `git show --numstat --format=%cI|%P`: the format line
-      // (date|parents), a blank line, then numstat rows.
-      const g = mkGit(() => '2026-07-18T14:00:00+02:00|p0000aa\n\n3\t1\tsrc/a.js\n10\t0\tsrc/b.js\n');
+      // Real shape of `git show --numstat --format=%cI|%ce|%P`: the format line
+      // (date|committer-email|parents), a blank line, then numstat rows. The
+      // committer email is what the authorship gate compares against.
+      const g = mkGit(() => '2026-07-18T14:00:00+02:00|me@local.dev|p0000aa\n\n3\t1\tsrc/a.js\n10\t0\tsrc/b.js\n');
       const res = commits.readCommit(projC, 'abc1234', g.deps);
       assert.deepStrictEqual(res, {
         sha: 'abc1234',
         ts: '2026-07-18T14:00:00+02:00',
+        email: 'me@local.dev',
         files: ['src/a.js', 'src/b.js'],
       });
       assert.strictEqual(g.calls.length, 1);
       assert.ok(g.calls[0].includes('abc1234'), 'sha missing from the git invocation');
       assert.ok(g.calls[0].includes('--no-show-signature'),
         'must pass --no-show-signature: log.showSignature=true would otherwise prepend signature text to stdout and corrupt ts');
-      assert.ok(g.calls[0].some(a => a.includes('%cI|%P')), 'format must carry the parent list for merge detection');
+      assert.ok(g.calls[0].some(a => a.includes('%cI|%ce|%P')), 'format must carry committer email + parent list');
     });
 
     check('commits: readCommit unquotes a C-quoted spaced path and decodes octal UTF-8 bytes', () => {
       assert.ok(commits && commits.readCommit, 'readCommit missing');
-      const g = mkGit(() => '2026-07-18T14:00:00Z|p0000aa\n\n2\t0\t"docs/read me.md"\n1\t0\t"\\303\\244.txt"\n');
+      const g = mkGit(() => '2026-07-18T14:00:00Z|dev@x.io|p0000aa\n\n2\t0\t"docs/read me.md"\n1\t0\t"\\303\\244.txt"\n');
       const res = commits.readCommit(projC, 'beef111', g.deps);
       assert.deepStrictEqual(res.files, ['docs/read me.md', 'ä.txt'],
         'octal escapes are UTF-8 bytes, not Latin-1 chars');
+      assert.strictEqual(res.email, 'dev@x.io', 'committer email must survive alongside quoted paths');
       // the shared changes.js helper is the thing that decodes
       assert.strictEqual(changesLib.unquote('"\\303\\244.txt"'), 'ä.txt');
       assert.strictEqual(changesLib.unquote('plain.js'), 'plain.js');
@@ -4810,11 +4813,32 @@ async function main() {
       // diff) — verified on this repo. The merge contract must therefore be
       // enforced from the parent list, never inferred from empty output.
       const merge = commits.readCommit(projC, 'mmm2222',
-        mkGit(() => '2026-07-18T15:00:00Z|p0000aa p0000bb\n\n748\t0\tdocs/upstream.md\n12\t3\tlib/other.js\n').deps);
-      assert.deepStrictEqual(merge, { sha: 'mmm2222', ts: '2026-07-18T15:00:00Z', files: [] });
+        mkGit(() => '2026-07-18T15:00:00Z|dev@x.io|p0000aa p0000bb\n\n748\t0\tdocs/upstream.md\n12\t3\tlib/other.js\n').deps);
+      assert.deepStrictEqual(merge, { sha: 'mmm2222', ts: '2026-07-18T15:00:00Z', email: 'dev@x.io', files: [] });
       const broken = commits.readCommit(projC, 'eee3333',
         mkGit(() => { throw new Error('fatal: bad object'); }).deps);
-      assert.deepStrictEqual(broken, { sha: 'eee3333', ts: null, files: [] });
+      assert.deepStrictEqual(broken, { sha: 'eee3333', ts: null, email: null, files: [] });
+    });
+
+    // --- Phase 3 Task 1: authorship gate (committer email == local user.email) ---
+    check('commits: gitUserEmail reads local user.email, trims it, and degrades to null', () => {
+      assert.ok(commits && commits.gitUserEmail, 'gitUserEmail missing');
+      const g = mkGit(() => 'me@local.dev\n');
+      assert.strictEqual(commits.gitUserEmail(projC, g.deps), 'me@local.dev');
+      assert.ok(g.calls[0].includes('config') && g.calls[0].includes('user.email'), 'must read git config user.email');
+      // Unset user.email: git prints nothing / exits non-zero → null (fail closed)
+      assert.strictEqual(commits.gitUserEmail(projC, mkGit(() => '').deps), null);
+      assert.strictEqual(commits.gitUserEmail(projC, mkGit(() => { throw new Error('no email'); }).deps), null);
+    });
+
+    check('commits: isLocalCommitter is true only for a matching identity, fail-closed otherwise', () => {
+      assert.ok(commits && commits.isLocalCommitter, 'isLocalCommitter missing');
+      assert.strictEqual(commits.isLocalCommitter('me@local.dev', 'me@local.dev'), true);
+      assert.strictEqual(commits.isLocalCommitter(' me@local.dev ', 'me@local.dev'), true, 'surrounding whitespace ignored');
+      assert.strictEqual(commits.isLocalCommitter('teammate@remote.dev', 'me@local.dev'), false, 'a foreign committer is never local');
+      assert.strictEqual(commits.isLocalCommitter('me@local.dev', null), false, 'missing local user.email fails closed');
+      assert.strictEqual(commits.isLocalCommitter(null, 'me@local.dev'), false, 'missing committer email fails closed');
+      assert.strictEqual(commits.isLocalCommitter(null, null), false);
     });
 
     check('commits: newCommitsSince returns post-cursor commits oldest-first, excluding merges', () => {
@@ -4898,6 +4922,10 @@ async function main() {
         ['-C', projCap, '-c', 'user.email=t@t.t', '-c', 'user.name=T', ...args],
         { encoding: 'utf8' });
       gitCap(['init', '-q']);
+      // Persist the local identity so the authorship gate (committer email ==
+      // local user.email) recognises these commits as locally authored.
+      gitCap(['config', 'user.email', 't@t.t']);
+      gitCap(['config', 'user.name', 'T']);
       const past = ms => new Date(Date.now() - ms).toISOString();
       {
         const st = util.loadState();
@@ -5084,7 +5112,7 @@ async function main() {
       const projMany = path.join(ROOT, 'projects', 'many-commits-app');
       fs.mkdirSync(projMany, { recursive: true });
       spawnSync('sh', ['-c',
-        `cd "${projMany}" && git init -q && git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m c0`],
+        `cd "${projMany}" && git init -q && git config user.email t@t.t && git config user.name T && git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m c0`],
         { encoding: 'utf8' });
       {
         const st = util.loadState();
@@ -5125,6 +5153,80 @@ async function main() {
         assert.deepStrictEqual(map[55].unattributed, ['later.js'], 'daemon-recorded row carries the attribution result');
       });
     }
+  }
+
+  // --- Phase 3 Task 1: authorship gate end-to-end over a real repo ---------
+  // A commit whose committer is the local identity is attributed; a commit
+  // pulled from a teammate (foreign committer) is recorded unattributed-locally
+  // and NEVER falsely credited; a repo with no local user.email fails closed.
+  {
+    const projGate = path.join(ROOT, 'projects', 'authorship-gate-app');
+    fs.mkdirSync(path.join(projGate, 'src'), { recursive: true });
+    const rawGit = args => spawnSync('git', ['-C', projGate, ...args], { encoding: 'utf8' });
+    rawGit(['init', '-q']);
+    rawGit(['config', 'user.email', 'me@local.dev']);
+    rawGit(['config', 'user.name', 'Me']);
+    const past = ms => new Date(Date.now() - ms).toISOString();
+    {
+      const st = util.loadState();
+      st.projects[projGate] = { events: [
+        { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projGate, 'src', 'mine.js'), session: 'gLocal' },
+        { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projGate, 'src', 'pulled.js'), session: 'gForeign' },
+      ] };
+      util.saveState(st);
+    }
+    // A local commit (committer == me@local.dev).
+    fs.writeFileSync(path.join(projGate, 'src', 'mine.js'), 'mine\n');
+    rawGit(['add', '-A']);
+    rawGit(['commit', '-q', '-m', 'local edit']);
+    const shaLocal = rawGit(['rev-parse', 'HEAD']).stdout.trim();
+    // A commit whose committer is a teammate (as after a `git pull`).
+    fs.writeFileSync(path.join(projGate, 'src', 'pulled.js'), 'pulled\n');
+    rawGit(['add', '-A']);
+    spawnSync('git', ['-C', projGate, '-c', 'user.email=teammate@remote.dev', '-c', 'user.name=Teammate',
+      'commit', '-q', '-m', 'teammate edit'], { encoding: 'utf8' });
+    const shaForeign = rawGit(['rev-parse', 'HEAD']).stdout.trim();
+    syncOnce({ project: projGate });
+
+    check('gate: a local-committer commit is attributed to its session', () => {
+      const map = require('../lib/commits').loadCommitMap(projGate);
+      const rec = map.find(r => r.sha === shaLocal);
+      assert.ok(rec, 'local commit not recorded');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'gLocal', files: ['src/mine.js'] }]);
+      assert.deepStrictEqual(rec.unattributed, []);
+    });
+
+    check('gate: a foreign-committer (pulled) commit is recorded unattributed-locally, never credited', () => {
+      const map = require('../lib/commits').loadCommitMap(projGate);
+      const rec = map.find(r => r.sha === shaForeign);
+      assert.ok(rec, 'foreign commit not recorded');
+      assert.deepStrictEqual(rec.sessions, [], 'a foreign committer must never be credited to a local session');
+      assert.deepStrictEqual(rec.unattributed, ['src/pulled.js'], 'its files are unattributed-locally');
+    });
+
+    check('gate: a repo with no local user.email fails closed (no throw, nothing credited)', () => {
+      const projNoId = path.join(ROOT, 'projects', 'no-identity-app');
+      fs.mkdirSync(path.join(projNoId, 'src'), { recursive: true });
+      const g = args => spawnSync('git', ['-C', projNoId, ...args], { encoding: 'utf8' });
+      g(['init', '-q']);
+      // Deliberately no user.email config. Commit with an ad-hoc identity.
+      {
+        const st = util.loadState();
+        st.projects[projNoId] = { events: [
+          { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projNoId, 'src', 'x.js'), session: 'nLocal' },
+        ] };
+        util.saveState(st);
+      }
+      fs.writeFileSync(path.join(projNoId, 'src', 'x.js'), 'x\n');
+      g(['add', '-A']);
+      spawnSync('git', ['-C', projNoId, '-c', 'user.email=whoever@nowhere.dev', '-c', 'user.name=W',
+        'commit', '-q', '-m', 'c'], { encoding: 'utf8' });
+      const sha = g(['rev-parse', 'HEAD']).stdout.trim();
+      assert.doesNotThrow(() => syncOnce({ project: projNoId }));
+      const rec = require('../lib/commits').loadCommitMap(projNoId).find(r => r.sha === sha);
+      assert.ok(rec, 'commit should still be recorded');
+      assert.deepStrictEqual(rec.sessions, [], 'fail closed: nothing credited without a local identity');
+    });
   }
 
   check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {
