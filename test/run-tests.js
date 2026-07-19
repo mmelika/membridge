@@ -4626,6 +4626,108 @@ async function main() {
       assert.deepStrictEqual(abs, base);
     });
 
+    // --- Phase 3 Task 2: blameLine (line → SHA) ---------------------------
+    const mkBlameGit = handler => {
+      const calls = [];
+      return { calls, deps: { runGit: args => { calls.push(args); return handler(args); } } };
+    };
+    check('provenance: blameLine extracts the 40-hex SHA from --porcelain blame', () => {
+      const commitsMod = require('../lib/commits');
+      assert.ok(commitsMod.blameLine, 'blameLine missing');
+      const sha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4';
+      const g = mkBlameGit(() => `${sha} 12 42 1\nauthor Me\n\tsome code line\n`);
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 42, g.deps), sha);
+      assert.ok(g.calls[0].includes('blame') && g.calls[0].includes('-L') && g.calls[0].some(a => a === '42,42'),
+        'must run git blame -L <line>,<line>');
+      assert.ok(g.calls[0].includes('--porcelain'), 'must use --porcelain');
+    });
+    check('provenance: blameLine returns null for an all-zero (uncommitted) SHA, garbage, and a throwing runner', () => {
+      const commitsMod = require('../lib/commits');
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => `${'0'.repeat(40)} 1 1 1\n`).deps), null,
+        'all-zero blame SHA = not committed yet → null');
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => 'not a sha at all\n').deps), null);
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => '').deps), null);
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => { throw new Error('fatal'); }).deps), null,
+        'a git failure degrades to null, never throws');
+    });
+    check('provenance: blameLine guards a non-positive / non-integer line before touching git', () => {
+      const commitsMod = require('../lib/commits');
+      for (const bad of [0, -1, 2.5, 'foo', null, undefined]) {
+        const g = mkBlameGit(() => `${'a'.repeat(40)} 1 1 1\n`);
+        assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', bad, g.deps), null, `line ${bad} must be null`);
+        assert.strictEqual(g.calls.length, 0, `must not run git for a bad line (${bad})`);
+      }
+    });
+
+    // --- Phase 3 Task 2: lineProvenance (SHA → map → session row) ----------
+    const SHA_W1 = '1'.repeat(40);
+    const SHA_MERGE = '2'.repeat(40);
+    const SHA_MISSING = '3'.repeat(40);
+    const lineMap = [
+      { sha: SHA_W1, ts: '2026-07-18T09:05:00.000Z', project: projWhy,
+        sessions: [{ session: 'w1', files: ['src/auth.js'] }], unattributed: [] },
+      { sha: SHA_MERGE, ts: '2026-07-18T09:06:00.000Z', project: projWhy, sessions: [], unattributed: [] },
+    ];
+    const lineDeps = (sha, opts = {}) => ({
+      blameLine: opts.throw ? () => { throw new Error('git down'); } : () => sha,
+      loadCommitMap: () => lineMap,
+    });
+
+    check('lineProvenance: a mapped line yields one fileProvenance-shaped row for the owning session', () => {
+      assert.ok(prov.lineProvenance, 'lineProvenance missing');
+      const res = prov.lineProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', 2, whyNow, lineDeps(SHA_W1));
+      assert.strictEqual(res.fallback, null, `expected no fallback, got ${res.fallback}`);
+      assert.strictEqual(res.sha, SHA_W1);
+      assert.strictEqual(res.line, 2);
+      assert.ok(res.session, 'expected a session row');
+      assert.strictEqual(res.session.who, 'You');
+      assert.strictEqual(res.session.session, 'w1');
+      assert.ok(/Rewrote auth/.test(res.session.summary), `row summary was: ${res.session.summary}`);
+      // Row shape is EXACTLY fileProvenance's row for that session — no extras.
+      const fileRow = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow)
+        .find(r => r.session === 'w1');
+      assert.deepStrictEqual(res.session, fileRow, 'line row must match the file-level row for that session');
+    });
+
+    check('lineProvenance: every fallback path sets the right reason with a null session', () => {
+      assert.ok(prov.lineProvenance, 'lineProvenance missing');
+      const call = (line, deps) => prov.lineProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', line, whyNow, deps);
+      // no / bad line
+      for (const bad of [null, 0, 'foo']) {
+        const r = call(bad, lineDeps(SHA_W1));
+        assert.strictEqual(r.fallback, 'no-line', `line ${bad} → no-line`);
+        assert.strictEqual(r.session, null);
+      }
+      // all-zero blame (blameLine returns null) → uncommitted
+      const unc = call(2, { blameLine: () => null, loadCommitMap: () => lineMap });
+      assert.strictEqual(unc.fallback, 'uncommitted');
+      assert.strictEqual(unc.session, null);
+      // SHA present in blame but not in the map → unmapped
+      const unm = call(2, lineDeps(SHA_MISSING));
+      assert.strictEqual(unm.fallback, 'unmapped');
+      assert.strictEqual(unm.session, null);
+      // merge record (files:[]) → merge
+      const mrg = call(2, lineDeps(SHA_MERGE));
+      assert.strictEqual(mrg.fallback, 'merge');
+      assert.strictEqual(mrg.session, null);
+      // throwing git → git-unavailable
+      const dead = call(2, lineDeps(SHA_W1, { throw: true }));
+      assert.strictEqual(dead.fallback, 'git-unavailable');
+      assert.strictEqual(dead.session, null);
+    });
+
+    check('provenance: parseFileLineArg splits <file>:<line>, tolerating drive-colons and column paste', () => {
+      assert.ok(prov.parseFileLineArg, 'parseFileLineArg missing');
+      assert.deepStrictEqual(prov.parseFileLineArg('src/a.js:42'), { file: 'src/a.js', line: 42 });
+      assert.deepStrictEqual(prov.parseFileLineArg('src/a.js'), { file: 'src/a.js', line: null });
+      assert.deepStrictEqual(prov.parseFileLineArg('C:\\x.js:10'), { file: 'C:\\x.js', line: 10 },
+        'a Windows drive colon must not be mistaken for the line separator');
+      assert.deepStrictEqual(prov.parseFileLineArg('a.js:42:7'), { file: 'a.js', line: 42 },
+        'an editor "file:line:col" paste keeps the LINE, drops the column');
+      assert.deepStrictEqual(prov.parseFileLineArg('a.js:foo'), { file: 'a.js:foo', line: null },
+        'a non-numeric suffix is part of the filename, not a line');
+    });
+
     // CLI wiring: spawn the real binary from a project SUBDIR — resolveRoot
     // must walk up to the tracked root, and output must be newest-first and
     // redacted. State is planted on disk for the subprocess to read.
@@ -4684,6 +4786,92 @@ async function main() {
         assert.strictEqual(whyBadRes.isError, true);
       });
       await whyClient.close();
+    }
+  }
+
+  // --- 15b. Line-level `why <file>:<line>` end-to-end (Phase 3 Task 2) ------
+  // A REAL repo so `git blame` resolves a real SHA; a planted commit map ties
+  // that SHA to a session; events give the session its ask/summary. Exercises
+  // the CLI (spawned) and the MCP boundary (in-process) over the same data.
+  {
+    const projLine = path.join(ROOT, 'projects', 'line-why-app');
+    fs.mkdirSync(path.join(projLine, 'src'), { recursive: true });
+    const gl = args => spawnSync('git', ['-C', projLine, ...args], { encoding: 'utf8' });
+    gl(['init', '-q']);
+    gl(['config', 'user.email', 'me@local.dev']);
+    gl(['config', 'user.name', 'Me']);
+    fs.writeFileSync(path.join(projLine, 'src', 'auth.js'), 'const token = rotate();\n');
+    gl(['add', '-A']);
+    gl(['commit', '-q', '-m', 'auth line']);
+    const lineSha = gl(['rev-parse', 'HEAD']).stdout.trim();
+    // An extra, UNCOMMITTED line in the working tree — blame of it is all-zero.
+    fs.appendFileSync(path.join(projLine, 'src', 'auth.js'), 'const scratch = 1;\n');
+    const lineEvents = [
+      { ts: '2026-07-18T09:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Add token=sk-line-secret rotation', session: 'L1' },
+      { ts: '2026-07-18T09:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projLine, 'src', 'auth.js'), session: 'L1' },
+      { ts: '2026-07-18T09:02:00.000Z', source: 'Claude Code', kind: 'summary', text: 'Rotated the auth token each request', session: 'L1', decisions: 'per-request rotation', gotchas: '' },
+    ];
+    {
+      const st = util.loadState();
+      st.projects[projLine] = { events: lineEvents };
+      util.saveState(st);
+    }
+    const commitsMod = require('../lib/commits');
+    commitsMod.recordCommit(projLine, {
+      sha: lineSha, ts: '2026-07-18T09:05:00.000Z', project: projLine,
+      sessions: [{ session: 'L1', files: ['src/auth.js'] }], unattributed: [],
+    });
+
+    const cliLine = spawnSync(process.execPath, [BIN, 'why', 'src/auth.js:1'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: `membridge why <file>:<line>` resolves the line to its session, redacted, with the short SHA', () => {
+      assert.strictEqual(cliLine.status, 0, `exit ${cliLine.status}, stderr: ${cliLine.stderr}`);
+      assert.ok(cliLine.stdout.includes('src/auth.js:1'), `stdout: ${cliLine.stdout}`);
+      assert.ok(cliLine.stdout.includes(lineSha.slice(0, 10)), `expected short sha ${lineSha.slice(0, 10)} in: ${cliLine.stdout}`);
+      assert.ok(/Rotated the auth token/.test(cliLine.stdout), `expected the session summary in: ${cliLine.stdout}`);
+      assert.ok(!cliLine.stdout.includes('sk-line-secret'), 'secret leaked into line-level CLI output');
+    });
+
+    const cliUncommitted = spawnSync(process.execPath, [BIN, 'why', 'src/auth.js:2'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: an uncommitted line prints the fallback annotation AND the file-level history', () => {
+      assert.strictEqual(cliUncommitted.status, 0, `exit ${cliUncommitted.status}, stderr: ${cliUncommitted.stderr}`);
+      assert.ok(/not committed yet|not yet attributable/i.test(cliUncommitted.stdout), `expected an uncommitted annotation in: ${cliUncommitted.stdout}`);
+      assert.ok(/Rotated the auth token/.test(cliUncommitted.stdout), `expected file-level history in the fallback: ${cliUncommitted.stdout}`);
+    });
+
+    const cliPlain = spawnSync(process.execPath, [BIN, 'why', 'src/auth.js'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: `membridge why <file>` (no line) is unchanged file-level output', () => {
+      assert.strictEqual(cliPlain.status, 0, cliPlain.stderr);
+      assert.ok(/Why src\/auth\.js —/.test(cliPlain.stdout), `stdout: ${cliPlain.stdout}`);
+      assert.ok(!/commit [0-9a-f]/.test(cliPlain.stdout), 'plain why must not print a commit line');
+    });
+
+    // MCP boundary: the why tool gains an optional line param.
+    {
+      const [ct, stx] = InMemoryTransport.createLinkedPair();
+      const server = mcpMod.createServer();
+      const client = new McpClient({ name: 'why-line-client', version: '1.0.0' });
+      await Promise.all([server.connect(stx), client.connect(ct)]);
+      const callJson = async (a) => JSON.parse((await client.callTool({ name: 'why', arguments: a })).content[0].text);
+      let lineData = null, uncData = null, err = null;
+      try {
+        lineData = await callJson({ project: projLine, file: 'src/auth.js', line: 1 });
+        uncData = await callJson({ project: projLine, file: 'src/auth.js', line: 2 });
+      } catch (e) { err = e; }
+      check('mcp: why with a line returns a redacted single session row + sha, fallback carried through', () => {
+        assert.ok(!err, `why(line) failed: ${err && err.message}`);
+        assert.strictEqual(lineData.line, 1);
+        assert.strictEqual(lineData.sha, lineSha);
+        assert.strictEqual(lineData.fallback, null);
+        assert.ok(lineData.session && lineData.session.session === 'L1', `session: ${JSON.stringify(lineData.session)}`);
+        assert.ok(!JSON.stringify(lineData).includes('sk-line-secret'), 'secret leaked through the MCP line boundary');
+        // Uncommitted line: fallback carried through, no session.
+        assert.strictEqual(uncData.fallback, 'uncommitted');
+        assert.strictEqual(uncData.session, null);
+      });
+      await client.close();
     }
   }
 

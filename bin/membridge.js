@@ -278,13 +278,26 @@ async function cmdMcp() {
 // resolved against cwd, then walked up to the nearest tracked project root.
 // The file does not have to exist on disk: a deleted file's history is still
 // a legitimate provenance question.
+// Explicit, human reasons for every line-level fallback — printed before the
+// file-level list so `why <file>:<line>` never dead-ends on a line git can't
+// resolve to a single owning commit.
+const LINE_FALLBACK = {
+  'no-line': 'no valid line number given',
+  'uncommitted': 'that line was last touched by an edit that is not committed yet — not yet attributable',
+  'unmapped': 'that line traces to a commit with no local session attribution',
+  'merge': 'that line traces to a merge commit (no single ask)',
+  'git-unavailable': 'git blame is unavailable here',
+};
+
 function cmdWhy() {
-  const fileArg = args[1];
-  if (!fileArg || fileArg.startsWith('--')) die('Usage: membridge why <file>  (run inside a tracked project)');
+  const rawArg = args[1];
+  if (!rawArg || rawArg.startsWith('--')) die('Usage: membridge why <file>[:<line>]  (run inside a tracked project)');
   const state = util.loadState();
   const config = util.getConfig();
   const projectResolve = require('../lib/project-resolve');
   const provenance = require('../lib/provenance');
+  // Split an optional :<line> off first; only the file part is path-resolved.
+  const { file: fileArg, line } = provenance.parseFileLineArg(rawArg);
   // Shell cwd is realpath'd by node while project keys keep the tool-log
   // spelling; resolveTrackedKey matches both spellings (it's the same logic
   // the git post-commit hook uses). The file itself may not exist (a deleted
@@ -302,20 +315,43 @@ function cmdWhy() {
   const rel = provenance.normalizeRel(hit.root, abs);
   if (!rel) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
   const key = hit.key;
-  const rows = provenance.fileProvenance(key, state.projects[key], config, rel);
-  if (!rows.length) {
-    console.log(`No recorded AI edits for ${rel} in ${key}.`);
-    return;
-  }
-  console.log(`Why ${rel} — ${rows.length} session(s), newest first:\n`);
-  for (const r of rows) {
+  const proj = state.projects[key];
+
+  // Rows come pre-redacted from fileProvenance/lineProvenance (both reuse the
+  // same redaction pipeline), so the CLI just formats them.
+  const renderRow = r => {
     console.log(`${digest.shortDate(r.ts)} · ${r.who} · ${r.tool}${r.live ? '  [working now]' : ''}`);
     console.log(`  Ask: ${r.ask || '(prompt not shared)'}`);
     if (r.summary) console.log(`  Did: ${r.summary}`);
     const notes = [r.decisions, r.gotchas].filter(Boolean).join(' · ');
     if (notes) console.log(`  Notes: ${notes}`);
     console.log('');
+  };
+  const renderFileLevel = () => {
+    const rows = provenance.fileProvenance(key, proj, config, rel);
+    if (!rows.length) {
+      console.log(`No recorded AI edits for ${rel} in ${key}.`);
+      return;
+    }
+    console.log(`Why ${rel} — ${rows.length} session(s), newest first:\n`);
+    for (const r of rows) renderRow(r);
+  };
+
+  if (line == null) {
+    renderFileLevel();
+    return;
   }
+
+  // Line-level: blame → SHA → the commit map → the one owning session, or an
+  // explicit fallback reason followed by the file-level history.
+  const res = provenance.lineProvenance(key, proj, config, rel, line, Date.now());
+  if (res.fallback || !res.session) {
+    console.log(`Line ${rel}:${line} — ${LINE_FALLBACK[res.fallback] || 'no line-level attribution'}; showing file-level history instead.\n`);
+    renderFileLevel();
+    return;
+  }
+  console.log(`Why ${rel}:${line} — commit ${(res.sha || '').slice(0, 10)}:\n`);
+  renderRow(res.session);
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +591,8 @@ Usage: membridge <command>
   dashboard           open the local web dashboard (starts daemon if needed)
   sync [--dry-run] [--project <path>]   one sync pass right now
   scan                read-only: show which tools/projects were discovered
-  why <file>          which AI sessions edited this file, newest first
+  why <file>[:<line>] which AI sessions edited this file, newest first; add
+                      :<line> for the one session behind a single line
   remove [--project <path>]             strip injected memory blocks
   enable-autostart    launch MemBridge automatically at login
   disable-autostart   remove the login launcher
