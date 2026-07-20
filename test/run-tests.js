@@ -2964,6 +2964,16 @@ async function main() {
     assert.deepStrictEqual(ev.highlights, [{ file: 'lib/mcp.js', note: 'the server' }]);
   });
 
+  check('headline: scanSummaries carries headline when present', () => {
+    const proj = path.join(ROOT, 'projects', 'hl-scan'); fs.mkdirSync(path.join(proj, '.membridge'), { recursive: true });
+    fs.writeFileSync(path.join(proj, '.membridge', 'summaries.jsonl'),
+      JSON.stringify({ session: 's1', ts: '2026-07-20T00:00:00Z', did: 'full did', headline: 'tight line' }) + '\n');
+    const st = { projects: { [proj]: { events: [] } }, files: {} };
+    const evs = require('../lib/scan').scanSummaries(st, {});
+    const ev = evs.find(e => e.session === 's1');
+    assert.ok(ev && ev.headline === 'tight line', 'headline not carried by scanSummaries');
+  });
+
   // --- 10. distillation: Stop hook, settings surgery, Distilled precedence ---
   const summariesFile = path.join(projR, '.membridge', 'summaries.jsonl');
   const runHook = payload => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
@@ -3646,6 +3656,11 @@ async function main() {
     assert.ok(/escape it for the shell/i.test(r), 'shell-escaping guidance present');
     assert.ok(r.includes(String.raw`'\''`), 'shows the apostrophe escape sequence');
   });
+  check('headline: blockReason asks for a short headline field', () => {
+    const r = hooks.blockReason('/p/.membridge/summaries.jsonl', 's1', 0);
+    assert.ok(/"headline"/.test(r), 'JSON template includes headline');
+    assert.ok(/10 words|glance/i.test(r), 'headline guidance present');
+  });
   check('checkpoint: countSummaryLines ignores malformed lines, empty did, and other sessions', () => {
     fs.writeFileSync(ckSummaries,
       'not json {\n' +
@@ -3695,6 +3710,15 @@ async function main() {
       assert.ok(out.stderr.trim(), `${why}: expected a stderr message`);
     }
     assert.ok(!fs.existsSync(target), 'invalid input must write nothing');
+  });
+  check('headline: append accepts a line with headline and one without; rejects non-string headline', () => {
+    const proj = path.join(ROOT, 'projects', 'hl-app'); fs.mkdirSync(proj, { recursive: true });
+    const target = path.join(proj, '.membridge', 'summaries.jsonl');
+    const base = { session: 's1', ts: '2026-07-20T00:00:00Z', did: 'did a thing' };
+    const run = obj => spawnSync(process.execPath, [HOOK_SCRIPT, 'append', target, JSON.stringify(obj)], { encoding: 'utf8' });
+    assert.strictEqual(run({ ...base, headline: 'Short outcome' }).status, 0, 'headline line rejected');
+    assert.strictEqual(run(base).status, 0, 'headline-less line rejected');
+    assert.notStrictEqual(run({ ...base, headline: 42 }).status, 0, 'non-string headline accepted');
   });
   check('append: bare invocation still runs the stop hook (allows on garbage stdin)', () => {
     const out = spawnSync(process.execPath, [HOOK_SCRIPT], { input: 'not json', encoding: 'utf8' });
@@ -4792,6 +4816,17 @@ async function main() {
       author_name: 'A', ts: '2026-07-14T05:00:00Z', source: 'Codex', ask: 'q', files: [],
       created_at: '2026-07-14T05:00:00Z' }, { selfUserId: 'me' });
     assert.strictEqual(n.summary, null);
+  });
+  check('headline: feed normalizeLocal and normalizeTeam carry headline', () => {
+    const local = feed.normalizeLocal(
+      { session: 's', headline: 'H', did: 'D', summary: 'D', ts: '2026-07-20T00:00:00Z', files: [] },
+      { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(local.headline, 'H', 'headline not carried by normalizeLocal');
+    const team = feed.normalizeTeam(
+      { id: 1, project_id: 'p', project_name: 'p', author_id: 'a', author_name: 'A',
+        ts: '2026-07-20T00:00:00Z', source: 'Distilled', ask: 'q', headline: 'H', files: [],
+        created_at: '2026-07-20T00:00:00Z' }, { selfUserId: 'me' });
+    assert.strictEqual(team.headline, 'H', 'headline not carried by normalizeTeam');
   });
   check('feed: local entry carries goal + changes', () => {
     const proj = { events: [
