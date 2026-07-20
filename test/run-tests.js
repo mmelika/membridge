@@ -923,6 +923,171 @@ async function main() {
       }
       return src.slice(startIdx, end);
     }
+    // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
+    // so these are source-level presence/shape assertions against the served
+    // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
+    check('dashboard embedded script never calls window.prompt/confirm/alert (Electron has no window.prompt — it silently no-ops)', () => {
+      assert.ok(!embeddedScript.includes('window.prompt('), 'window.prompt( still present');
+      assert.ok(!embeddedScript.includes('window.confirm('), 'window.confirm( still present');
+      assert.ok(!embeddedScript.includes('window.alert('), 'window.alert( still present');
+      assert.ok(!/(^|[^.\w])prompt\(/.test(embeddedScript), 'a bare prompt( call is still present');
+      assert.ok(!/(^|[^.\w])confirm\(/.test(embeddedScript), 'a bare confirm( call is still present');
+      assert.ok(!/(^|[^.\w])alert\(/.test(embeddedScript), 'a bare alert( call is still present');
+    });
+    check('dashboard has a reusable in-app prompt modal joined to the overlay + Escape idiom', () => {
+      assert.ok(pageHtml.includes('id="promptOverlay"'), 'prompt overlay markup missing');
+      assert.ok(pageHtml.includes('id="promptInput"'), 'prompt input missing');
+      assert.ok(pageHtml.includes('id="promptConfirm"'), 'prompt confirm button missing');
+      assert.ok(embeddedScript.includes('function openPrompt('), 'openPrompt helper missing');
+      assert.ok(/promptInput[\s\S]{0,400}key === 'Enter'/.test(embeddedScript), 'Enter-confirms wiring missing');
+      assert.ok(/hadModal[\s\S]{0,400}promptOverlay/.test(embeddedScript), 'prompt overlay not joined to the Escape hadModal chain');
+      assert.ok(/window\.addEventListener\('keydown'[\s\S]{0,900}closePrompt\(\)/.test(embeddedScript), 'Escape does not close the prompt overlay');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/create'"), 'create still runs the same teamRequest flow');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/join'"), 'join still runs the same teamRequest flow');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/rename'"), 'rename still runs the same teamRequest flow');
+    });
+    check('feedFilterBarHtml renders a stable, never-shrinking union of tools/projects instead of deriving from filtered entries', () => {
+      const barFnSrc = extractFn(embeddedScript, 'feedFilterBarHtml');
+      assert.ok(barFnSrc, 'feedFilterBarHtml not found');
+      assert.ok(embeddedScript.includes('feedToolsSeen') && embeddedScript.includes('feedProjectsSeen'),
+        'stable-superset accumulator vars missing');
+      assert.ok(barFnSrc.includes('feedToolsSeen') && barFnSrc.includes('feedProjectsSeen'),
+        'feedFilterBarHtml does not read from the stable-superset accumulators');
+      // the old collapsing shape built a fresh tools/projects map off entries.forEach every render
+      assert.ok(!/entries\.forEach[\s\S]{0,200}tools\[e\.source\]/.test(barFnSrc),
+        'feedFilterBarHtml still derives tool options from its entries argument the old collapsing way');
+    });
+    check('Activity back control clears filters and re-renders Activity in place (no longer exits to the Projects index)', () => {
+      assert.ok(!embeddedScript.includes('← Catch-Up'), 'old "← Catch-Up" label still present');
+      assert.ok(embeddedScript.includes('← All activity'), 'new honest back-link label missing');
+      assert.ok(/data-feed="back"[\s\S]{0,600}feedFilters\s*=\s*\{\s*author:\s*null,\s*project:\s*null,\s*source:\s*null\s*\}/.test(embeddedScript),
+        'back handler does not clear feedFilters to {author:null,project:null,source:null}');
+    });
+    check('Team empty-state card reuses the header brand mark above "No team yet"', () => {
+      const noneFnSrc = extractFn(embeddedScript, 'teamScreenNone');
+      assert.ok(noneFnSrc, 'teamScreenNone not found');
+      assert.ok(noneFnSrc.includes('brand-mark'), 'brand-mark asset missing from the team empty state');
+      assert.ok(noneFnSrc.includes('No team yet'), 'heading missing');
+      assert.ok(noneFnSrc.indexOf('brand-mark') < noneFnSrc.indexOf('No team yet'), 'brand mark is not positioned above the heading');
+    });
+    check('a reusable slow-load spinner arms at 3s and is wired into the three view loaders', () => {
+      assert.ok(/SPINNER_DELAY_MS\s*=\s*3000/.test(embeddedScript), '3s spinner delay constant missing');
+      assert.ok(embeddedScript.includes('function armSpinner('), 'armSpinner helper missing');
+      assert.ok(embeddedScript.includes('function clearSpinner('), 'clearSpinner helper missing');
+      ['loadProjectsIndex', 'loadFeed', 'renderTeamScreen'].forEach((name) => {
+        const src = extractFn(embeddedScript, name);
+        assert.ok(src, `${name} not found`);
+        assert.ok(/armSpinner\(/.test(src), `${name} does not arm the spinner`);
+        assert.ok(/clearSpinner\(/.test(src), `${name} does not clear the spinner`);
+      });
+    });
+    // Fix round: the spinner's 3s paint replaces host content, which the
+    // fp-dedup guards (fp === feedFp/pxFp && host.firstChild → skip render)
+    // cannot see — a slow-but-unchanged poll tick stranded the spinner, and
+    // the paint could wipe an open ⋯ menu the dedup branch protects.
+    check('spinner paint is observable: fp-dedup skips must re-render a painted-over host, and an open ⋯ menu blocks the paint', () => {
+      assert.ok(/function clearSpinner\(viewKey, token\)[\s\S]{0,400}return !!spinnerPainted\[viewKey\]/.test(embeddedScript),
+        'clearSpinner does not report whether the timer already painted');
+      assert.ok(embeddedScript.includes('function spinnerRendered('),
+        'spinnerRendered reset helper missing (painted debt must clear only on a real render)');
+      const feedSrc = extractFn(embeddedScript, 'loadFeed');
+      assert.ok(/fp === feedFp && host\.firstChild && !spinnerPaintedOver/.test(feedSrc),
+        "loadFeed's fp-dedup skip does not consult the painted flag");
+      const pxSrc = extractFn(embeddedScript, 'loadProjectsIndex');
+      const pxGuards = pxSrc.match(/fp === pxFp && host\.firstChild && !spinnerPaintedOver/g) || [];
+      assert.ok(pxGuards.length >= 2,
+        `loadProjectsIndex's fp-dedup skips must both consult the painted flag (found ${pxGuards.length})`);
+      // menu guard: the paint path must skip when the projects ⋯ menu/confirm is open
+      assert.ok(/skipPaint && skipPaint\(\)/.test(embeddedScript), 'paint path has no skip-paint guard');
+      assert.ok(/armSpinner\('projects'[\s\S]{0,140}pxMenuId \|\| pxConfirmId/.test(pxSrc),
+        'projects loader does not pass the open-menu guard to armSpinner');
+    });
+    check('switching/joining/creating/leaving a team resets the feed filter unions (stale old-team options cannot persist)', () => {
+      assert.ok(embeddedScript.includes('function resetFeedFilterUnions('), 'union reset helper missing');
+      assert.ok(/data-ts-switchto[\s\S]{0,220}resetFeedFilterUnions\(\)/.test(embeddedScript),
+        'switch-to branch does not reset the unions');
+      assert.ok(/\/api\/team\/join'[\s\S]{0,260}resetFeedFilterUnions\(\)/.test(embeddedScript),
+        'join flow does not reset the unions');
+    });
+    // ---- Round 3 Electron-runtime UI bugs: team create/join failing silently,
+    // the Activity project filter matching on display name, and the session
+    // page's old no-summary liveness rule. Same contract as the rounds above:
+    // browser behavior is pinned by source-shape assertions (no DOM runtime in
+    // this suite); the server half of each contract is exercised for real. ----
+    const noAuthCreate = await fetch(`${base}/api/team/create`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'ghost-team' }),
+    });
+    const noAuthCreateBody = await noAuthCreate.json().catch(() => ({}));
+    const noAuthJoin = await fetch(`${base}/api/team/join`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inviteCode: 'no-such-code' }),
+    });
+    const noAuthJoinBody = await noAuthJoin.json().catch(() => ({}));
+    check('unauthenticated /api/team/create + /join answer a non-2xx with an error body the UI can surface', () => {
+      assert.ok(!noAuthCreate.ok, 'unauthenticated create must not be 2xx');
+      assert.ok(noAuthCreateBody.error, 'create error body is empty');
+      assert.ok(!noAuthJoin.ok, 'unauthenticated join must not be 2xx');
+      assert.ok(noAuthJoinBody.error, 'join error body is empty');
+    });
+    check('Team screen surfaces create/join failures — auth-aware notice + sign-in gate, never a silent no-op', () => {
+      assert.ok(embeddedScript.includes('function tsNoticeHtml('), 'Team screen notice helper missing');
+      const tsViewSrc = extractFn(embeddedScript, 'renderTeamScreenView');
+      assert.ok(tsViewSrc && tsViewSrc.includes('tsNoticeHtml()'), 'Team screen view does not render the notice');
+      // Rejections must reach the notice — the old handlers swallowed them with
+      // an argument-less .catch(function () { setPill(false); }).
+      assert.ok(/\/api\/team\/create'[\s\S]{0,600}\.catch\(function \(err\)/.test(embeddedScript),
+        'create rejection is still swallowed (argument-less catch)');
+      assert.ok(/\/api\/team\/join'[\s\S]{0,600}\.catch\(function \(err\)/.test(embeddedScript),
+        'join rejection is still swallowed (argument-less catch)');
+      // A resolved-but-error body must surface too, not just rejections.
+      assert.ok(/r && r\.error/.test(embeddedScript), 'resolved r.error responses are not surfaced');
+      // Auth failures get actionable copy; other failures show the server error.
+      assert.ok(embeddedScript.includes('Sign in to create a team'), 'auth-failure copy missing (create)');
+      assert.ok(embeddedScript.includes('Sign in to join a team'), 'auth-failure copy missing (join)');
+      // Signed-out empty state gates behind sign-in instead of two dead buttons.
+      const noneSrc = extractFn(embeddedScript, 'teamScreenNone');
+      assert.ok(noneSrc && noneSrc.includes('authenticated'), 'team empty state ignores auth state');
+      assert.ok(noneSrc.includes('data-ts-signin'), 'signed-out empty state has no sign-in CTA');
+      // Happy path intact: a returned team_id is remembered and the screen re-renders.
+      assert.ok(/r\.team_id\) \{ rememberTeam\(r\.team_id\); resetFeedFilterUnions\(\); \}/.test(embeddedScript),
+        'create/join happy path no longer remembers the new team');
+      // The notice clears only on a REAL /api/team payload: renderTeamScreen's
+      // fetch coerces a failure to null and flows through the success handler,
+      // which must not wipe a just-painted failure banner.
+      const tsLoadSrc = extractFn(embeddedScript, 'renderTeamScreen');
+      assert.ok(tsLoadSrc && /if \(tsTeamState\) \{ tsNotice = ''; tsNoticeAuth = false; \}/.test(tsLoadSrc),
+        'notice clear is not gated on a real /api/team payload — a failed reload wipes the banner');
+    });
+    const feedByPath = await (await fetch(`${base}/api/feed?project=${encodeURIComponent(proj1)}&limit=50`)).json();
+    check('Activity project filter: a tracked project path returns that project\'s local entries', () => {
+      const locals = (feedByPath.entries || []).filter(e => e.origin === 'local');
+      assert.ok(locals.length > 0, 'path filter returned no local entries for a project with activity');
+      assert.ok(locals.every(e => e.projectPath === proj1), 'foreign entries leaked through the project filter');
+    });
+    check('Activity project dropdown sends the value the feed filters on (projectId/projectPath) — display name is label only', () => {
+      const barFnSrc = extractFn(embeddedScript, 'feedFilterBarHtml');
+      assert.ok(barFnSrc, 'feedFilterBarHtml not found');
+      assert.ok(!/feedProjectsSeen\[e\.project\]/.test(barFnSrc),
+        'dropdown still keys project options by display name — /api/feed matches projectPath/projectId, so a name value returns "Nothing to show"');
+      assert.ok(/e\.projectId \|\| e\.projectPath/.test(barFnSrc),
+        'dropdown option value is not the id-preferred precedence the .fproj pill and /api/feed use');
+    });
+    check("session page liveness = the feed's STALE_GAP wall-clock rule (an old session renders finished, never 'working now')", () => {
+      const sessSrc = extractFn(embeddedScript, 'sessionPageHtml');
+      assert.ok(sessSrc, 'sessionPageHtml not found');
+      assert.ok(/\(Date\.now\(\) - \(Date\.parse\(t\.ts\) \|\| 0\)\) < STALE_GAP/.test(sessSrc),
+        'session page does not compute live from STALE_GAP');
+      assert.ok(!/wip = !t\.rep/.test(sessSrc), 'old summary-claim liveness (wip = !t.rep) still drives the page');
+      assert.ok(/live\s*\n?\s*\?[\s\S]{0,420}working now/.test(sessSrc), '"working now" badge is not gated on live');
+      assert.ok(/tail = live/.test(sessSrc), "timeline 'working…' tail is not gated on live");
+      assert.ok(sessSrc.includes('session ended'), 'stale-session finished fallback missing');
+      assert.ok(sessSrc.includes('repHarvested'), 'harvested-summary fallback missing for stale sessions');
+      // The 5s poll dedups on a serialized fingerprint; unless liveness is IN
+      // that fingerprint, a page opened while live keeps its "working now"
+      // badge forever once the session crosses STALE_GAP with no new entries.
+      const loadSessSrc = extractFn(embeddedScript, 'loadSession');
+      assert.ok(loadSessSrc && /STALE_GAP[\s\S]{0,200}sessFp|live[\s\S]{0,600}sessFp = fp/.test(loadSessSrc) && /live/.test(loadSessSrc),
+        "loadSession's dedup fingerprint ignores liveness — a stale session never repaints to finished");
+    });
     const bulkFnSrc = extractFn(embeddedScript, 'deleteProjectsBulk');
     check('deleteProjectsBulk helper exists standalone in the embedded script', () => {
       assert.ok(bulkFnSrc, 'deleteProjectsBulk function not found');
