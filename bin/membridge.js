@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 'use strict';
-// Fast path: the Claude Code Stop hook fires on every session stop and must
-// not pay for the full CLI require tree below (server, dashboard, team sync).
-if (process.argv[2] === 'hook' && process.argv[3] === 'stop') {
-  require('../lib/hooks').runStop();
+// Fast path: the Claude Code Stop hook fires on every session stop and the
+// git post-commit hook on every commit — neither may pay for the full CLI
+// require tree below (server, dashboard, team sync).
+if (process.argv[2] === 'hook' && (process.argv[3] === 'stop' || process.argv[3] === 'post-commit')) {
+  const hooks = require('../lib/hooks');
+  (process.argv[3] === 'stop' ? hooks.runStop : hooks.runPostCommit)();
   return;
 }
 const fs = require('fs');
@@ -271,6 +273,124 @@ async function cmdMcp() {
   await require('../lib/mcp').startMcpServer();
 }
 
+// File-level provenance: which AI sessions (yours and teammates') edited a
+// file, newest first. Works from any subdirectory — the file argument is
+// resolved against cwd, then walked up to the nearest tracked project root.
+// The file does not have to exist on disk: a deleted file's history is still
+// a legitimate provenance question.
+// Explicit, human reasons for every line-level fallback — printed before the
+// file-level list so `why <file>:<line>` never dead-ends on a line git can't
+// resolve to a single owning commit.
+const LINE_FALLBACK = {
+  'no-line': 'no valid line number given',
+  'uncommitted': 'that line was last touched by an edit that is not committed yet — not yet attributable',
+  'pending': 'attribution pending',
+  'unmapped': 'that line traces to a commit with no local session attribution',
+  'merge': 'that line traces to a merge commit (no single ask)',
+  'git-unavailable': 'git blame is unavailable here',
+};
+
+function cmdWhy() {
+  const rawArg = args[1];
+  if (!rawArg || rawArg.startsWith('--')) die('Usage: membridge why <file>[:<line>]  (run inside a tracked project)');
+  const state = util.loadState();
+  const config = util.getConfig();
+  const projectResolve = require('../lib/project-resolve');
+  const provenance = require('../lib/provenance');
+  // Split an optional :<line> off first; only the file part is path-resolved.
+  const { file: fileArg, line } = provenance.parseFileLineArg(rawArg);
+  // Shell cwd is realpath'd by node while project keys keep the tool-log
+  // spelling; resolveTrackedKey matches both spellings (it's the same logic
+  // the git post-commit hook uses). The file itself may not exist (a deleted
+  // file's history is still a fair question), so only its parent directory
+  // is realpath'd, and only best-effort.
+  let abs = path.resolve(process.cwd(), fileArg);
+  try {
+    abs = path.join(fs.realpathSync(path.dirname(abs)), path.basename(abs));
+  } catch {}
+  const hit = projectResolve.resolveTrackedKey(state, abs);
+  if (!hit) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
+  // Relativize against hit.root (the spelling the walk matched, an ancestor
+  // of abs) and hand fileProvenance the RELATIVE path — relative paths are
+  // spelling-independent, so the key's own spelling no longer matters.
+  const rel = provenance.normalizeRel(hit.root, abs);
+  if (!rel) die(`${fileArg} is not inside a tracked project — no MemBridge activity recorded there.`);
+  const key = hit.key;
+  const proj = state.projects[key];
+
+  // Rows come pre-redacted from fileProvenance/lineProvenance (both reuse the
+  // same redaction pipeline), so the CLI just formats them.
+  const renderRow = r => {
+    console.log(`${digest.shortDate(r.ts)} · ${r.who} · ${r.tool}${r.live ? '  [working now]' : ''}`);
+    console.log(`  Ask: ${r.ask || '(prompt not shared)'}`);
+    if (r.summary) console.log(`  Did: ${r.summary}`);
+    const notes = [r.decisions, r.gotchas].filter(Boolean).join(' · ');
+    if (notes) console.log(`  Notes: ${notes}`);
+    console.log('');
+  };
+  const renderFileLevel = () => {
+    const rows = provenance.fileProvenance(key, proj, config, rel);
+    if (!rows.length) {
+      console.log(`No recorded AI edits for ${rel} in ${key}.`);
+      return;
+    }
+    console.log(`Why ${rel} — ${rows.length} session(s), newest first:\n`);
+    for (const r of rows) renderRow(r);
+  };
+
+  if (line == null) {
+    renderFileLevel();
+    return;
+  }
+
+  // Line-level: blame → SHA → the commit map → the one owning session, or an
+  // explicit fallback reason followed by the file-level history.
+  const res = provenance.lineProvenance(key, proj, config, rel, line, Date.now());
+  if (res.fallback || !res.session) {
+    console.log(`Line ${rel}:${line} — ${LINE_FALLBACK[res.fallback] || 'no line-level attribution'}; showing file-level history instead.\n`);
+    renderFileLevel();
+    return;
+  }
+  console.log(`Why ${rel}:${line} — commit ${(res.sha || '').slice(0, 10)}:\n`);
+  renderRow(res.session);
+}
+
+// `membridge churn [--session <id>] [--since <Nd>] [--project <path>]` — the
+// diagnostic-only landed-vs-reverted view. There is DELIBERATELY no per-person
+// option: an unknown flag is rejected rather than silently scoped to anyone.
+function cmdChurn() {
+  const churnLib = require('../lib/churn');
+  const projectResolve = require('../lib/project-resolve');
+  const ALLOWED = new Set(['--session', '--since', '--project']);
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('--')) continue;
+    if (!ALLOWED.has(a)) {
+      die(`Unknown option "${a}". churn takes only --session <id>, --since <Nd>, --project <path>. It has no per-person/teammate/author option by design — churn is never compared across people.`);
+    }
+    i++; // skip the flag's value
+  }
+  const state = util.loadState();
+  const projectArg = opt('--project');
+  const base = projectArg ? path.resolve(process.cwd(), projectArg) : process.cwd();
+  let abs = base;
+  try { abs = fs.realpathSync(base); } catch {}
+  // resolveTrackedKey walks up from a file's dirname — probe with a child.
+  const hit = projectResolve.resolveTrackedKey(state, path.join(abs, '_'));
+  if (!hit) die(`${base} is not inside a tracked project — no MemBridge commits recorded there.`);
+  const key = hit.key;
+  const proj = state.projects[key] || { events: [] };
+
+  const sinceGiven = opt('--since');
+  const sinceDays = churnLib.parseSince(sinceGiven);
+  let session = opt('--session');
+  // Bare invocation defaults to the current/most-recent session; an explicit
+  // --since (window) mode spans every locally-attributed commit instead.
+  if (!session && !sinceGiven) session = churnLib.mostRecentSession(proj);
+  const result = churnLib.churn(key, { session: session || null, sinceDays, now: Date.now() });
+  console.log(churnLib.renderChurn(result, { session: session || null, sinceDays }));
+}
+
 // ---------------------------------------------------------------------------
 // Team sync commands (Supabase backend, see supabase/schema.sql + README)
 // ---------------------------------------------------------------------------
@@ -488,7 +608,8 @@ async function cmdTeam() {
 function cmdHook() {
   const sub = args[1];
   if (sub === 'stop') return hooks.runStop();
-  die('Usage: membridge hook stop  (invoked by the Claude Code Stop hook — see `membridge setup-hooks`)');
+  if (sub === 'post-commit') return hooks.runPostCommit();
+  die('Usage: membridge hook <stop|post-commit>  (invoked by the installed hooks — see `membridge setup-hooks`)');
 }
 
 function cmdHelp() {
@@ -513,11 +634,21 @@ Usage: membridge <command>
   daemon              run in the foreground (used internally / by services)
   help                this text
 
+Provenance (why a file/line looks the way it does — see README):
+  why <file>[:<line>] which AI sessions edited this file, newest first; add
+                      :<line> for the one session behind a single line
+  churn [--session <id>] [--since <Nd>] [--project <path>]
+                      diagnostic-only: what fraction of a session's committed
+                      lines still survive in HEAD (a rework health signal —
+                      never a target, never compared across people)
+
 Distillation (agent-written session summaries — see README):
-  setup-hooks         add a Claude Code Stop hook: the agent that did the work
-                      writes a 2-3 line summary before each session ends
-  remove-hooks        remove the MemBridge Stop hook (your other hooks are kept)
-  hook stop           the hook itself (invoked by Claude Code, not by you)
+  setup-hooks         add a Claude Code Stop hook (agent-written session
+                      summaries) AND a git post-commit hook in every tracked
+                      repo (instant commit->session provenance capture)
+  remove-hooks        remove the MemBridge hooks (your other hooks are kept)
+  hook stop           the Stop hook itself (invoked by Claude Code, not by you)
+  hook post-commit    the git hook itself (invoked by git, not by you)
 
 MCP (expose project memory, read-only, to MCP-capable clients — Claude
 Desktop, Cursor, Cowork, ...; see README):
@@ -549,6 +680,8 @@ Docs:   https://github.com/mmelika/membridge#readme`);
 const commands = {
   sync: cmdSync,
   scan: cmdScan,
+  why: cmdWhy,
+  churn: cmdChurn,
   daemon: cmdDaemon,
   start: cmdStart,
   stop: cmdStop,

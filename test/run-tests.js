@@ -17,7 +17,7 @@ process.env.MEMBRIDGE_INTERVAL = '3600'; // daemon ticks once at boot, then stay
 delete process.env.ANTHROPIC_API_KEY; // a real key on the dev machine must not leak into settings tests
 
 const util = require('../lib/util');
-const { syncOnce } = require('../lib/scan');
+const { syncOnce, filterTrackedSessions } = require('../lib/scan');
 const digest = require('../lib/digest');
 const { startServer, teamPayload, teamProjectsPayload, statusPayload, feedPayload, projectDetail, planPayload } = require('../lib/server');
 const teamsync = require('../lib/teamsync');
@@ -58,6 +58,10 @@ const count = (hay, needle) => hay.split(needle).length - 1;
 
 function setupFixtures() {
   for (const p of [proj1, proj2, proj3]) fs.mkdirSync(p, { recursive: true });
+  // The ingestion gate only keeps sessions landing in an already-tracked root.
+  // proj1 is the tracked project; proj2/proj3 stay untracked on purpose (their
+  // exclusion/marker tests assert no .membridge is ever created for them).
+  fs.mkdirSync(path.join(proj1, '.membridge'), { recursive: true });
   fs.writeFileSync(path.join(proj1, 'CLAUDE.md'), '# Shop app\n\nOriginal notes that must survive.\n');
   fs.mkdirSync(path.join(proj1, 'src'), { recursive: true });
   fs.writeFileSync(path.join(proj1, 'src', 'login.js'), 'export const login = () => {};\n');
@@ -143,7 +147,16 @@ async function main() {
   const agentsMd = () => read(path.join(proj1, 'AGENTS.md'));
 
   check('fresh sync finds events from all three tools', () => {
-    assert.ok(r1.newEvents >= 6, `expected >=6 events, got ${r1.newEvents}`);
+    // proj1's five events survive the ingestion gate; proj2/proj3 sessions are
+    // dropped (untracked cwds) and asserted absent in the gate section below.
+    assert.ok(r1.newEvents >= 5, `expected >=5 events, got ${r1.newEvents}`);
+  });
+  check('untracked fixture cwds never become projects', () => {
+    const st = util.loadState();
+    for (const p of [proj2, proj3]) {
+      assert.ok(!Object.keys(st.projects || {}).some(k => util.normPath(k) === util.normPath(p)),
+        `${p} should not have been auto-created`);
+    }
   });
   check('CLAUDE.md gets the memory block and keeps original content', () => {
     const md = claudeMd();
@@ -187,6 +200,194 @@ async function main() {
     assert.strictEqual(withFile.ts, '2026-07-09T10:01:00.000Z', 'edit attached to wrong ask');
     const banned = db.entries.find(e => e.ask.includes('sk-test1234567890abcdef'));
     assert.ok(!banned, 'secret leaked into memory DB');
+  });
+  // --- 1b. capture provenance: the codex adapter must never mislabel foreign
+  // files. Codex Desktop's history importer writes rollout-SHAPED files for
+  // OTHER tools' sessions (history_mode "legacy", sometimes originator
+  // "Claude Cowork") under ~/.codex/sessions — those and any Claude-Code-shaped
+  // JSONL in the codex root must be skipped, not stamped 'Codex'. ---
+  check('codex: an imported legacy rollout (history_mode "legacy" / Cowork originator) is skipped, never stamped Codex', () => {
+    const fsA = {};
+    const evsA = codexAdapter.extractEvents([
+      { timestamp: '2026-07-18T23:08:43.825Z', type: 'session_meta', payload: { id: 'imp-1', cwd: proj1, originator: 'Codex Desktop', history_mode: 'legacy' } },
+      { timestamp: '2026-07-18T23:08:43.831Z', type: 'event_msg', payload: { type: 'user_message', message: 'how do i get to it fast' } },
+    ], fsA);
+    assert.deepStrictEqual(evsA, [], 'imported legacy rollout produced Codex events');
+    assert.ok(fsA.foreign, 'imported file not marked foreign');
+    const fsB = {};
+    const evsB = codexAdapter.extractEvents([
+      { timestamp: '2026-07-18T23:08:47.000Z', type: 'session_meta', payload: { id: 'imp-2', cwd: proj1, originator: 'Claude Cowork' } },
+      { timestamp: '2026-07-18T23:08:47.100Z', type: 'event_msg', payload: { type: 'user_message', message: 'morning email summary please' } },
+    ], fsB);
+    assert.deepStrictEqual(evsB, [], 'Cowork-originated rollout produced Codex events');
+    assert.ok(fsB.foreign, 'Cowork file not marked foreign');
+    // once foreign, later incremental batches stay skipped even with codex-ish lines
+    const evsA2 = codexAdapter.extractEvents([
+      { timestamp: '2026-07-18T23:09:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'try again', cwd: proj1 } },
+    ], fsA);
+    assert.deepStrictEqual(evsA2, [], 'foreign file resumed emitting on a later batch');
+  });
+  check('codex: a Claude-Code-shaped transcript in the codex root is skipped (no session_meta opener)', () => {
+    const fsC = {};
+    const evsC = codexAdapter.extractEvents([
+      { type: 'user', message: { role: 'user', content: 'Build the login page with OAuth' }, cwd: proj1, timestamp: '2026-07-10T10:00:00.000Z' },
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(120) }] }, cwd: proj1, timestamp: '2026-07-10T10:01:00.000Z' },
+    ], fsC);
+    assert.deepStrictEqual(evsC, [], 'Claude-shaped transcript produced Codex events');
+    assert.ok(fsC.foreign, 'Claude-shaped file not marked foreign');
+  });
+  check('codex: a genuine rollout still ingests as Codex (no regression), and the verdict persists in fileState', () => {
+    const fsD = {};
+    const evsD = codexAdapter.extractEvents([
+      { timestamp: '2026-07-09T10:05:00.000Z', type: 'session_meta', payload: { id: 'gen-1', cwd: proj1, originator: 'codex_cli_rs' } },
+      { timestamp: '2026-07-09T10:06:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'Add unit tests for the login form' } },
+    ], fsD);
+    assert.strictEqual(evsD.length, 1, `expected 1 event, got ${evsD.length}`);
+    assert.strictEqual(evsD[0].source, 'Codex');
+    assert.strictEqual(evsD[0].project, proj1);
+    assert.ok(fsD.validated, 'genuine file not stamped validated');
+    // incremental follow-up batch (no session_meta) keeps working off the verdict
+    const evsD2 = codexAdapter.extractEvents([
+      { timestamp: '2026-07-09T10:07:00.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'Now wire the submit button' } },
+    ], fsD);
+    assert.strictEqual(evsD2.length, 1, 'validated file stopped ingesting on incremental read');
+  });
+  check('codex cleanup: purges mislabeled sessions + resets offsets, leaves genuine and undecidable files alone', () => {
+    const scanMod = require('../lib/scan');
+    const foreignFile = '/fake/.codex/sessions/2026/07/18/rollout-fake-import.jsonl';
+    const genuineFile = '/fake/.codex/sessions/2026/06/01/rollout-real.jsonl';
+    const missingFile = '/fake/.codex/sessions/2026/05/01/rollout-gone.jsonl';
+    const st = {
+      files: {
+        [foreignFile]: { offset: 999, adapter: 'codex', data: { cwd: proj1 } },
+        [genuineFile]: { offset: 500, adapter: 'codex', data: { cwd: '/other/proj' } },
+        [missingFile]: { offset: 42, adapter: 'codex', data: {} },
+        '/fake/claude/x.jsonl': { offset: 5, adapter: 'claude-code', data: {} },
+      },
+      projects: {
+        [proj1]: { events: [
+          { ts: '2026-07-18T23:08:43.831Z', project: proj1, source: 'Codex', kind: 'prompt', text: 'mislabeled', session: 'rollout-fake-import' },
+          { ts: '2026-07-18T23:08:43.900Z', project: proj1, source: 'Codex', kind: 'prompt', text: 'unjudgeable', session: 'rollout-gone' },
+          { ts: '2026-07-09T10:00:00.000Z', project: proj1, source: 'Claude Code', kind: 'prompt', text: 'real claude', session: 'sess-c' },
+        ] },
+        '/other/proj': { events: [
+          { ts: '2026-06-01T09:00:00.000Z', project: '/other/proj', source: 'Codex', kind: 'prompt', text: 'genuine codex', session: 'rollout-real' },
+        ] },
+      },
+    };
+    const purged = scanMod.cleanupCodexMislabels(st, { readFirstEntry: f =>
+      f === foreignFile ? { type: 'session_meta', payload: { id: 'i', cwd: proj1, history_mode: 'legacy' } }
+      : f === genuineFile ? { type: 'session_meta', payload: { id: 'g', cwd: '/other/proj' } }
+      : null });
+    assert.deepStrictEqual(purged, ['rollout-fake-import'], 'purge set is not exactly the foreign file');
+    assert.ok(!st.files[foreignFile], 'foreign file offsets not reset');
+    assert.ok(st.files[genuineFile] && st.files[genuineFile].data.validated, 'genuine file not stamped validated');
+    assert.strictEqual(st.files[genuineFile].offset, 500, 'genuine file offset must not reset');
+    assert.ok(st.files[missingFile], 'undecidable (missing) file must be left alone');
+    assert.deepStrictEqual(st.projects[proj1].events.map(e => e.session), ['rollout-gone', 'sess-c'],
+      'purge must remove exactly the foreign-file Codex events');
+    assert.strictEqual(st.projects['/other/proj'].events.length, 1, 'genuine Codex session on another project was deleted');
+    assert.ok(st.projects[proj1].dirty, 'purged project not marked dirty for re-render');
+    assert.ok(!st.projects['/other/proj'].dirty, 'untouched project must not be dirtied');
+    // second pass is a no-op for decided recs: even a reader that now calls
+    // everything legacy must not re-judge the validated genuine file. The
+    // still-missing file stays undecided (it would be judged if it appeared —
+    // deliberate self-healing).
+    const purged2 = scanMod.cleanupCodexMislabels(st, { readFirstEntry: f =>
+      f === missingFile ? null : { type: 'session_meta', payload: { id: 'z', history_mode: 'legacy' } } });
+    assert.deepStrictEqual(purged2, [], 'cleanup re-judged already-decided files');
+  });
+  // ACCEPTANCE e2e: replicate the real damage (imported rollout on disk, its
+  // events already in state as 'Codex') — after a sync, the project has ZERO
+  // Codex sessions from imported files, genuine Codex events survive, and a
+  // re-scan does not re-introduce the mislabels.
+  {
+    const impDir = path.join(process.env.MEMBRIDGE_CODEX_DIR, '2026', '07', '18');
+    fs.mkdirSync(impDir, { recursive: true });
+    const impFile = path.join(impDir, 'rollout-import-e2e.jsonl');
+    fs.writeFileSync(impFile, jsonl([
+      { timestamp: '2026-07-18T23:08:43.825Z', type: 'session_meta', payload: { id: 'imp-e2e', cwd: proj1, originator: 'Codex Desktop', history_mode: 'legacy' } },
+      { timestamp: '2026-07-18T23:08:43.831Z', type: 'event_msg', payload: { type: 'user_message', message: 'i had an idea as another feature for membridge' } },
+    ]));
+    const stSeed = util.loadState();
+    const p1key = Object.keys(stSeed.projects || {}).find(k => util.normPath(k) === util.normPath(proj1));
+    assert.ok(p1key, 'proj1 missing from state before acceptance seed');
+    // pre-fix damage: file fully consumed by the old adapter, events stamped Codex
+    stSeed.files[impFile] = { offset: fs.statSync(impFile).size, adapter: 'codex', data: { cwd: proj1 } };
+    stSeed.projects[p1key].events.push(
+      { ts: '2026-07-18T23:08:43.831Z', project: p1key, source: 'Codex', kind: 'prompt', text: 'i had an idea as another feature for membridge', session: 'rollout-import-e2e' });
+    util.saveState(stSeed);
+    syncOnce();
+    check('ACCEPTANCE: after fix + cleanup + re-scan the project has zero imported-Codex sessions, genuine Codex intact', () => {
+      const st = util.loadState();
+      const evs = st.projects[p1key].events || [];
+      assert.ok(!evs.some(e => e.source === 'Codex' && e.session === 'rollout-import-e2e'),
+        'mislabeled imported session still present after cleanup');
+      assert.ok(evs.some(e => e.source === 'Codex' && e.session === 'rollout-1'),
+        'genuine Codex session was wrongly purged');
+      assert.ok(!st.files[impFile] || (st.files[impFile].data || {}).foreign,
+        'imported file is neither reset nor marked foreign');
+    });
+    syncOnce(); // re-scan: the reset offsets re-read the import file from 0
+    check('ACCEPTANCE: a re-scan does not re-introduce the mislabeled sessions as Codex', () => {
+      const st = util.loadState();
+      const evs = st.projects[p1key].events || [];
+      assert.ok(!evs.some(e => e.source === 'Codex' && e.session === 'rollout-import-e2e'),
+        're-scan re-ingested the imported file as Codex');
+      assert.ok((st.files[impFile] && st.files[impFile].data || {}).foreign,
+        'rescanned import file not marked foreign in fileState');
+    });
+  }
+  // A project whose ONLY events were mislabeled (the real outer-dir case) is
+  // purged to empty — its already-injected context block must still be
+  // REWRITTEN clean, not skipped by the events-empty render guard, and dirty
+  // must clear rather than leak true forever.
+  {
+    const projX = path.join(ROOT, 'projects', 'outer-shell');
+    fs.mkdirSync(path.join(projX, '.membridge'), { recursive: true });
+    fs.writeFileSync(path.join(projX, 'CLAUDE.md'),
+      '# Outer shell\n\n' + digest.BEGIN + '\n- 2026-07-18 23:08 · Codex: polluted mislabeled ask\n' + digest.END + '\n');
+    const impDir2 = path.join(process.env.MEMBRIDGE_CODEX_DIR, '2026', '07', '18');
+    const impFile2 = path.join(impDir2, 'rollout-import-outer.jsonl');
+    fs.writeFileSync(impFile2, jsonl([
+      { timestamp: '2026-07-18T23:08:44.000Z', type: 'session_meta', payload: { id: 'imp-outer', cwd: projX, originator: 'Codex Desktop', history_mode: 'legacy' } },
+      { timestamp: '2026-07-18T23:08:44.100Z', type: 'event_msg', payload: { type: 'user_message', message: 'polluted mislabeled ask' } },
+    ]));
+    const stSeed2 = util.loadState();
+    stSeed2.files[impFile2] = { offset: fs.statSync(impFile2).size, adapter: 'codex', data: { cwd: projX } };
+    stSeed2.projects[projX] = { events: [
+      { ts: '2026-07-18T23:08:44.100Z', project: projX, source: 'Codex', kind: 'prompt', text: 'polluted mislabeled ask', session: 'rollout-import-outer' },
+    ] };
+    util.saveState(stSeed2);
+    syncOnce();
+    check('cleanup: a project purged to EMPTY still gets its polluted context block rewritten clean, dirty cleared', () => {
+      const st = util.loadState();
+      const key = Object.keys(st.projects).find(k => util.normPath(k) === util.normPath(projX));
+      assert.ok(key, 'outer-shell project lost from state');
+      assert.strictEqual((st.projects[key].events || []).length, 0, 'mislabeled event not purged');
+      const md = read(path.join(projX, 'CLAUDE.md'));
+      assert.ok(md.includes('# Outer shell'), 'original content lost');
+      assert.ok(md.includes(digest.BEGIN), 'block markers lost');
+      assert.ok(!md.includes('polluted mislabeled ask'), 'purged Codex ask still injected in CLAUDE.md');
+      assert.ok(!st.projects[key].dirty, 'dirty flag leaked true on the purged-to-empty project');
+    });
+  }
+  check('cleanup default reader: a blank first line does not stall the verdict (file still judged from its first real line)', () => {
+    const scanMod = require('../lib/scan');
+    const blankDir = path.join(ROOT, 'codex-blankline');
+    fs.mkdirSync(blankDir, { recursive: true });
+    const blankFile = path.join(blankDir, 'rollout-blank-first.jsonl');
+    fs.writeFileSync(blankFile,
+      '\n' + JSON.stringify({ timestamp: '2026-07-18T23:08:45.000Z', type: 'session_meta', payload: { id: 'b1', cwd: proj1, history_mode: 'legacy' } }) + '\n');
+    const st = {
+      files: { [blankFile]: { offset: 10, adapter: 'codex', data: {} } },
+      projects: { [proj1]: { events: [
+        { ts: '2026-07-18T23:08:45.000Z', project: proj1, source: 'Codex', kind: 'prompt', text: 'x', session: 'rollout-blank-first' },
+      ] } },
+    };
+    const purged = scanMod.cleanupCodexMislabels(st); // default disk reader
+    assert.deepStrictEqual(purged, ['rollout-blank-first'], 'blank-first-line import file was not judged');
+    assert.strictEqual(st.projects[proj1].events.length, 0, 'its mislabeled event survived');
   });
   check('projectStats: week-windowed sessions, distinct files, deduped open todos', () => {
     const now = Date.parse('2026-07-14T12:00:00.000Z');
@@ -267,6 +468,49 @@ async function main() {
     // rename dest present in status map (not the compound "old.js -> src/new.js" key)
     assert.strictEqual(out[0].status, 'edited');
     assert.strictEqual(out[0].add, null); // rename counts are best-effort null
+  });
+  check('changes: defaultRunGit hardens env (no terminal prompt, no optional locks)', () => {
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'membridge-stubgit-'));
+    const stubGit = path.join(stubDir, 'git');
+    fs.writeFileSync(stubGit, '#!/bin/sh\necho "$GIT_TERMINAL_PROMPT:$GIT_OPTIONAL_LOCKS"\n');
+    fs.chmodSync(stubGit, 0o755);
+    const prevPath = process.env.PATH;
+    process.env.PATH = stubDir + path.delimiter + prevPath;
+    try {
+      const out = changesLib.defaultRunGit(stubDir)(['status']);
+      assert.strictEqual(out, '0:0\n', `git subprocess env not hardened: ${JSON.stringify(out)}`);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+  check('changes: defaultRunGit still throws on nonzero exit (contract preserved for callers)', () => {
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'membridge-stubgit-'));
+    const stubGit = path.join(stubDir, 'git');
+    fs.writeFileSync(stubGit, '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(stubGit, 0o755);
+    const prevPath = process.env.PATH;
+    process.env.PATH = stubDir + path.delimiter + prevPath;
+    try {
+      assert.throws(() => changesLib.defaultRunGit(stubDir)(['status']), 'nonzero exit should still throw');
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+  check('changes: defaultRunGit is bounded — a blocked git is killed within the timeout, not hung', () => {
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'membridge-stubgit-'));
+    const stubGit = path.join(stubDir, 'git');
+    fs.writeFileSync(stubGit, '#!/bin/sh\nsleep 30\n'); // simulates a credential prompt / lock wait
+    fs.chmodSync(stubGit, 0o755);
+    const prevPath = process.env.PATH;
+    process.env.PATH = stubDir + path.delimiter + prevPath;
+    try {
+      const start = Date.now();
+      assert.throws(() => changesLib.defaultRunGit(stubDir)(['status']), /ETIMEDOUT|SIGKILL/);
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 9000, `defaultRunGit did not honor the 5s timeout (took ${elapsed}ms)`);
+    } finally {
+      process.env.PATH = prevPath;
+    }
   });
   check('projectDetail: a teammate touch drives team-aware lastTouched + activeLabel + stats', () => {
     const state = util.loadState();
@@ -383,7 +627,11 @@ async function main() {
   });
 
   // Simulate a pre-v2 state file: stripping `version` must trigger a full
-  // rescan of every transcript from byte 0 on the next sync.
+  // rescan of every transcript from byte 0 on the next sync. The remove step
+  // above untracked proj1 on disk, and a discarded state has no project keys,
+  // so re-track proj1 first (as the dashboard "add" would) — the ingestion
+  // gate only rebuilds projects that are still tracked.
+  fs.mkdirSync(path.join(proj1, '.membridge'), { recursive: true });
   const v1State = JSON.parse(read(util.statePath()));
   delete v1State.version;
   fs.writeFileSync(util.statePath(), JSON.stringify(v1State, null, 2));
@@ -434,7 +682,7 @@ async function main() {
 
   // --- 4b. extra targets: opt-in injection into Gemini/Cursor/Windsurf/Copilot ---
   const projX = path.join(ROOT, 'projects', 'multi-tool-app');
-  fs.mkdirSync(projX, { recursive: true });
+  fs.mkdirSync(path.join(projX, '.membridge'), { recursive: true }); // tracked, so the gate ingests it
   const xtDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-multi-tool-app');
   fs.mkdirSync(xtDir, { recursive: true });
   fs.writeFileSync(path.join(xtDir, 'sessX.jsonl'), jsonl([
@@ -638,6 +886,11 @@ async function main() {
     check('dashboard page has the project view', () => {
       assert.ok(pageHtml.includes('view-project'), 'project view missing');
     });
+    check('dashboard ⋯ project menu dismisses on outside click and Escape', () => {
+      assert.ok(embeddedScript.includes('data-px-menu-pop'), 'menu popover marker missing');
+      assert.ok(embeddedScript.includes("closest('[data-px-menu-pop]')"), 'outside-click dismiss check missing');
+      assert.ok(/Escape[\s\S]{0,600}pxMenuId = null/.test(embeddedScript), 'Escape-key menu dismiss missing');
+    });
     check('dashboard page has the Settings screen with BYOK', () => {
       assert.ok(pageHtml.includes('view-settings'), 'settings view missing');
       assert.ok(pageHtml.includes('id="settingsRoot"'), 'settings host missing');
@@ -646,6 +899,240 @@ async function main() {
       assert.ok(pageHtml.includes('Bring your own key'), 'BYOK copy missing');
       assert.ok(pageHtml.includes('Tools detected: '), 'tools-detected line missing');
     });
+    check('dashboard page has multi-select + bulk delete for local watched projects', () => {
+      assert.ok(embeddedScript.includes('data-bulk-check='), 'per-row bulk checkbox missing');
+      assert.ok(embeddedScript.includes('data-bulk-selectall'), '"select all local" control missing');
+      assert.ok(embeddedScript.includes('data-bulk-delete'), 'delete-selected affordance missing');
+      assert.ok(embeddedScript.includes("This can't be undone."), 'bulk-delete confirm copy missing');
+      // Local-only gating: the checkbox markup must be emitted from a branch keyed
+      // off "not a team project" (the same field the shared/local-only badge
+      // uses) so shared rows never get a bulk checkbox.
+      assert.ok(/isLocal\s*=\s*!p\.team/.test(embeddedScript), 'checkbox gating is not keyed off p.team (local vs shared)');
+    });
+    // deleteProjectsBulk is a pure, injected-fetch helper (house style: offline
+    // testable, no DOM). Extract it from the embedded script by brace-matching
+    // and exercise it directly, mirroring how the rest of the app is tested.
+    function extractFn(src, name) {
+      const startIdx = src.indexOf('function ' + name + '(');
+      if (startIdx === -1) return null;
+      let i = src.indexOf('{', startIdx);
+      let depth = 0, end = i;
+      for (; end < src.length; end++) {
+        if (src[end] === '{') depth++;
+        else if (src[end] === '}') { depth--; if (depth === 0) { end++; break; } }
+      }
+      return src.slice(startIdx, end);
+    }
+    // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
+    // so these are source-level presence/shape assertions against the served
+    // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
+    check('dashboard embedded script never calls window.prompt/confirm/alert (Electron has no window.prompt — it silently no-ops)', () => {
+      assert.ok(!embeddedScript.includes('window.prompt('), 'window.prompt( still present');
+      assert.ok(!embeddedScript.includes('window.confirm('), 'window.confirm( still present');
+      assert.ok(!embeddedScript.includes('window.alert('), 'window.alert( still present');
+      assert.ok(!/(^|[^.\w])prompt\(/.test(embeddedScript), 'a bare prompt( call is still present');
+      assert.ok(!/(^|[^.\w])confirm\(/.test(embeddedScript), 'a bare confirm( call is still present');
+      assert.ok(!/(^|[^.\w])alert\(/.test(embeddedScript), 'a bare alert( call is still present');
+    });
+    check('dashboard has a reusable in-app prompt modal joined to the overlay + Escape idiom', () => {
+      assert.ok(pageHtml.includes('id="promptOverlay"'), 'prompt overlay markup missing');
+      assert.ok(pageHtml.includes('id="promptInput"'), 'prompt input missing');
+      assert.ok(pageHtml.includes('id="promptConfirm"'), 'prompt confirm button missing');
+      assert.ok(embeddedScript.includes('function openPrompt('), 'openPrompt helper missing');
+      assert.ok(/promptInput[\s\S]{0,400}key === 'Enter'/.test(embeddedScript), 'Enter-confirms wiring missing');
+      assert.ok(/hadModal[\s\S]{0,400}promptOverlay/.test(embeddedScript), 'prompt overlay not joined to the Escape hadModal chain');
+      assert.ok(/window\.addEventListener\('keydown'[\s\S]{0,900}closePrompt\(\)/.test(embeddedScript), 'Escape does not close the prompt overlay');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/create'"), 'create still runs the same teamRequest flow');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/join'"), 'join still runs the same teamRequest flow');
+      assert.ok(embeddedScript.includes("teamRequest('/api/team/rename'"), 'rename still runs the same teamRequest flow');
+    });
+    check('feedFilterBarHtml renders a stable, never-shrinking union of tools/projects instead of deriving from filtered entries', () => {
+      const barFnSrc = extractFn(embeddedScript, 'feedFilterBarHtml');
+      assert.ok(barFnSrc, 'feedFilterBarHtml not found');
+      assert.ok(embeddedScript.includes('feedToolsSeen') && embeddedScript.includes('feedProjectsSeen'),
+        'stable-superset accumulator vars missing');
+      assert.ok(barFnSrc.includes('feedToolsSeen') && barFnSrc.includes('feedProjectsSeen'),
+        'feedFilterBarHtml does not read from the stable-superset accumulators');
+      // the old collapsing shape built a fresh tools/projects map off entries.forEach every render
+      assert.ok(!/entries\.forEach[\s\S]{0,200}tools\[e\.source\]/.test(barFnSrc),
+        'feedFilterBarHtml still derives tool options from its entries argument the old collapsing way');
+    });
+    check('Activity back control clears filters and re-renders Activity in place (no longer exits to the Projects index)', () => {
+      assert.ok(!embeddedScript.includes('← Catch-Up'), 'old "← Catch-Up" label still present');
+      assert.ok(embeddedScript.includes('← All activity'), 'new honest back-link label missing');
+      assert.ok(/data-feed="back"[\s\S]{0,600}feedFilters\s*=\s*\{\s*author:\s*null,\s*project:\s*null,\s*source:\s*null\s*\}/.test(embeddedScript),
+        'back handler does not clear feedFilters to {author:null,project:null,source:null}');
+    });
+    check('Team empty-state card reuses the header brand mark above "No team yet"', () => {
+      const noneFnSrc = extractFn(embeddedScript, 'teamScreenNone');
+      assert.ok(noneFnSrc, 'teamScreenNone not found');
+      assert.ok(noneFnSrc.includes('brand-mark'), 'brand-mark asset missing from the team empty state');
+      assert.ok(noneFnSrc.includes('No team yet'), 'heading missing');
+      assert.ok(noneFnSrc.indexOf('brand-mark') < noneFnSrc.indexOf('No team yet'), 'brand mark is not positioned above the heading');
+    });
+    check('a reusable slow-load spinner arms at 3s and is wired into the three view loaders', () => {
+      assert.ok(/SPINNER_DELAY_MS\s*=\s*3000/.test(embeddedScript), '3s spinner delay constant missing');
+      assert.ok(embeddedScript.includes('function armSpinner('), 'armSpinner helper missing');
+      assert.ok(embeddedScript.includes('function clearSpinner('), 'clearSpinner helper missing');
+      ['loadProjectsIndex', 'loadFeed', 'renderTeamScreen'].forEach((name) => {
+        const src = extractFn(embeddedScript, name);
+        assert.ok(src, `${name} not found`);
+        assert.ok(/armSpinner\(/.test(src), `${name} does not arm the spinner`);
+        assert.ok(/clearSpinner\(/.test(src), `${name} does not clear the spinner`);
+      });
+    });
+    // Fix round: the spinner's 3s paint replaces host content, which the
+    // fp-dedup guards (fp === feedFp/pxFp && host.firstChild → skip render)
+    // cannot see — a slow-but-unchanged poll tick stranded the spinner, and
+    // the paint could wipe an open ⋯ menu the dedup branch protects.
+    check('spinner paint is observable: fp-dedup skips must re-render a painted-over host, and an open ⋯ menu blocks the paint', () => {
+      assert.ok(/function clearSpinner\(viewKey, token\)[\s\S]{0,400}return !!spinnerPainted\[viewKey\]/.test(embeddedScript),
+        'clearSpinner does not report whether the timer already painted');
+      assert.ok(embeddedScript.includes('function spinnerRendered('),
+        'spinnerRendered reset helper missing (painted debt must clear only on a real render)');
+      const feedSrc = extractFn(embeddedScript, 'loadFeed');
+      assert.ok(/fp === feedFp && host\.firstChild && !spinnerPaintedOver/.test(feedSrc),
+        "loadFeed's fp-dedup skip does not consult the painted flag");
+      const pxSrc = extractFn(embeddedScript, 'loadProjectsIndex');
+      const pxGuards = pxSrc.match(/fp === pxFp && host\.firstChild && !spinnerPaintedOver/g) || [];
+      assert.ok(pxGuards.length >= 2,
+        `loadProjectsIndex's fp-dedup skips must both consult the painted flag (found ${pxGuards.length})`);
+      // menu guard: the paint path must skip when the projects ⋯ menu/confirm is open
+      assert.ok(/skipPaint && skipPaint\(\)/.test(embeddedScript), 'paint path has no skip-paint guard');
+      assert.ok(/armSpinner\('projects'[\s\S]{0,140}pxMenuId \|\| pxConfirmId/.test(pxSrc),
+        'projects loader does not pass the open-menu guard to armSpinner');
+    });
+    check('switching/joining/creating/leaving a team resets the feed filter unions (stale old-team options cannot persist)', () => {
+      assert.ok(embeddedScript.includes('function resetFeedFilterUnions('), 'union reset helper missing');
+      assert.ok(/data-ts-switchto[\s\S]{0,220}resetFeedFilterUnions\(\)/.test(embeddedScript),
+        'switch-to branch does not reset the unions');
+      assert.ok(/\/api\/team\/join'[\s\S]{0,260}resetFeedFilterUnions\(\)/.test(embeddedScript),
+        'join flow does not reset the unions');
+    });
+    // ---- Round 3 Electron-runtime UI bugs: team create/join failing silently,
+    // the Activity project filter matching on display name, and the session
+    // page's old no-summary liveness rule. Same contract as the rounds above:
+    // browser behavior is pinned by source-shape assertions (no DOM runtime in
+    // this suite); the server half of each contract is exercised for real. ----
+    const noAuthCreate = await fetch(`${base}/api/team/create`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'ghost-team' }),
+    });
+    const noAuthCreateBody = await noAuthCreate.json().catch(() => ({}));
+    const noAuthJoin = await fetch(`${base}/api/team/join`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ inviteCode: 'no-such-code' }),
+    });
+    const noAuthJoinBody = await noAuthJoin.json().catch(() => ({}));
+    check('unauthenticated /api/team/create + /join answer a non-2xx with an error body the UI can surface', () => {
+      assert.ok(!noAuthCreate.ok, 'unauthenticated create must not be 2xx');
+      assert.ok(noAuthCreateBody.error, 'create error body is empty');
+      assert.ok(!noAuthJoin.ok, 'unauthenticated join must not be 2xx');
+      assert.ok(noAuthJoinBody.error, 'join error body is empty');
+    });
+    check('Team screen surfaces create/join failures — auth-aware notice + sign-in gate, never a silent no-op', () => {
+      assert.ok(embeddedScript.includes('function tsNoticeHtml('), 'Team screen notice helper missing');
+      const tsViewSrc = extractFn(embeddedScript, 'renderTeamScreenView');
+      assert.ok(tsViewSrc && tsViewSrc.includes('tsNoticeHtml()'), 'Team screen view does not render the notice');
+      // Rejections must reach the notice — the old handlers swallowed them with
+      // an argument-less .catch(function () { setPill(false); }).
+      assert.ok(/\/api\/team\/create'[\s\S]{0,600}\.catch\(function \(err\)/.test(embeddedScript),
+        'create rejection is still swallowed (argument-less catch)');
+      assert.ok(/\/api\/team\/join'[\s\S]{0,600}\.catch\(function \(err\)/.test(embeddedScript),
+        'join rejection is still swallowed (argument-less catch)');
+      // A resolved-but-error body must surface too, not just rejections.
+      assert.ok(/r && r\.error/.test(embeddedScript), 'resolved r.error responses are not surfaced');
+      // Auth failures get actionable copy; other failures show the server error.
+      assert.ok(embeddedScript.includes('Sign in to create a team'), 'auth-failure copy missing (create)');
+      assert.ok(embeddedScript.includes('Sign in to join a team'), 'auth-failure copy missing (join)');
+      // Signed-out empty state gates behind sign-in instead of two dead buttons.
+      const noneSrc = extractFn(embeddedScript, 'teamScreenNone');
+      assert.ok(noneSrc && noneSrc.includes('authenticated'), 'team empty state ignores auth state');
+      assert.ok(noneSrc.includes('data-ts-signin'), 'signed-out empty state has no sign-in CTA');
+      // Happy path intact: a returned team_id is remembered and the screen re-renders.
+      assert.ok(/r\.team_id\) \{ rememberTeam\(r\.team_id\); resetFeedFilterUnions\(\); \}/.test(embeddedScript),
+        'create/join happy path no longer remembers the new team');
+      // The notice clears only on a REAL /api/team payload: renderTeamScreen's
+      // fetch coerces a failure to null and flows through the success handler,
+      // which must not wipe a just-painted failure banner.
+      const tsLoadSrc = extractFn(embeddedScript, 'renderTeamScreen');
+      assert.ok(tsLoadSrc && /if \(tsTeamState\) \{ tsNotice = ''; tsNoticeAuth = false; \}/.test(tsLoadSrc),
+        'notice clear is not gated on a real /api/team payload — a failed reload wipes the banner');
+    });
+    const feedByPath = await (await fetch(`${base}/api/feed?project=${encodeURIComponent(proj1)}&limit=50`)).json();
+    check('Activity project filter: a tracked project path returns that project\'s local entries', () => {
+      const locals = (feedByPath.entries || []).filter(e => e.origin === 'local');
+      assert.ok(locals.length > 0, 'path filter returned no local entries for a project with activity');
+      assert.ok(locals.every(e => e.projectPath === proj1), 'foreign entries leaked through the project filter');
+    });
+    check('Activity project dropdown sends the value the feed filters on (projectId/projectPath) — display name is label only', () => {
+      const barFnSrc = extractFn(embeddedScript, 'feedFilterBarHtml');
+      assert.ok(barFnSrc, 'feedFilterBarHtml not found');
+      assert.ok(!/feedProjectsSeen\[e\.project\]/.test(barFnSrc),
+        'dropdown still keys project options by display name — /api/feed matches projectPath/projectId, so a name value returns "Nothing to show"');
+      assert.ok(/e\.projectId \|\| e\.projectPath/.test(barFnSrc),
+        'dropdown option value is not the id-preferred precedence the .fproj pill and /api/feed use');
+    });
+    check("session page liveness = the feed's STALE_GAP wall-clock rule (an old session renders finished, never 'working now')", () => {
+      const sessSrc = extractFn(embeddedScript, 'sessionPageHtml');
+      assert.ok(sessSrc, 'sessionPageHtml not found');
+      assert.ok(/\(Date\.now\(\) - \(Date\.parse\(t\.ts\) \|\| 0\)\) < STALE_GAP/.test(sessSrc),
+        'session page does not compute live from STALE_GAP');
+      assert.ok(!/wip = !t\.rep/.test(sessSrc), 'old summary-claim liveness (wip = !t.rep) still drives the page');
+      assert.ok(/live\s*\n?\s*\?[\s\S]{0,420}working now/.test(sessSrc), '"working now" badge is not gated on live');
+      assert.ok(/tail = live/.test(sessSrc), "timeline 'working…' tail is not gated on live");
+      assert.ok(sessSrc.includes('session ended'), 'stale-session finished fallback missing');
+      assert.ok(sessSrc.includes('repHarvested'), 'harvested-summary fallback missing for stale sessions');
+      // The 5s poll dedups on a serialized fingerprint; unless liveness is IN
+      // that fingerprint, a page opened while live keeps its "working now"
+      // badge forever once the session crosses STALE_GAP with no new entries.
+      const loadSessSrc = extractFn(embeddedScript, 'loadSession');
+      assert.ok(loadSessSrc && /STALE_GAP[\s\S]{0,200}sessFp|live[\s\S]{0,600}sessFp = fp/.test(loadSessSrc) && /live/.test(loadSessSrc),
+        "loadSession's dedup fingerprint ignores liveness — a stale session never repaints to finished");
+    });
+    const bulkFnSrc = extractFn(embeddedScript, 'deleteProjectsBulk');
+    check('deleteProjectsBulk helper exists standalone in the embedded script', () => {
+      assert.ok(bulkFnSrc, 'deleteProjectsBulk function not found');
+    });
+    if (bulkFnSrc) {
+      const deleteProjectsBulk = new Function('return (' + bulkFnSrc + ');')();
+      const okResult = await deleteProjectsBulk(['/a', '/b'], () => Promise.resolve({ ok: true }));
+      check('deleteProjectsBulk: all succeed -> both deleted, none failed', () => {
+        assert.deepStrictEqual(okResult, { deleted: ['/a', '/b'], failed: [] });
+      });
+      let calls = 0;
+      const partialResult = await deleteProjectsBulk(['/a', '/b', '/c'], (url, opts) => {
+        calls++;
+        const body = JSON.parse(opts.body);
+        if (body.path === '/b') return Promise.reject(new Error('boom'));
+        return Promise.resolve({ ok: true });
+      });
+      check('deleteProjectsBulk: one failure does not stop the loop', () => {
+        assert.strictEqual(calls, 3, `loop stopped early after a failure (only ${calls} calls)`);
+        assert.deepStrictEqual(partialResult.deleted, ['/a', '/c']);
+        assert.deepStrictEqual(partialResult.failed, ['/b']);
+      });
+      // The server's top-level catch answers a throwing deleteProject with an
+      // HTTP 500 (lib/server.js) — fetch RESOLVES on that, so a resolved but
+      // not-ok response must land in failed, never in deleted.
+      let httpCalls = 0;
+      const httpFailResult = await deleteProjectsBulk(['/a', '/b', '/c'], (url, opts) => {
+        httpCalls++;
+        const body = JSON.parse(opts.body);
+        return body.path === '/b'
+          ? Promise.resolve({ ok: false, status: 500 })
+          : Promise.resolve({ ok: true, status: 200 });
+      });
+      check('deleteProjectsBulk: a resolved non-2xx response counts as failed, loop continues', () => {
+        assert.strictEqual(httpCalls, 3, `loop stopped early on an http error (only ${httpCalls} calls)`);
+        assert.deepStrictEqual(httpFailResult.deleted, ['/a', '/c']);
+        assert.deepStrictEqual(httpFailResult.failed, ['/b']);
+      });
+      let fetchCalledOnEmpty = false;
+      const emptyResult = await deleteProjectsBulk([], () => { fetchCalledOnEmpty = true; return Promise.resolve({ ok: true }); });
+      check('deleteProjectsBulk: empty selection is a no-op', () => {
+        assert.deepStrictEqual(emptyResult, { deleted: [], failed: [] });
+        assert.ok(!fetchCalledOnEmpty, 'fetch was called for an empty selection');
+      });
+    }
     const feedRes = await (await fetch(`${base}/api/feed?limit=50`)).json();
     check('/api/feed returns a merged entries array with a degradation flag', () => {
       assert.ok(Array.isArray(feedRes.entries), 'entries is an array');
@@ -1063,18 +1550,31 @@ async function main() {
       assert.ok(!afterDel.some(x => x.path.toLowerCase() === proj1.toLowerCase()), 'project still listed');
     });
 
-    // new activity in a deleted project must bring it back (offsets were
-    // already consumed, so only the appended event returns)
+    // The ingestion gate means a deleted project stays deleted: new activity
+    // in its (now untracked) cwd is dropped, never auto-revived. Re-adding the
+    // project through the dashboard, plus fresh activity, brings it back.
     fs.appendFileSync(
       path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
-      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship the checkout flow' }, cwd: proj1, timestamp: '2026-07-09T12:00:00.000Z' }) + '\n',
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Dropped while deleted' }, cwd: proj1, timestamp: '2026-07-09T12:00:00.000Z' }) + '\n',
+    );
+    await post(`${base}/api/sync`);
+    const afterDrop = await (await fetch(`${base}/api/projects`)).json();
+    check('deleted project does NOT reappear from new activity alone (ingestion gate)', () => {
+      assert.ok(!afterDrop.some(x => x.path.toLowerCase() === proj1.toLowerCase()), 'deleted project auto-revived from an untracked cwd');
+    });
+
+    await post(`${base}/api/projects/add`, { path: proj1 });
+    fs.appendFileSync(
+      path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'sess1.jsonl'),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Ship the checkout flow' }, cwd: proj1, timestamp: '2026-07-09T12:01:00.000Z' }) + '\n',
     );
     await post(`${base}/api/sync`);
     const afterRevive = await (await fetch(`${base}/api/projects`)).json();
-    check('deleted project reappears with new activity', () => {
+    check('re-added project picks up new activity again', () => {
       const p = afterRevive.find(x => x.path.toLowerCase() === proj1.toLowerCase());
       assert.ok(p, 'deleted project did not reappear');
       assert.ok(p.prompts.some(e => e.text.includes('Ship the checkout flow')), 'new prompt missing');
+      assert.ok(!p.prompts.some(e => e.text.includes('Dropped while deleted')), 'gate-dropped prompt resurfaced');
     });
 
     process.env.MEMBRIDGE_API_BASE = 'http://127.0.0.1:17944'; // in-process advisor -> the same mock
@@ -2244,7 +2744,7 @@ async function main() {
 
   // --- 9. rich signals: todos + agent summaries ---
   const projR = path.join(ROOT, 'projects', 'rich-app');
-  fs.mkdirSync(projR, { recursive: true });
+  fs.mkdirSync(path.join(projR, '.membridge'), { recursive: true }); // tracked, so the gate ingests it
   const rDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-rich-app');
   fs.mkdirSync(rDir, { recursive: true });
   const OLD_SUMMARY = 'Refactored the payment retry queue: exponential backoff with jitter is in, the dead-letter queue is wired, and idempotency is covered by tests. Rotated api_key=sk-test1234567890abcdef.';
@@ -3496,6 +3996,517 @@ async function main() {
     ['secret-assignment', "config password=hunter2xyz done", 'hunter2xyz'],
     ['high-entropy', `blob ${ENTROPY_TOKEN} done`, ENTROPY_TOKEN],
   ];
+  // E2E crypto primitives (libsodium sealed-box + secretbox). Load once so the
+  // sync check body can use the primitives directly (check() doesn't await).
+  const teamcrypto = require('../lib/teamcrypto');
+  await teamcrypto.ready();
+  check('teamcrypto: seal/unseal + secretbox round trip, wrong-key safe, file paths inside ciphertext', () => {
+    const a = teamcrypto.genKeypair(), b = teamcrypto.genKeypair();
+    const teamKey = teamcrypto.genTeamKey();
+    const sealed = teamcrypto.sealTeamKey(teamKey, b.publicKey);
+    assert.strictEqual(teamcrypto.unsealTeamKey(sealed, b.publicKey, b.privateKey), teamKey, 'unseal round trip');
+    const payload = { ask: 'q', summary: 's', goal: null, decisions: null, gotchas: null, files: ['src/login.js'], changes: null };
+    const enc = teamcrypto.encrypt(payload, teamKey);
+    assert.deepStrictEqual(teamcrypto.decrypt(enc.ciphertext, enc.nonce, teamKey), payload, 'secretbox round trip');
+    assert.strictEqual(teamcrypto.unsealTeamKey(sealed, a.publicKey, a.privateKey), null, 'wrong keypair -> null');
+    assert.strictEqual(teamcrypto.decrypt(enc.ciphertext, enc.nonce, teamcrypto.genTeamKey()), null, 'wrong team key -> null');
+    assert.ok(!Buffer.from(enc.ciphertext, 'base64').toString('latin1').includes('src/login.js'), 'file path leaked into ciphertext');
+    assert.notStrictEqual(teamcrypto.encrypt(payload, teamKey).ciphertext, enc.ciphertext, 'nonce reused');
+  });
+  // Private-key storage. The real keychain only exists on macOS, so off-darwin
+  // this asserts the fail-closed contract instead of skipping blind.
+  const keychain = require('../lib/keychain');
+  check('keychain: store/load/remove round trip on macOS; fails closed elsewhere', () => {
+    if (!keychain.available()) {
+      assert.strictEqual(keychain.load('anything'), null, 'unavailable load must be null');
+      assert.strictEqual(keychain.store('a', 'b'), false, 'unavailable store must be false');
+      return; // no `security` binary: fail-closed contract verified, nothing more to test
+    }
+    const acct = 'membridge.test.' + Date.now();
+    assert.ok(keychain.store(acct, 'SECRET-VALUE'), 'store failed');
+    assert.strictEqual(keychain.load(acct), 'SECRET-VALUE', 'load round trip');
+    assert.ok(keychain.store(acct, 'SECOND'), 're-store (update) failed');
+    assert.strictEqual(keychain.load(acct), 'SECOND', 'update round trip');
+    assert.ok(keychain.remove(acct), 'remove failed');
+    assert.strictEqual(keychain.load(acct), null, 'load after remove must be null');
+  });
+  // Identity bootstrap (ensureIdentity, plan Task 4): pure by injection, so
+  // every scenario runs offline against fakes — no network, no real keychain.
+  // Awaits happen at block level (check() doesn't await), wrapped so a missing
+  // helper fails the checks instead of killing the runner.
+  {
+    const mkIdFakes = (opts = {}) => {
+      const stored = new Map(opts.preload || []);
+      const calls = { store: [], upload: [], gen: 0 };
+      return {
+        stored, calls,
+        deps: {
+          keychain: {
+            available: () => opts.keychainAvailable !== false,
+            load: a => (stored.has(a) ? stored.get(a) : null),
+            store: (a, s) => {
+              calls.store.push(a);
+              if (opts.storeFails) return false;
+              stored.set(a, s);
+              return true;
+            },
+            remove: a => stored.delete(a),
+          },
+          teamcrypto: {
+            available: () => opts.cryptoAvailable !== false,
+            ready: async () => {},
+            genKeypair: () => {
+              calls.gen++;
+              return { publicKey: 'PUB' + calls.gen, privateKey: 'PRIV' + calls.gen };
+            },
+          },
+          uploadPubkey: async row => { calls.upload.push(row); },
+        },
+      };
+    };
+    const idCreds = { userId: 'user-1', accessToken: 'tok' };
+    let idErr = null;
+    const fresh = mkIdFakes();
+    const noCrypto = mkIdFakes({ cryptoAvailable: false });
+    const noChain = mkIdFakes({ keychainAvailable: false });
+    const halfPair = mkIdFakes({ preload: [['membridge.box.privatekey', 'ORPHAN-PRIV']] });
+    const badStore = mkIdFakes({ storeFails: true });
+    let id1, id2, idNoCrypto, idNoChain, idNoCreds, idHalf, idBadStore;
+    try {
+      id1 = await teamsync.ensureIdentity(idCreds, fresh.deps);
+      id2 = await teamsync.ensureIdentity(idCreds, fresh.deps);
+      idNoCrypto = await teamsync.ensureIdentity(idCreds, noCrypto.deps);
+      idNoChain = await teamsync.ensureIdentity(idCreds, noChain.deps);
+      idNoCreds = await teamsync.ensureIdentity(null, fresh.deps);
+      idHalf = await teamsync.ensureIdentity(idCreds, halfPair.deps);
+      idBadStore = await teamsync.ensureIdentity(idCreds, badStore.deps);
+    } catch (e) { idErr = e; }
+
+    check('teamsync: ensureIdentity first call generates a pair, stores both halves, uploads the pubkey once', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.deepStrictEqual(id1, { publicKey: 'PUB1', privateKey: 'PRIV1' });
+      assert.strictEqual(fresh.calls.gen, 1, 'expected exactly one keypair generation');
+      assert.strictEqual(fresh.stored.get('membridge.box.privatekey'), 'PRIV1', 'private key not stored');
+      assert.strictEqual(fresh.stored.get('membridge.box.publickey'), 'PUB1', 'public key not stored');
+      assert.deepStrictEqual(fresh.calls.upload, [{ user_id: 'user-1', public_key: 'PUB1' }],
+        'expected exactly one upload of { user_id, public_key }');
+    });
+
+    check('teamsync: ensureIdentity second call reuses the stored pair and does not re-upload', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.deepStrictEqual(id2, { publicKey: 'PUB1', privateKey: 'PRIV1' });
+      assert.strictEqual(fresh.calls.gen, 1, 'second call must not regenerate');
+      assert.strictEqual(fresh.calls.upload.length, 1, 'second call must not re-upload');
+    });
+
+    check('teamsync: ensureIdentity fails closed — unavailable crypto/keychain or missing creds return null, nothing stored or uploaded', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.strictEqual(idNoCrypto, null);
+      assert.strictEqual(noCrypto.calls.store.length + noCrypto.calls.upload.length, 0, 'unavailable crypto must be a no-op');
+      assert.strictEqual(idNoChain, null);
+      assert.strictEqual(noChain.calls.store.length + noChain.calls.upload.length, 0, 'unavailable keychain must be a no-op');
+      assert.strictEqual(idNoCreds, null, 'missing creds must return null');
+    });
+
+    check('teamsync: ensureIdentity self-heals a half-missing pair by regenerating and re-uploading', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.deepStrictEqual(idHalf, { publicKey: 'PUB1', privateKey: 'PRIV1' });
+      assert.strictEqual(halfPair.stored.get('membridge.box.privatekey'), 'PRIV1', 'orphaned private key must be replaced');
+      assert.strictEqual(halfPair.calls.upload.length, 1, 'regenerated pubkey must be uploaded');
+    });
+
+    check('teamsync: ensureIdentity returns null and uploads nothing when the keychain cannot persist the key', () => {
+      assert.ok(!idErr, `ensureIdentity threw: ${idErr && idErr.message}`);
+      assert.strictEqual(idBadStore, null, 'a key we cannot retain must not be reported as an identity');
+      assert.strictEqual(badStore.calls.upload.length, 0, 'must not upload a pubkey whose private half was not persisted');
+    });
+  }
+
+  // Team-key handling (resolveTeamKey, plan Task 5): same injected-deps
+  // convention as ensureIdentity above. deps.teamId names the team the
+  // closures are bound to (inserted rows carry it), deps.cache is the
+  // caller-owned per-sync-run Map — injection, not module state, so the
+  // "one pass" lifetime is the caller's by construction.
+  {
+    const mkKeyFakes = (opts = {}) => {
+      const calls = { fetchRow: 0, fetchRowEpochs: [], fetchMembers: 0, inserts: [], gen: 0, seal: [], unseal: 0 };
+      return {
+        calls,
+        deps: {
+          teamId: opts.teamId || 'team-1',
+          cache: opts.cache,
+          teamcrypto: {
+            available: () => opts.cryptoAvailable !== false,
+            ready: async () => {},
+            genTeamKey: () => { calls.gen++; return 'RAWKEY' + calls.gen; },
+            sealTeamKey: (key, pub) => { calls.seal.push([key, pub]); return `SEALED(${key}->${pub})`; },
+            unsealTeamKey: sealed => { calls.unseal++; return opts.unsealFails ? null : 'UNSEALED-' + sealed; },
+          },
+          fetchMySealedRow: async epoch => {
+            calls.fetchRow++;
+            calls.fetchRowEpochs.push(epoch);
+            return opts.myRow || null;
+          },
+          fetchMemberPubkeys: async () => { calls.fetchMembers++; return opts.members || []; },
+          insertSealedRows: async rows => { calls.inserts.push(rows); },
+        },
+      };
+    };
+    const keyIdentity = { publicKey: 'MYPUB', privateKey: 'MYPRIV' };
+    const twoMembers = [
+      { user_id: 'u-a', public_key: 'PUB-A' },
+      { user_id: 'u-b', public_key: 'PUB-B' },
+    ];
+    let tkErr = null;
+    const mint = mkKeyFakes({ members: twoMembers, teamId: 'team-mint' });
+    const have = mkKeyFakes({ myRow: { sealed_team_key: 'BLOB' }, teamId: 'team-have' });
+    const cached = mkKeyFakes({ myRow: { sealed_team_key: 'BLOB2' }, teamId: 'team-cache', cache: new Map() });
+    const badUnseal = mkKeyFakes({ myRow: { sealed_team_key: 'BAD' }, unsealFails: true, teamId: 'team-bad', cache: new Map() });
+    const noCrypto = mkKeyFakes({ cryptoAvailable: false, teamId: 'team-off' });
+    let kMint, kHave, kC1, kC2, kC3, kBad, kBadAgain, kOff, kNoId;
+    try {
+      kMint = await teamsync.resolveTeamKey(keyIdentity, 3, mint.deps);
+      kHave = await teamsync.resolveTeamKey(keyIdentity, 1, have.deps);
+      kC1 = await teamsync.resolveTeamKey(keyIdentity, 1, cached.deps);
+      kC2 = await teamsync.resolveTeamKey(keyIdentity, 1, cached.deps);   // same epoch: cache hit
+      kC3 = await teamsync.resolveTeamKey(keyIdentity, 2, cached.deps);   // new epoch: cache miss
+      kBad = await teamsync.resolveTeamKey(keyIdentity, 1, badUnseal.deps);
+      kBadAgain = await teamsync.resolveTeamKey(keyIdentity, 1, badUnseal.deps); // failure must not be cached
+      kOff = await teamsync.resolveTeamKey(keyIdentity, 1, noCrypto.deps);
+      kNoId = await teamsync.resolveTeamKey(null, 1, mkKeyFakes().deps);
+    } catch (e) { tkErr = e; }
+
+    check('teamsync: resolveTeamKey with no sealed row mints one key and inserts one sealed row per member', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kMint, 'RAWKEY1');
+      assert.strictEqual(mint.calls.gen, 1, 'expected exactly one team-key generation');
+      assert.deepStrictEqual(mint.calls.fetchRowEpochs, [3], 'fetchMySealedRow must receive the epoch');
+      assert.strictEqual(mint.calls.inserts.length, 1, 'expected exactly one insert call');
+      assert.deepStrictEqual(mint.calls.inserts[0], [
+        { team_id: 'team-mint', epoch: 3, member_user_id: 'u-a', sealed_team_key: 'SEALED(RAWKEY1->PUB-A)' },
+        { team_id: 'team-mint', epoch: 3, member_user_id: 'u-b', sealed_team_key: 'SEALED(RAWKEY1->PUB-B)' },
+      ], 'one row per member, sealed to that member\'s pubkey');
+    });
+
+    check('teamsync: resolveTeamKey with an existing sealed row unseals it — no generation, no insert', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kHave, 'UNSEALED-BLOB');
+      assert.strictEqual(have.calls.gen, 0, 'must not generate when a sealed row exists');
+      assert.strictEqual(have.calls.inserts.length, 0, 'must not insert when a sealed row exists');
+      assert.strictEqual(have.calls.fetchMembers, 0, 'must not fetch member pubkeys when a sealed row exists');
+    });
+
+    check('teamsync: resolveTeamKey caches per (team, epoch) for the injected cache\'s lifetime', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kC1, 'UNSEALED-BLOB2');
+      assert.strictEqual(kC2, 'UNSEALED-BLOB2', 'second call must return the same key');
+      assert.strictEqual(cached.calls.fetchRow, 2, 'same epoch must be served from cache (1 fetch) + new epoch refetches (2nd)');
+      assert.strictEqual(cached.calls.fetchRowEpochs[1], 2, 'only the new epoch may refetch');
+      assert.strictEqual(kC3, 'UNSEALED-BLOB2', 'different epoch resolves independently (same fake blob)');
+    });
+
+    check('teamsync: resolveTeamKey fails closed — unseal failure or unavailable crypto/identity returns null with no inserts, and failures are never cached', () => {
+      assert.ok(!tkErr, `resolveTeamKey threw: ${tkErr && tkErr.message}`);
+      assert.strictEqual(kBad, null, 'unseal failure must return null');
+      assert.strictEqual(kBadAgain, null);
+      assert.strictEqual(badUnseal.calls.fetchRow, 2, 'a failed resolve must not be cached — second call refetches');
+      assert.strictEqual(badUnseal.calls.inserts.length, 0, 'unseal failure must not insert');
+      assert.strictEqual(kOff, null, 'unavailable crypto must return null');
+      assert.strictEqual(noCrypto.calls.fetchRow, 0, 'unavailable crypto must not fetch');
+      assert.strictEqual(kNoId, null, 'missing identity must return null');
+    });
+  }
+
+  // Encrypt-on-push (encryptRow + syncTeams wiring, plan Task 6 Part A).
+  // encryptRow is pure and tested with REAL libsodium (already ready()'d
+  // above — no keychain involved, so no machine side effects); the wiring's
+  // fail-closed path runs the real syncTeams against a fresh mock backend
+  // with injected unavailable crypto deps.
+  {
+    const tcReal = require('../lib/teamcrypto');
+    const pushRow = {
+      project_id: 'p-1', author_id: 'u-1', author_name: 'Marco',
+      ts: '2026-07-18T10:00:00.000Z', source: 'Claude Code', session: 's1',
+      ask: 'redacted ask', goal: null, decisions: 'kept it', gotchas: null,
+      files: ['src/a.js'], changes: null, summary: 'did the thing',
+    };
+    let encErr = null, encOff, encOn, encRound;
+    try {
+      encOff = teamsync.encryptRow(pushRow, null, 1, { teamcrypto: null });
+      const teamKey = tcReal.genTeamKey();
+      encOn = teamsync.encryptRow(pushRow, teamKey, 1, { teamcrypto: tcReal });
+      encRound = tcReal.decrypt(encOn.ciphertext, encOn.nonce, teamKey);
+    } catch (e) { encErr = e; }
+
+    check('teamsync: encryptRow with no team key returns the row unchanged (flag-off byte-identical)', () => {
+      assert.ok(!encErr, `encryptRow threw: ${encErr && encErr.message}`);
+      assert.strictEqual(encOff, pushRow, 'flag-off must return the SAME row object, not a copy');
+    });
+
+    check('teamsync: encryptRow dual-writes — ciphertext/nonce/key_epoch added, plaintext intact, payload round-trips', () => {
+      assert.ok(!encErr, `encryptRow threw: ${encErr && encErr.message}`);
+      assert.ok(encOn.ciphertext && encOn.nonce, 'ciphertext/nonce missing');
+      assert.strictEqual(encOn.key_epoch, 1);
+      assert.strictEqual(encOn.ask, 'redacted ask', 'plaintext ask must still be present (dual-write)');
+      assert.strictEqual(encOn.summary, 'did the thing', 'plaintext summary must still be present');
+      assert.strictEqual(encOn.project_id, 'p-1', 'metadata must be untouched');
+      assert.ok(!('ciphertext' in pushRow), 'input row must not be mutated');
+      assert.deepStrictEqual(encRound, {
+        ask: 'redacted ask', summary: 'did the thing', goal: null,
+        decisions: 'kept it', gotchas: null, files: ['src/a.js'], changes: null,
+      }, 'decrypting must return exactly the seven content fields');
+    });
+
+    // Fail-closed wiring: flag ON, crypto/keychain unavailable. The pass must
+    // push today's plaintext rows, never throw — and must LOG the fallback,
+    // which is what separates "the wiring engaged and failed closed" from
+    // "the flag was silently ignored" (this is the assertion that fails
+    // before the wiring exists).
+    {
+      const mockE = createMockSupabase();
+      await new Promise(r => mockE.server.listen(17952, '127.0.0.1', r));
+      const savedEnvUrl = process.env.MEMBRIDGE_TEAM_URL;
+      const savedEnvKey = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17952';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+      const projE = path.join(ROOT, 'projects', 'encrypt-app');
+      fs.mkdirSync(projE, { recursive: true });
+      let syncErr = null, syncRes = null, logDelta = '';
+      try {
+        await teamsync.signup(util.getConfig(), 'enc@test.dev', 'pw-e', 'Enc');
+        const teamE = await teamsync.createTeam(util.getConfig(), 'EncTeam');
+        await teamsync.linkProject(util.getConfig(), projE, teamE.team_id, 'EncTeam');
+        const st = util.loadState();
+        st.projects[projE] = { events: [
+          { ts: '2026-07-18T10:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'encrypt me maybe', session: 'e1' },
+          { ts: '2026-07-18T10:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projE, 'src', 'x.js'), session: 'e1' },
+        ] };
+        util.saveState(st);
+        const raw = util.loadUserConfig();
+        raw.team = { ...(raw.team || {}), encrypt: true };
+        util.saveUserConfig(raw);
+        let logBefore = 0;
+        try { logBefore = fs.statSync(util.logPath()).size; } catch {}
+        syncRes = await teamsync.syncTeams({
+          project: projE,
+          cryptoDeps: {
+            keychain: { available: () => false, load: () => null, store: () => false, remove: () => false },
+            teamcrypto: { available: () => false },
+            uploadPubkey: async () => { throw new Error('must not be called when unavailable'); },
+          },
+        });
+        try { logDelta = fs.readFileSync(util.logPath(), 'utf8').slice(logBefore); } catch {}
+      } catch (e) { syncErr = e; } finally {
+        const raw = util.loadUserConfig();
+        if (raw.team) { delete raw.team.encrypt; util.saveUserConfig(raw); }
+        process.env.MEMBRIDGE_TEAM_URL = savedEnvUrl;
+        process.env.MEMBRIDGE_TEAM_ANON_KEY = savedEnvKey;
+        mockE.server.close();
+      }
+      check('teamsync: flag-on push with unavailable crypto falls back to plaintext rows, logs it, never throws', () => {
+        assert.ok(!syncErr, `syncTeams threw: ${syncErr && syncErr.message}`);
+        assert.deepStrictEqual(syncRes.errors, [], `sync errors: ${JSON.stringify(syncRes && syncRes.errors)}`);
+        assert.ok(mockE.entries.length >= 1, 'expected at least one pushed row');
+        for (const r of mockE.entries) {
+          assert.ok(!('ciphertext' in r) && !('nonce' in r) && !('key_epoch' in r),
+            'unavailable crypto must push plaintext-only rows');
+        }
+        assert.ok(mockE.entries.some(e => /encrypt me maybe/.test(e.ask || '')), 'plaintext content missing from push');
+        assert.ok(/team encrypt/.test(logDelta),
+          'expected a logged "team encrypt" fallback line proving the flag path engaged fail-closed');
+      });
+    }
+  }
+
+  // Decrypt-on-pull + full round trip (plan Task 6 Part B). Two real homes
+  // against one mock backend: Alice mints the epoch key and pushes encrypted
+  // (dual-write), Bob unseals with his own keypair and pulls. Keychains are
+  // in-memory fakes (never the real macOS keychain); libsodium is real.
+  // cryptoDeps injects ONLY { keychain, teamcrypto } — uploadPubkey must be
+  // inherited from the real wiring (merge, not replace), which is itself part
+  // of what these tests pin.
+  {
+    const tcE2E = require('../lib/teamcrypto');
+    const mkMemKeychain = () => {
+      const m = new Map();
+      return {
+        available: () => true,
+        load: a => m.get(a) || null,
+        store: (a, s) => { m.set(a, s); return true; },
+        remove: a => m.delete(a),
+      };
+    };
+    const setTeamCfg = () => {
+      util.ensureConfig();
+      const raw = util.loadUserConfig();
+      raw.team = { ...(raw.team || {}), sharePrompts: true, encrypt: true };
+      util.saveUserConfig(raw);
+    };
+    const savedHome = process.env.MEMBRIDGE_HOME;
+    const savedUrl2 = process.env.MEMBRIDGE_TEAM_URL;
+    const savedKey2 = process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    const homeAlice = path.join(ROOT, 'home-e2ea');
+    const homeBob = path.join(ROOT, 'home-e2eb');
+    const projE2E = path.join(ROOT, 'projects', 'e2e-app');
+    fs.mkdirSync(projE2E, { recursive: true });
+    const kcAlice = mkMemKeychain();
+    const kcBob = mkMemKeychain();
+    const mockE2E = createMockSupabase();
+    let e2eErr = null, resAlice = null, resBob = null, bobEntries = null, origRows = null;
+    try {
+      await new Promise(r => mockE2E.server.listen(17953, '127.0.0.1', r));
+      process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17953';
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+
+      // Alice: account, team, linked project.
+      process.env.MEMBRIDGE_HOME = homeAlice;
+      setTeamCfg();
+      await teamsync.signup(util.getConfig(), 'alice-e2e@test.dev', 'pw-a', 'Alice');
+      const teamE = await teamsync.createTeam(util.getConfig(), 'E2E');
+      const linkE = await teamsync.linkProject(util.getConfig(), projE2E, teamE.team_id, 'E2E');
+
+      // Bob joins and bootstraps his identity FIRST, so Alice's epoch-1 mint
+      // seals to both members.
+      process.env.MEMBRIDGE_HOME = homeBob;
+      setTeamCfg();
+      await teamsync.signup(util.getConfig(), 'bob-e2e@test.dev', 'pw-b', 'Bob');
+      await teamsync.joinTeam(util.getConfig(), teamE.invite_code);
+      await teamsync.syncTeams({ cryptoDeps: { keychain: kcBob, teamcrypto: tcE2E } });
+
+      // Alice: plant a session and push encrypted.
+      process.env.MEMBRIDGE_HOME = homeAlice;
+      const stA = util.loadState();
+      stA.projects[projE2E] = { events: [
+        { ts: '2026-07-18T12:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Ship the E2E slice token=sk-e2e-alice-999', session: 'e2e1' },
+        { ts: '2026-07-18T12:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projE2E, 'src', 'core.js'), session: 'e2e1' },
+        { ts: '2026-07-18T12:02:00.000Z', source: 'Claude Code', kind: 'summary', text: 'Shipped the slice end to end', session: 'e2e1', decisions: 'sealed-box model kept' },
+      ] };
+      util.saveState(stA);
+      resAlice = await teamsync.syncTeams({ project: projE2E, cryptoDeps: { keychain: kcAlice, teamcrypto: tcE2E } });
+      origRows = mockE2E.entries.map(e => ({ ...e }));
+
+      // Tamper every stored plaintext column: a correct pull must recover
+      // content from the CIPHERTEXT, so the tampering must never surface.
+      for (const e of mockE2E.entries) {
+        if (e.ask) e.ask = 'TAMPERED ' + e.ask;
+        if (e.summary) e.summary = 'TAMPERED ' + e.summary;
+        if (e.decisions) e.decisions = 'TAMPERED';
+      }
+      // Plus one plaintext-only row (no ciphertext): must pull through as-is.
+      const alice = mockE2E.users.get('alice-e2e@test.dev');
+      mockE2E.entries.push({
+        project_id: linkE.projectId, author_id: alice.id, author_name: 'Alice',
+        ts: '2026-07-18T12:30:00.000Z', source: 'Codex', session: 'plain1',
+        ask: 'plain only row', goal: null, decisions: null, gotchas: null,
+        summary: 'no cipher here', files: ['docs/x.md'], changes: null,
+        created_at: new Date(Date.now() + 60000).toISOString(),
+      });
+
+      // Bob: pull and decrypt.
+      process.env.MEMBRIDGE_HOME = homeBob;
+      const stB = util.loadState();
+      stB.projects[projE2E] = { events: [] };
+      util.saveState(stB);
+      resBob = await teamsync.syncTeams({ project: projE2E, cryptoDeps: { keychain: kcBob, teamcrypto: tcE2E } });
+      bobEntries = (util.loadState().projects[projE2E] || {}).teamEntries || [];
+    } catch (e) { e2eErr = e; } finally {
+      process.env.MEMBRIDGE_HOME = savedHome;
+      process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
+      process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey2;
+      mockE2E.server.close();
+    }
+
+    check('teamsync: flag-on push dual-writes ciphertext rows and seals the epoch key to every member', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      assert.deepStrictEqual(resAlice.errors, [], `alice sync errors: ${JSON.stringify(resAlice && resAlice.errors)}`);
+      assert.ok(origRows.length >= 1, 'expected pushed rows');
+      for (const r of origRows) {
+        assert.ok(r.ciphertext && r.nonce && r.key_epoch === 1, 'pushed row missing ciphertext/nonce/key_epoch');
+        assert.ok(!Buffer.from(r.ciphertext, 'base64').toString('latin1').includes('src/core.js'),
+          'file path visible in ciphertext bytes');
+      }
+      assert.ok(origRows.some(r => r.summary), 'plaintext summary must still be populated (dual-write)');
+      assert.strictEqual(mockE2E.pubkeys.size, 2, 'both members must have uploaded pubkeys');
+      assert.strictEqual(mockE2E.teamKeys.length, 2, 'epoch key must be sealed once to each member');
+    });
+
+    check('teamsync: pull decrypts ciphertext rows — tampered plaintext columns are ignored', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      assert.deepStrictEqual(resBob.errors, [], `bob sync errors: ${JSON.stringify(resBob && resBob.errors)}`);
+      const enc = bobEntries.filter(e => e.session === 'e2e1');
+      assert.ok(enc.length >= 1, `expected pulled encrypted-session entries, got ${JSON.stringify(bobEntries)}`);
+      assert.ok(!JSON.stringify(enc).includes('TAMPERED'),
+        'tampered plaintext surfaced — pull must take content from the ciphertext');
+    });
+
+    check('teamsync: pull keeps a plaintext-only row unchanged', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      const plain = bobEntries.find(e => e.session === 'plain1');
+      assert.ok(plain, 'plaintext-only row missing from pull');
+      assert.strictEqual(plain.ask, 'plain only row');
+      assert.strictEqual(plain.summary, 'no cipher here');
+      assert.deepStrictEqual(plain.files, ['docs/x.md']);
+    });
+
+    check('teamsync: round trip — Bob recovers exactly what Alice pushed, through the ciphertext', () => {
+      assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
+      const orig = origRows.find(r => r.summary);
+      const got = bobEntries.find(e => e.session === 'e2e1' && e.summary);
+      assert.ok(orig && got, 'summary-bearing row missing on one side');
+      assert.strictEqual(got.ask, orig.ask, 'ask must round-trip identically');
+      assert.strictEqual(got.summary, orig.summary, 'summary must round-trip identically');
+      assert.strictEqual(got.decisions, orig.decisions, 'decisions must round-trip identically');
+      assert.deepStrictEqual(got.files, orig.files, 'files must round-trip identically');
+      assert.ok(!JSON.stringify(bobEntries).includes('sk-e2e-alice-999'),
+        'secret must have been redacted before encryption');
+    });
+
+    // Pre-migration backend (no 009 columns): flag-on push must drop the
+    // three new columns and land plaintext (PGRST204 retry), and the pull
+    // select must degrade instead of erroring. Fresh mock + home.
+    {
+      const mockPre = createMockSupabase();
+      mockPre.flags.rejectColumns.add('ciphertext');
+      mockPre.flags.rejectColumns.add('nonce');
+      mockPre.flags.rejectColumns.add('key_epoch');
+      const homeCarol = path.join(ROOT, 'home-e2ec');
+      const projPre = path.join(ROOT, 'projects', 'pre-app');
+      fs.mkdirSync(projPre, { recursive: true });
+      let preErr = null, resPre = null;
+      try {
+        await new Promise(r => mockPre.server.listen(17954, '127.0.0.1', r));
+        process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17954';
+        process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+        process.env.MEMBRIDGE_HOME = homeCarol;
+        setTeamCfg();
+        await teamsync.signup(util.getConfig(), 'carol-e2e@test.dev', 'pw-c', 'Carol');
+        const teamP = await teamsync.createTeam(util.getConfig(), 'PreTeam');
+        await teamsync.linkProject(util.getConfig(), projPre, teamP.team_id, 'PreTeam');
+        const stC = util.loadState();
+        stC.projects[projPre] = { events: [
+          { ts: '2026-07-18T13:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'premigration push', session: 'pre1' },
+        ] };
+        util.saveState(stC);
+        resPre = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: mkMemKeychain(), teamcrypto: tcE2E } });
+      } catch (e) { preErr = e; } finally {
+        process.env.MEMBRIDGE_HOME = savedHome;
+        process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
+        process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey2;
+        mockPre.server.close();
+      }
+      check('teamsync: flag-on against a 009-less backend — push drops ciphertext/nonce/key_epoch and retries, pull select degrades, no errors', () => {
+        assert.ok(!preErr, `premigration scenario threw: ${preErr && preErr.message}`);
+        assert.deepStrictEqual(resPre.errors, [], `sync errors: ${JSON.stringify(resPre && resPre.errors)}`);
+        assert.ok(mockPre.entries.length >= 1, 'expected the push to land after dropping the new columns');
+        for (const r of mockPre.entries) {
+          assert.ok(!('ciphertext' in r) && !('nonce' in r) && !('key_epoch' in r),
+            'new columns must have been dropped for the old backend');
+        }
+        assert.ok(mockPre.entries.some(e => /premigration push/.test(e.ask || '')), 'plaintext content missing');
+        assert.strictEqual(mockPre.teamKeys.length, 1, 'the epoch mint itself must still succeed (team_keys has no flag)');
+      });
+    }
+  }
   check('redact: every default pattern removes the secret and emits a named marker', () => {
     for (const [name, input, secret] of cases) {
       const out = redactLib.redactDefault(input);
@@ -3862,8 +4873,10 @@ async function main() {
     assert.deepStrictEqual(out.files, ['lib/a.js', 'lib/b.js']);
   });
   check('renderBlock: pulled teammate changes render, no [object Object]', () => {
+    // relative ts: teamInjectSlice drops entries older than teamMaxAgeHours
+    // (72h), so a hardcoded date turns into a time bomb.
     const proj = { events: [], teamEntries: [
-      { author: 'Andrew', ts: '2026-07-16T00:00:00.000Z', source: 'Claude Code',
+      { author: 'Andrew', ts: new Date(Date.now() - 3600000).toISOString(), source: 'Claude Code',
         goal: 'Ship MCP', summary: 'Built the server.',
         files: ['lib/mcp.js'],
         changes: [{ file: 'lib/mcp.js', status: 'new', add: 10, del: 0, note: null, dep: false }] },
@@ -3938,7 +4951,7 @@ async function main() {
   {
     const mcpTsAgo = sec => new Date(Date.now() - sec * 1000).toISOString();
     const projMcp = path.join(ROOT, 'projects', 'mcp-app');
-    fs.mkdirSync(projMcp, { recursive: true });
+    fs.mkdirSync(path.join(projMcp, '.membridge'), { recursive: true }); // tracked, so the gate ingests it
     const mcpTxDir = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-mcp-app');
     fs.mkdirSync(mcpTxDir, { recursive: true });
     fs.writeFileSync(path.join(mcpTxDir, 'sessM.jsonl'), jsonl([
@@ -3981,9 +4994,9 @@ async function main() {
     };
 
     const toolsList = await client.listTools();
-    check('mcp: exposes exactly the four read-only tools, all marked readOnlyHint', () => {
+    check('mcp: exposes exactly the five read-only tools, all marked readOnlyHint', () => {
       const names = toolsList.tools.map(t => t.name).sort();
-      assert.deepStrictEqual(names, ['get_project_memory', 'get_recent_activity', 'list_projects', 'search_memory']);
+      assert.deepStrictEqual(names, ['get_project_memory', 'get_recent_activity', 'list_projects', 'search_memory', 'why']);
       assert.ok(toolsList.tools.every(t => t.annotations && t.annotations.readOnlyHint === true), 'a tool is missing readOnlyHint');
       assert.ok(toolsList.tools.every(t => t.annotations.destructiveHint === false), 'a tool is missing destructiveHint:false');
     });
@@ -4069,8 +5082,9 @@ async function main() {
     await client.connect(transport);
     const tools = await client.listTools();
     check('mcp: `membridge mcp` starts a real stdio server and lists its tools', () => {
-      assert.strictEqual(tools.tools.length, 4);
+      assert.strictEqual(tools.tools.length, 5);
       assert.ok(tools.tools.some(t => t.name === 'list_projects'));
+      assert.ok(tools.tools.some(t => t.name === 'why'));
     });
     await client.close();
   }
@@ -4101,6 +5115,1760 @@ async function main() {
       assert.ok(out.stderr.includes('npm install @modelcontextprotocol/sdk zod'), 'missing the actionable install command');
       assert.ok(!out.stdout.includes('UNREACHABLE'), 'execution continued past process.exit');
     });
+  }
+
+  // --- 15. Provenance (lib/provenance.js): `membridge why <file>` ---
+  // File-level only: which sessions edited a file, newest first. Event
+  // fixtures are passed as plain proj objects (same planting style as the
+  // teamEntries block above) — provenance is a pure reduction, so no scan
+  // pass is needed and a fixed `now` keeps the live flag deterministic.
+  {
+    const projWhy = path.join(ROOT, 'projects', 'why-app');
+    fs.mkdirSync(path.join(projWhy, 'src'), { recursive: true });
+    const whyNow = Date.parse('2026-07-18T12:00:00Z');
+    const whyEvents = [
+      { ts: '2026-07-18T09:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Refactor auth token=sk-why-secret-111 flow', session: 'w1' },
+      { ts: '2026-07-18T09:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projWhy, 'src', 'auth.js'), session: 'w1' },
+      { ts: '2026-07-18T09:02:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projWhy, 'src', 'other.js'), session: 'w1' },
+      { ts: '2026-07-18T09:03:00.000Z', source: 'Claude Code', kind: 'summary', text: 'Rewrote auth around token=sk-why-secret-222 rotation', session: 'w1', decisions: 'kept the sync API', gotchas: 'mind the token cache' },
+      { ts: '2026-07-18T10:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Docs pass', session: 'w3' },
+      { ts: '2026-07-18T10:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projWhy, 'README.md'), session: 'w3' },
+      { ts: '2026-07-18T11:50:00.000Z', source: 'Codex', kind: 'prompt', text: 'Tighten auth error handling', session: 'w2' },
+      { ts: '2026-07-18T11:52:00.000Z', source: 'Codex', kind: 'edit', file: path.join(projWhy, 'src', 'auth.js'), session: 'w2' },
+    ];
+    const whyTeam = [
+      { author: 'Priya', ts: '2026-07-18T11:58:00.000Z', source: 'Codex', session: 'tp1', ask: 'harden auth token=sk-why-team-333', summary: 'refreshed session handling', files: ['src/auth.js'] },
+      { author: 'Priya', ts: '2026-07-17T08:00:00.000Z', source: 'Codex', session: 'tp2', ask: null, summary: 'unrelated docs work', files: ['docs/notes.md'] },
+    ];
+    const cfgWhy = util.getConfig();
+
+    let prov = null;
+    check('provenance: a multi-session file returns one row per session, newest first, with session fields', () => {
+      prov = require('../lib/provenance');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow);
+      assert.strictEqual(rows.length, 2, `expected 2 rows, got ${rows.length}`);
+      assert.strictEqual(rows[0].session, 'w2');
+      assert.strictEqual(rows[0].tool, 'Codex');
+      assert.strictEqual(rows[0].who, 'You');
+      assert.ok(/Tighten auth/.test(rows[0].ask), `w2 ask was: ${rows[0].ask}`);
+      assert.strictEqual(rows[0].summary, null, 'w2 has no summary');
+      assert.strictEqual(rows[1].session, 'w1');
+      assert.ok(/Rewrote auth/.test(rows[1].summary), `w1 summary was: ${rows[1].summary}`);
+      assert.ok(/kept the sync API/.test(rows[1].decisions), `w1 decisions was: ${rows[1].decisions}`);
+      assert.ok(/mind the token cache/.test(rows[1].gotchas), `w1 gotchas was: ${rows[1].gotchas}`);
+      assert.ok(String(rows[0].ts) > String(rows[1].ts), 'rows are not newest-first');
+    });
+
+    check('provenance: live is a time claim — only sessions active inside the stale window', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow);
+      assert.strictEqual(rows[0].live, true, 'w2 (10 min old) should be live');
+      assert.strictEqual(rows[1].live, false, 'w1 (3 h old) should not be live');
+    });
+
+    check('provenance: redacts secrets in ask and summary through the standard pipeline', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents, teamEntries: whyTeam }, cfgWhy, 'src/auth.js', whyNow);
+      const blob = JSON.stringify(rows);
+      assert.ok(!blob.includes('sk-why-secret-111') && !blob.includes('sk-why-secret-222') && !blob.includes('sk-why-team-333'),
+        'secret leaked into provenance');
+      assert.ok(count(blob, '[redacted') >= 3, 'expected redaction markers in local ask, local summary and teammate ask');
+    });
+
+    check('provenance: unknown or out-of-project file returns empty', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      assert.deepStrictEqual(prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/nope.js', whyNow), []);
+      assert.deepStrictEqual(prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, '../outside.js', whyNow), []);
+    });
+
+    check('provenance: teammate sessions carrying the file appear with who=author, without team-slice trimming', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const rows = prov.fileProvenance(projWhy, { events: whyEvents, teamEntries: whyTeam }, cfgWhy, 'src/auth.js', whyNow);
+      assert.strictEqual(rows.length, 3, `expected 3 rows, got ${rows.length}`);
+      assert.strictEqual(rows[0].who, 'Priya');
+      assert.strictEqual(rows[0].session, 'tp1');
+      assert.ok(!rows.some(r => r.session === 'tp2'), 'a teammate row for a different file leaked in');
+    });
+
+    check('provenance: ./-prefixed and absolute in-project paths normalize to the same file', () => {
+      assert.ok(prov, 'lib/provenance.js missing');
+      const base = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow);
+      const dot = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, './src/auth.js', whyNow);
+      const abs = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, path.join(projWhy, 'src', 'auth.js'), whyNow);
+      assert.deepStrictEqual(dot, base);
+      assert.deepStrictEqual(abs, base);
+    });
+
+    // --- Phase 3 Task 2: blameLine (line → SHA) ---------------------------
+    const mkBlameGit = handler => {
+      const calls = [];
+      return { calls, deps: { runGit: args => { calls.push(args); return handler(args); } } };
+    };
+    check('provenance: blameLine extracts the 40-hex SHA from --porcelain blame', () => {
+      const commitsMod = require('../lib/commits');
+      assert.ok(commitsMod.blameLine, 'blameLine missing');
+      const sha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4';
+      const g = mkBlameGit(() => `${sha} 12 42 1\nauthor Me\n\tsome code line\n`);
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 42, g.deps), sha);
+      assert.ok(g.calls[0].includes('blame') && g.calls[0].includes('-L') && g.calls[0].some(a => a === '42,42'),
+        'must run git blame -L <line>,<line>');
+      assert.ok(g.calls[0].includes('--porcelain'), 'must use --porcelain');
+    });
+    check('provenance: blameLine returns null for an all-zero (uncommitted) SHA, garbage, and a throwing runner', () => {
+      const commitsMod = require('../lib/commits');
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => `${'0'.repeat(40)} 1 1 1\n`).deps), null,
+        'all-zero blame SHA = not committed yet → null');
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => 'not a sha at all\n').deps), null);
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => '').deps), null);
+      assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', 1, mkBlameGit(() => { throw new Error('fatal'); }).deps), null,
+        'a git failure degrades to null, never throws');
+    });
+    check('provenance: blameLine guards a non-positive / non-integer line before touching git', () => {
+      const commitsMod = require('../lib/commits');
+      for (const bad of [0, -1, 2.5, 'foo', null, undefined]) {
+        const g = mkBlameGit(() => `${'a'.repeat(40)} 1 1 1\n`);
+        assert.strictEqual(commitsMod.blameLine(projWhy, 'src/auth.js', bad, g.deps), null, `line ${bad} must be null`);
+        assert.strictEqual(g.calls.length, 0, `must not run git for a bad line (${bad})`);
+      }
+    });
+
+    // --- Phase 3 Task 2: lineProvenance (SHA → map → session row) ----------
+    const SHA_W1 = '1'.repeat(40);
+    const SHA_MERGE = '2'.repeat(40);
+    const SHA_MISSING = '3'.repeat(40);
+    const SHA_PENDING = '4'.repeat(40);
+    const lineMap = [
+      { sha: SHA_W1, ts: '2026-07-18T09:05:00.000Z', project: projWhy,
+        sessions: [{ session: 'w1', files: ['src/auth.js'] }], unattributed: [] },
+      { sha: SHA_MERGE, ts: '2026-07-18T09:06:00.000Z', project: projWhy, sessions: [], unattributed: [] },
+      // Provisional-only: recorded by the hook, not yet settled by the daemon.
+      { sha: SHA_PENDING, ts: '2026-07-18T09:07:00.000Z', project: projWhy,
+        sessions: [], unattributed: ['src/auth.js'], provisional: true },
+    ];
+    const lineDeps = (sha, opts = {}) => ({
+      blameLine: opts.throw ? () => { throw new Error('git down'); } : () => sha,
+      loadCommitMap: () => lineMap,
+    });
+
+    check('lineProvenance: a mapped line yields one fileProvenance-shaped row for the owning session', () => {
+      assert.ok(prov.lineProvenance, 'lineProvenance missing');
+      const res = prov.lineProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', 2, whyNow, lineDeps(SHA_W1));
+      assert.strictEqual(res.fallback, null, `expected no fallback, got ${res.fallback}`);
+      assert.strictEqual(res.sha, SHA_W1);
+      assert.strictEqual(res.line, 2);
+      assert.ok(res.session, 'expected a session row');
+      assert.strictEqual(res.session.who, 'You');
+      assert.strictEqual(res.session.session, 'w1');
+      assert.ok(/Rewrote auth/.test(res.session.summary), `row summary was: ${res.session.summary}`);
+      // Row shape is EXACTLY fileProvenance's row for that session — no extras.
+      const fileRow = prov.fileProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', whyNow)
+        .find(r => r.session === 'w1');
+      assert.deepStrictEqual(res.session, fileRow, 'line row must match the file-level row for that session');
+    });
+
+    check('lineProvenance: every fallback path sets the right reason with a null session', () => {
+      assert.ok(prov.lineProvenance, 'lineProvenance missing');
+      const call = (line, deps) => prov.lineProvenance(projWhy, { events: whyEvents }, cfgWhy, 'src/auth.js', line, whyNow, deps);
+      // no / bad line
+      for (const bad of [null, 0, 'foo']) {
+        const r = call(bad, lineDeps(SHA_W1));
+        assert.strictEqual(r.fallback, 'no-line', `line ${bad} → no-line`);
+        assert.strictEqual(r.session, null);
+      }
+      // all-zero blame (blameLine returns null) → uncommitted
+      const unc = call(2, { blameLine: () => null, loadCommitMap: () => lineMap });
+      assert.strictEqual(unc.fallback, 'uncommitted');
+      assert.strictEqual(unc.session, null);
+      // SHA present in blame but not in the map → unmapped
+      const unm = call(2, lineDeps(SHA_MISSING));
+      assert.strictEqual(unm.fallback, 'unmapped');
+      assert.strictEqual(unm.session, null);
+      // merge record (files:[]) → merge
+      const mrg = call(2, lineDeps(SHA_MERGE));
+      assert.strictEqual(mrg.fallback, 'merge');
+      assert.strictEqual(mrg.session, null);
+      // Test 5 (brief's list): a provisional-only commit record → 'pending',
+      // never 'unmapped'/'merge' even though sessions:[] would otherwise read
+      // exactly like one of those.
+      const pend = call(2, lineDeps(SHA_PENDING));
+      assert.strictEqual(pend.fallback, 'pending', `expected pending, got ${pend.fallback}`);
+      assert.strictEqual(pend.session, null);
+      assert.strictEqual(pend.sha, SHA_PENDING);
+      // throwing git → git-unavailable
+      const dead = call(2, lineDeps(SHA_W1, { throw: true }));
+      assert.strictEqual(dead.fallback, 'git-unavailable');
+      assert.strictEqual(dead.session, null);
+    });
+
+    check('provenance: parseFileLineArg splits <file>:<line>, tolerating drive-colons and column paste', () => {
+      assert.ok(prov.parseFileLineArg, 'parseFileLineArg missing');
+      assert.deepStrictEqual(prov.parseFileLineArg('src/a.js:42'), { file: 'src/a.js', line: 42 });
+      assert.deepStrictEqual(prov.parseFileLineArg('src/a.js'), { file: 'src/a.js', line: null });
+      assert.deepStrictEqual(prov.parseFileLineArg('C:\\x.js:10'), { file: 'C:\\x.js', line: 10 },
+        'a Windows drive colon must not be mistaken for the line separator');
+      assert.deepStrictEqual(prov.parseFileLineArg('a.js:42:7'), { file: 'a.js', line: 42 },
+        'an editor "file:line:col" paste keeps the LINE, drops the column');
+      assert.deepStrictEqual(prov.parseFileLineArg('a.js:foo'), { file: 'a.js:foo', line: null },
+        'a non-numeric suffix is part of the filename, not a line');
+    });
+
+    // CLI wiring: spawn the real binary from a project SUBDIR — resolveRoot
+    // must walk up to the tracked root, and output must be newest-first and
+    // redacted. State is planted on disk for the subprocess to read.
+    {
+      const st = util.loadState();
+      st.projects[projWhy] = { events: whyEvents, teamEntries: whyTeam };
+      util.saveState(st);
+      const out = spawnSync(process.execPath, [BIN, 'why', 'auth.js'],
+        { cwd: path.join(projWhy, 'src'), encoding: 'utf8', env: process.env });
+      check('why: `membridge why <file>` prints newest-first, redacted provenance from a subdir', () => {
+        assert.strictEqual(out.status, 0, `exit ${out.status}, stderr: ${out.stderr}`);
+        assert.ok(out.stdout.includes('src/auth.js'), `stdout: ${out.stdout}`);
+        const iPriya = out.stdout.indexOf('Priya');
+        const iCodex = out.stdout.indexOf('Codex');
+        const iClaude = out.stdout.indexOf('Claude Code');
+        assert.ok(iPriya !== -1 && iCodex !== -1 && iClaude !== -1, `stdout: ${out.stdout}`);
+        assert.ok(iPriya < iClaude, 'teammate (newest) should print before the oldest local session');
+        assert.ok(!out.stdout.includes('sk-why-secret-111') && !out.stdout.includes('sk-why-team-333'), 'secret leaked into CLI output');
+        assert.ok(out.stdout.includes('[redacted'), 'no redaction marker in CLI output');
+      });
+      const miss = spawnSync(process.execPath, [BIN, 'why', 'no-such-file.js'],
+        { cwd: projWhy, encoding: 'utf8', env: process.env });
+      check('why: unknown file inside a tracked project prints a friendly empty result', () => {
+        assert.strictEqual(miss.status, 0, `exit ${miss.status}, stderr: ${miss.stderr}`);
+        assert.ok(/No recorded AI edits/i.test(miss.stdout), `stdout: ${miss.stdout}`);
+      });
+    }
+
+    // MCP round trip: the 5th read-only tool over the same provenance module,
+    // redacted at the boundary exactly like the other four.
+    {
+      const [whyCt, whySt] = InMemoryTransport.createLinkedPair();
+      const whyServer = mcpMod.createServer();
+      const whyClient = new McpClient({ name: 'why-test-client', version: '1.0.0' });
+      await Promise.all([whyServer.connect(whySt), whyClient.connect(whyCt)]);
+      const callJson = async (name, a) => {
+        const res = await whyClient.callTool({ name, arguments: a || {} });
+        return { res, data: JSON.parse(res.content[0].text) };
+      };
+      let whyErr = null, whyData = null, whyMissData = null, whyBadRes = null;
+      try {
+        whyData = (await callJson('why', { project: projWhy, file: 'src/auth.js' })).data;
+        whyMissData = (await callJson('why', { project: projWhy, file: 'src/nope.js' })).data;
+        whyBadRes = (await callJson('why', { project: path.join(ROOT, 'projects', 'nope-app'), file: 'x.js' })).res;
+      } catch (e) { whyErr = e; }
+      check('mcp: why(file) round trip — sessions newest-first, redacted, empty for unknown file, isError for unknown project', () => {
+        assert.ok(!whyErr, `why call failed: ${whyErr && whyErr.message}`);
+        assert.strictEqual(whyData.file, 'src/auth.js');
+        assert.strictEqual(whyData.sessions.length, 3, `expected 3 sessions, got ${whyData.sessions.length}`);
+        assert.strictEqual(whyData.sessions[0].who, 'Priya');
+        assert.strictEqual(whyData.sessions[2].session, 'w1');
+        const blob = JSON.stringify(whyData);
+        assert.ok(!blob.includes('sk-why-secret-111') && !blob.includes('sk-why-secret-222') && !blob.includes('sk-why-team-333'),
+          'secret leaked through the MCP boundary');
+        assert.deepStrictEqual(whyMissData.sessions, []);
+        assert.strictEqual(whyBadRes.isError, true);
+      });
+      await whyClient.close();
+    }
+  }
+
+  // --- 15b. Line-level `why <file>:<line>` end-to-end (Phase 3 Task 2) ------
+  // A REAL repo so `git blame` resolves a real SHA; a planted commit map ties
+  // that SHA to a session; events give the session its ask/summary. Exercises
+  // the CLI (spawned) and the MCP boundary (in-process) over the same data.
+  {
+    const projLine = path.join(ROOT, 'projects', 'line-why-app');
+    fs.mkdirSync(path.join(projLine, 'src'), { recursive: true });
+    const gl = args => spawnSync('git', ['-C', projLine, ...args], { encoding: 'utf8' });
+    gl(['init', '-q']);
+    gl(['config', 'user.email', 'me@local.dev']);
+    gl(['config', 'user.name', 'Me']);
+    fs.writeFileSync(path.join(projLine, 'src', 'auth.js'), 'const token = rotate();\n');
+    gl(['add', '-A']);
+    gl(['commit', '-q', '-m', 'auth line']);
+    const lineSha = gl(['rev-parse', 'HEAD']).stdout.trim();
+    // An extra, UNCOMMITTED line in the working tree — blame of it is all-zero.
+    fs.appendFileSync(path.join(projLine, 'src', 'auth.js'), 'const scratch = 1;\n');
+    const lineEvents = [
+      { ts: '2026-07-18T09:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'Add token=sk-line-secret rotation', session: 'L1' },
+      { ts: '2026-07-18T09:01:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projLine, 'src', 'auth.js'), session: 'L1' },
+      { ts: '2026-07-18T09:02:00.000Z', source: 'Claude Code', kind: 'summary', text: 'Rotated the auth token each request', session: 'L1', decisions: 'per-request rotation', gotchas: '' },
+    ];
+    {
+      const st = util.loadState();
+      st.projects[projLine] = { events: lineEvents };
+      util.saveState(st);
+    }
+    const commitsMod = require('../lib/commits');
+    commitsMod.recordCommit(projLine, {
+      sha: lineSha, ts: '2026-07-18T09:05:00.000Z', project: projLine,
+      sessions: [{ session: 'L1', files: ['src/auth.js'] }], unattributed: [],
+    });
+
+    const cliLine = spawnSync(process.execPath, [BIN, 'why', 'src/auth.js:1'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: `membridge why <file>:<line>` resolves the line to its session, redacted, with the short SHA', () => {
+      assert.strictEqual(cliLine.status, 0, `exit ${cliLine.status}, stderr: ${cliLine.stderr}`);
+      assert.ok(cliLine.stdout.includes('src/auth.js:1'), `stdout: ${cliLine.stdout}`);
+      assert.ok(cliLine.stdout.includes(lineSha.slice(0, 10)), `expected short sha ${lineSha.slice(0, 10)} in: ${cliLine.stdout}`);
+      assert.ok(/Rotated the auth token/.test(cliLine.stdout), `expected the session summary in: ${cliLine.stdout}`);
+      assert.ok(!cliLine.stdout.includes('sk-line-secret'), 'secret leaked into line-level CLI output');
+    });
+
+    const cliUncommitted = spawnSync(process.execPath, [BIN, 'why', 'src/auth.js:2'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: an uncommitted line prints the fallback annotation AND the file-level history', () => {
+      assert.strictEqual(cliUncommitted.status, 0, `exit ${cliUncommitted.status}, stderr: ${cliUncommitted.stderr}`);
+      assert.ok(/not committed yet|not yet attributable/i.test(cliUncommitted.stdout), `expected an uncommitted annotation in: ${cliUncommitted.stdout}`);
+      assert.ok(/Rotated the auth token/.test(cliUncommitted.stdout), `expected file-level history in the fallback: ${cliUncommitted.stdout}`);
+    });
+
+    const cliPlain = spawnSync(process.execPath, [BIN, 'why', 'src/auth.js'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: `membridge why <file>` (no line) is unchanged file-level output', () => {
+      assert.strictEqual(cliPlain.status, 0, cliPlain.stderr);
+      assert.ok(/Why src\/auth\.js —/.test(cliPlain.stdout), `stdout: ${cliPlain.stdout}`);
+      assert.ok(!/commit [0-9a-f]/.test(cliPlain.stdout), 'plain why must not print a commit line');
+    });
+
+    // Test 5 (brief's list), CLI half: a provisional-only commit (just
+    // committed, not yet settled) prints the explicit "pending" annotation
+    // AND falls back to file-level history — the same rendering path as the
+    // uncommitted fallback above. A SEPARATE file (not auth.js) so this in no
+    // way disturbs auth.js's still-uncommitted line 2 used above/below.
+    fs.writeFileSync(path.join(projLine, 'src', 'pending.js'), 'const p = 1;\n');
+    gl(['add', 'src/pending.js']);
+    gl(['commit', '-q', '-m', 'pending file']);
+    const pendingSha = gl(['rev-parse', 'HEAD']).stdout.trim();
+    {
+      const st = util.loadState();
+      st.projects[projLine].events.push(
+        { ts: '2026-07-18T09:10:00.000Z', source: 'Claude Code', kind: 'edit', file: path.join(projLine, 'src', 'pending.js'), session: 'L1' });
+      util.saveState(st);
+    }
+    commitsMod.recordCommit(projLine, {
+      sha: pendingSha, ts: '2026-07-18T09:11:00.000Z', project: projLine,
+      sessions: [], unattributed: ['src/pending.js'], provisional: true,
+    });
+    const cliPending = spawnSync(process.execPath, [BIN, 'why', 'src/pending.js:1'],
+      { cwd: projLine, encoding: 'utf8', env: process.env });
+    check('why: a provisional (just-committed, not-yet-settled) line prints "attribution pending" AND file-level history', () => {
+      assert.strictEqual(cliPending.status, 0, `exit ${cliPending.status}, stderr: ${cliPending.stderr}`);
+      assert.ok(/attribution pending/i.test(cliPending.stdout), `expected the pending annotation in: ${cliPending.stdout}`);
+      // A row can stay pending for a full grace window (or longer, while a
+      // credited candidate catches up) — the annotation must not promise
+      // recency it cannot know.
+      assert.ok(!/just committed/i.test(cliPending.stdout), `annotation must not claim "just committed": ${cliPending.stdout}`);
+      assert.ok(/Why src\/pending\.js —/.test(cliPending.stdout), `expected file-level history fallback in: ${cliPending.stdout}`);
+    });
+
+    // MCP boundary: the why tool gains an optional line param.
+    {
+      const [ct, stx] = InMemoryTransport.createLinkedPair();
+      const server = mcpMod.createServer();
+      const client = new McpClient({ name: 'why-line-client', version: '1.0.0' });
+      await Promise.all([server.connect(stx), client.connect(ct)]);
+      const callJson = async (a) => JSON.parse((await client.callTool({ name: 'why', arguments: a })).content[0].text);
+      let lineData = null, uncData = null, err = null;
+      try {
+        lineData = await callJson({ project: projLine, file: 'src/auth.js', line: 1 });
+        uncData = await callJson({ project: projLine, file: 'src/auth.js', line: 2 });
+      } catch (e) { err = e; }
+      check('mcp: why with a line returns a redacted single session row + sha, fallback carried through', () => {
+        assert.ok(!err, `why(line) failed: ${err && err.message}`);
+        assert.strictEqual(lineData.line, 1);
+        assert.strictEqual(lineData.sha, lineSha);
+        assert.strictEqual(lineData.fallback, null);
+        assert.ok(lineData.session && lineData.session.session === 'L1', `session: ${JSON.stringify(lineData.session)}`);
+        assert.ok(!JSON.stringify(lineData).includes('sk-line-secret'), 'secret leaked through the MCP line boundary');
+        // Uncommitted line: fallback carried through, no session.
+        assert.strictEqual(uncData.fallback, 'uncommitted');
+        assert.strictEqual(uncData.session, null);
+      });
+      await client.close();
+    }
+  }
+
+  // --- 16. Commit↔session attribution (lib/commits.js, provenance Phase 2) ---
+  // Pure fixtures — no git, no wall clock. Events carry ABSOLUTE file paths
+  // (as the real stream does) and are normalized against opts.projectPath;
+  // changed files arrive repo-relative (as git reports them).
+  {
+    const projC = path.join(ROOT, 'projects', 'commits-app');
+    const editEv = (session, ts, rel) =>
+      ({ ts, source: 'Claude Code', kind: 'edit', file: path.join(projC, rel), session });
+    const commitEvts = [
+      editEv('sA', '2026-07-18T10:00:00.000Z', 'src/a.js'),
+      editEv('sA', '2026-07-18T10:01:00.000Z', 'src/b.js'),
+      editEv('sB', '2026-07-18T10:05:00.000Z', 'src/b.js'),
+      editEv('sB', '2026-07-18T10:06:00.000Z', 'src/c.js'),
+      { ts: '2026-07-18T10:07:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'noise', session: 'sB' },
+      editEv('', '2026-07-18T10:08:00.000Z', 'docs/orphan.md'),
+      editEv('sC', '2026-07-18T11:30:00.000Z', 'src/a.js'), // after the commit
+    ];
+    const COMMIT_TS = '2026-07-18T11:00:00.000Z';
+    const cOpts = { projectPath: projC };
+
+    let commits = null;
+    check('commits: one session that edited every changed file owns them all', () => {
+      commits = require('../lib/commits');
+      const soloEvts = [
+        editEv('sA', '2026-07-18T10:00:00.000Z', 'src/a.js'),
+        editEv('sA', '2026-07-18T10:01:00.000Z', 'src/b.js'),
+      ];
+      const res = commits.attributeCommit(['src/a.js', 'src/b.js'], COMMIT_TS, soloEvts, cOpts);
+      assert.deepStrictEqual(res, {
+        sessions: [{ session: 'sA', files: ['src/a.js', 'src/b.js'] }],
+        unattributed: [],
+      });
+      // ms-epoch commit time is accepted and equivalent
+      const resMs = commits.attributeCommit(['src/a.js', 'src/b.js'], Date.parse(COMMIT_TS), soloEvts, cOpts);
+      assert.deepStrictEqual(resMs, res);
+    });
+
+    check('commits: files split across the sessions that own them, newest-owning session first', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(['src/a.js', 'src/c.js'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(res.sessions, [
+        { session: 'sB', files: ['src/c.js'] },     // last edit 10:06 — newest first
+        { session: 'sA', files: ['src/a.js'] },     // last edit 10:00
+      ]);
+      assert.deepStrictEqual(res.unattributed, []);
+    });
+
+    check('commits: when two sessions edited the same file before the commit, the most recent wins', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(['src/b.js'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(res.sessions, [{ session: 'sB', files: ['src/b.js'] }]);
+    });
+
+    check('commits: a changed file with no qualifying edit — or only a sessionless one — is unattributed', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(['src/zzz.js', 'docs/orphan.md'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(res.sessions, []);
+      assert.deepStrictEqual(res.unattributed, ['src/zzz.js', 'docs/orphan.md']);
+    });
+
+    check('commits: edits dated after the commit never attribute', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      // At 11:00, sC's 11:30 edit of a.js must not steal ownership from sA…
+      const late = commits.attributeCommit(['src/a.js'], COMMIT_TS, commitEvts, cOpts);
+      assert.deepStrictEqual(late.sessions, [{ session: 'sA', files: ['src/a.js'] }]);
+      // …and with a commit time before every edit, nothing qualifies at all.
+      const early = commits.attributeCommit(['src/a.js'], '2026-07-18T09:00:00.000Z', commitEvts, cOpts);
+      assert.deepStrictEqual(early.sessions, []);
+      assert.deepStrictEqual(early.unattributed, ['src/a.js']);
+    });
+
+    check('commits: absolute and ./-prefixed changed-file spellings normalize and still match', () => {
+      assert.ok(commits, 'lib/commits.js missing');
+      const res = commits.attributeCommit(
+        ['./src/a.js', path.join(projC, 'src', 'b.js')], COMMIT_TS, commitEvts, cOpts);
+      const owned = res.sessions.flatMap(s => s.files).sort();
+      assert.deepStrictEqual(owned, ['src/a.js', 'src/b.js'], 'both spellings must normalize to repo-relative and match');
+      assert.deepStrictEqual(res.unattributed, []);
+    });
+
+    // --- Phase 2 Task 2: the git commit reader, injected runGit only -------
+    // Canned git output, no real repo. The fake records every args array so
+    // tests can pin WHICH git commands run (the -n 50 cap, the ranges).
+    const mkGit = handler => {
+      const calls = [];
+      return { calls, deps: { runGit: args => { calls.push(args); return handler(args); } } };
+    };
+
+    check('commits: readCommit parses committer ts, committer email, and changed files from git show --numstat', () => {
+      assert.ok(commits && commits.readCommit, 'readCommit missing');
+      // Real shape of `git show --numstat --format=%cI|%ce|%P`: the format line
+      // (date|committer-email|parents), a blank line, then numstat rows. The
+      // committer email is what the authorship gate compares against.
+      const g = mkGit(() => '2026-07-18T14:00:00+02:00|me@local.dev|p0000aa\n\n3\t1\tsrc/a.js\n10\t0\tsrc/b.js\n');
+      const res = commits.readCommit(projC, 'abc1234', g.deps);
+      assert.deepStrictEqual(res, {
+        sha: 'abc1234',
+        ts: '2026-07-18T14:00:00+02:00',
+        email: 'me@local.dev',
+        files: ['src/a.js', 'src/b.js'],
+      });
+      assert.strictEqual(g.calls.length, 1);
+      assert.ok(g.calls[0].includes('abc1234'), 'sha missing from the git invocation');
+      assert.ok(g.calls[0].includes('--no-show-signature'),
+        'must pass --no-show-signature: log.showSignature=true would otherwise prepend signature text to stdout and corrupt ts');
+      assert.ok(g.calls[0].some(a => a.includes('%cI|%ce|%P')), 'format must carry committer email + parent list');
+    });
+
+    check('commits: readCommit unquotes a C-quoted spaced path and decodes octal UTF-8 bytes', () => {
+      assert.ok(commits && commits.readCommit, 'readCommit missing');
+      const g = mkGit(() => '2026-07-18T14:00:00Z|dev@x.io|p0000aa\n\n2\t0\t"docs/read me.md"\n1\t0\t"\\303\\244.txt"\n');
+      const res = commits.readCommit(projC, 'beef111', g.deps);
+      assert.deepStrictEqual(res.files, ['docs/read me.md', 'ä.txt'],
+        'octal escapes are UTF-8 bytes, not Latin-1 chars');
+      assert.strictEqual(res.email, 'dev@x.io', 'committer email must survive alongside quoted paths');
+      // the shared changes.js helper is the thing that decodes
+      assert.strictEqual(changesLib.unquote('"\\303\\244.txt"'), 'ä.txt');
+      assert.strictEqual(changesLib.unquote('plain.js'), 'plain.js');
+    });
+
+    check('commits: readCommit on a merge returns empty files even though git prints first-parent numstat rows', () => {
+      assert.ok(commits && commits.readCommit, 'readCommit missing');
+      // Modern git (>=2.31) DOES print numstat rows for merges (first-parent
+      // diff) — verified on this repo. The merge contract must therefore be
+      // enforced from the parent list, never inferred from empty output.
+      const merge = commits.readCommit(projC, 'mmm2222',
+        mkGit(() => '2026-07-18T15:00:00Z|dev@x.io|p0000aa p0000bb\n\n748\t0\tdocs/upstream.md\n12\t3\tlib/other.js\n').deps);
+      assert.deepStrictEqual(merge, { sha: 'mmm2222', ts: '2026-07-18T15:00:00Z', email: 'dev@x.io', files: [] });
+      const broken = commits.readCommit(projC, 'eee3333',
+        mkGit(() => { throw new Error('fatal: bad object'); }).deps);
+      assert.deepStrictEqual(broken, { sha: 'eee3333', ts: null, email: null, files: [] });
+    });
+
+    // --- Phase 3 Task 1: authorship gate (committer email == local user.email) ---
+    check('commits: gitUserEmail reads local user.email, trims it, and degrades to null', () => {
+      assert.ok(commits && commits.gitUserEmail, 'gitUserEmail missing');
+      const g = mkGit(() => 'me@local.dev\n');
+      assert.strictEqual(commits.gitUserEmail(projC, g.deps), 'me@local.dev');
+      assert.ok(g.calls[0].includes('config') && g.calls[0].includes('user.email'), 'must read git config user.email');
+      // Unset user.email: git prints nothing / exits non-zero → null (fail closed)
+      assert.strictEqual(commits.gitUserEmail(projC, mkGit(() => '').deps), null);
+      assert.strictEqual(commits.gitUserEmail(projC, mkGit(() => { throw new Error('no email'); }).deps), null);
+    });
+
+    check('commits: isLocalCommitter is true only for a matching identity, fail-closed otherwise', () => {
+      assert.ok(commits && commits.isLocalCommitter, 'isLocalCommitter missing');
+      assert.strictEqual(commits.isLocalCommitter('me@local.dev', 'me@local.dev'), true);
+      assert.strictEqual(commits.isLocalCommitter(' me@local.dev ', 'me@local.dev'), true, 'surrounding whitespace ignored');
+      assert.strictEqual(commits.isLocalCommitter('teammate@remote.dev', 'me@local.dev'), false, 'a foreign committer is never local');
+      assert.strictEqual(commits.isLocalCommitter('me@local.dev', null), false, 'missing local user.email fails closed');
+      assert.strictEqual(commits.isLocalCommitter(null, 'me@local.dev'), false, 'missing committer email fails closed');
+      assert.strictEqual(commits.isLocalCommitter(null, null), false);
+    });
+
+    check('commits: newCommitsSince returns post-cursor commits oldest-first, excluding merges', () => {
+      assert.ok(commits && commits.newCommitsSince, 'newCommitsSince missing');
+      const g = mkGit(args => {
+        if (args.includes('merge-base')) return ''; // ancestor check passes
+        return 'c3new\nc2mid\nc1old\n';             // git log: newest first
+      });
+      const res = commits.newCommitsSince(projC, 'cursor99', g.deps);
+      assert.deepStrictEqual(res, ['c1old', 'c2mid', 'c3new'], 'must be oldest-first');
+      const logCall = g.calls.find(a => a.includes('log'));
+      assert.ok(logCall, 'expected a git log call');
+      assert.ok(logCall.includes('--no-merges'), 'merges must be excluded');
+      assert.ok(logCall.some(a => a === 'cursor99..HEAD'), 'expected the sinceSha..HEAD range');
+    });
+
+    check('commits: first run (no cursor) is capped at the last 50 commits, never the whole history', () => {
+      assert.ok(commits && commits.newCommitsSince, 'newCommitsSince missing');
+      const g = mkGit(() => 'n2\nn1\n');
+      const res = commits.newCommitsSince(projC, null, g.deps);
+      assert.deepStrictEqual(res, ['n1', 'n2']);
+      const logCall = g.calls.find(a => a.includes('log'));
+      assert.ok(logCall.includes('-n') && logCall.includes('50'), `expected -n 50, got: ${logCall}`);
+      assert.ok(!logCall.some(a => a.includes('..')), 'first run must not use a range');
+      // An unknown / non-ancestor cursor falls back to the SAME bounded run.
+      const g2 = mkGit(args => {
+        if (args.includes('merge-base')) throw new Error('not an ancestor');
+        return 'n2\nn1\n';
+      });
+      const res2 = commits.newCommitsSince(projC, 'gone000', g2.deps);
+      assert.deepStrictEqual(res2, ['n1', 'n2']);
+      const log2 = g2.calls.find(a => a.includes('log'));
+      assert.ok(log2.includes('-n') && log2.includes('50'), 'bad cursor must fall back to the bounded first run');
+    });
+
+    check('commits: any git failure in newCommitsSince returns [], never throws', () => {
+      assert.ok(commits && commits.newCommitsSince, 'newCommitsSince missing');
+      const dead = mkGit(() => { throw new Error('fatal: not a git repository'); });
+      assert.deepStrictEqual(commits.newCommitsSince(projC, null, dead.deps), []);
+      assert.deepStrictEqual(commits.newCommitsSince(projC, 'cursor99', dead.deps), []);
+    });
+
+    // --- Phase 2 Task 3: persist the map + populate during sync ------------
+
+    check('commits: recordCommit/loadCommitMap round-trip skips garbage lines; lastRecordedSha is the newest', () => {
+      assert.ok(commits && commits.recordCommit, 'recordCommit missing');
+      const projStore = path.join(ROOT, 'projects', 'commit-store-app');
+      fs.mkdirSync(projStore, { recursive: true });
+      const rec1 = { sha: 's1', ts: 't1', project: projStore, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [] };
+      const rec2 = { sha: 's2', ts: 't2', project: projStore, sessions: [], unattributed: ['b.js'] };
+      commits.recordCommit(projStore, rec1);
+      fs.appendFileSync(path.join(projStore, '.membridge', 'commits.jsonl'), 'NOT JSON {{{\n');
+      commits.recordCommit(projStore, rec2);
+      assert.deepStrictEqual(commits.loadCommitMap(projStore), [rec1, rec2], 'round trip with garbage line skipped');
+      assert.strictEqual(commits.lastRecordedSha(projStore), 's2');
+      const nowhere = path.join(ROOT, 'projects', 'no-such-app');
+      assert.deepStrictEqual(commits.loadCommitMap(nowhere), []);
+      assert.strictEqual(commits.lastRecordedSha(nowhere), null);
+    });
+
+    check('commits: recordCommit lands on a fresh line after a torn (newline-less) tail instead of gluing', () => {
+      assert.ok(commits && commits.recordCommit, 'recordCommit missing');
+      const projTorn = path.join(ROOT, 'projects', 'commit-torn-app');
+      fs.mkdirSync(path.join(projTorn, '.membridge'), { recursive: true });
+      // A crash/ENOSPC mid-append leaves a partial line with no trailing \n.
+      fs.writeFileSync(path.join(projTorn, '.membridge', 'commits.jsonl'), '{"sha":"aaa","ts":"2026-0');
+      const rec = { sha: 'bbb', ts: 't', project: projTorn, sessions: [], unattributed: [] };
+      commits.recordCommit(projTorn, rec);
+      assert.deepStrictEqual(commits.loadCommitMap(projTorn), [rec],
+        'the healthy record must survive beside the torn line, not be glued into it');
+      assert.strictEqual(commits.lastRecordedSha(projTorn), 'bbb');
+    });
+
+    // --- Task 3: O(1) idempotency check + dedupe-by-sha on read -------------
+
+    check('commits: lastRecordedSha is a cheap tail read — never parses the whole file', () => {
+      const projTail = path.join(ROOT, 'projects', 'commit-tail-app');
+      fs.mkdirSync(path.join(projTail, '.membridge'), { recursive: true });
+      const file = path.join(projTail, '.membridge', 'commits.jsonl');
+      // A large garbage line planted early would be observed by a full-file
+      // parse (loadCommitMap already tolerates it, but a cheap check must
+      // never even read this far back into the file).
+      fs.writeFileSync(file, 'NOT JSON ' + 'x'.repeat(20000) + '\n');
+      for (let i = 0; i < 500; i++) {
+        fs.appendFileSync(file, JSON.stringify({ sha: `s${i}`, ts: 't', project: projTail, sessions: [], unattributed: [] }) + '\n');
+      }
+      const origReadFile = fs.readFileSync;
+      let readFileCalls = 0;
+      fs.readFileSync = function (...args) { readFileCalls++; return origReadFile.apply(fs, args); };
+      try {
+        assert.strictEqual(commits.lastRecordedSha(projTail), 's499');
+      } finally {
+        fs.readFileSync = origReadFile;
+      }
+      assert.strictEqual(readFileCalls, 0, `lastRecordedSha must not full-parse the file (readFileSync called ${readFileCalls}x)`);
+    });
+
+    check('commits: lastRecordedSha stays correct even when the last record is bigger than the tail window', () => {
+      const projBig = path.join(ROOT, 'projects', 'commit-bigrec-app');
+      fs.mkdirSync(path.join(projBig, '.membridge'), { recursive: true });
+      const file = path.join(projBig, '.membridge', 'commits.jsonl');
+      fs.writeFileSync(file, JSON.stringify({ sha: 'small1', ts: 't', project: projBig, sessions: [], unattributed: [] }) + '\n');
+      // A record that alone exceeds any reasonable tail-read window (many
+      // files in one commit) — the cheap path must fall back to a full parse
+      // rather than return a wrong/partial answer.
+      const manyFiles = Array.from({ length: 2000 }, (_, i) => `src/file${i}.js`);
+      const bigRec = { sha: 'bigrecordsha', ts: 't', project: projBig, sessions: [{ session: 'w1', files: manyFiles }], unattributed: [] };
+      fs.appendFileSync(file, JSON.stringify(bigRec) + '\n');
+      assert.strictEqual(commits.lastRecordedSha(projBig), 'bigrecordsha');
+      assert.deepStrictEqual(commits.loadCommitMap(projBig).map(r => r.sha), ['small1', 'bigrecordsha']);
+    });
+
+    check('commits: lastRecordedSha fallback tracks the physically-last write, not dedup-by-sha order', () => {
+      // A pathological but possible file: sha A, then sha B, then sha A again
+      // (a legitimate non-consecutive duplicate — see the division-of-labor
+      // comment) as the physically LAST line, made big enough to force the
+      // tail-read into its full-parse fallback. Dedup-by-sha's first-seen
+      // ordering would put A before B and answer 'B' here; the physically
+      // last write is really 'A', and that's what a writer's idempotency
+      // check must see.
+      const projOrder = path.join(ROOT, 'projects', 'commit-fallback-order-app');
+      fs.mkdirSync(path.join(projOrder, '.membridge'), { recursive: true });
+      const file = path.join(projOrder, '.membridge', 'commits.jsonl');
+      const manyFiles = Array.from({ length: 2000 }, (_, i) => `src/file${i}.js`);
+      fs.writeFileSync(file, JSON.stringify({ sha: 'A', ts: 't1', project: projOrder, sessions: [], unattributed: [] }) + '\n');
+      fs.appendFileSync(file, JSON.stringify({ sha: 'B', ts: 't2', project: projOrder, sessions: [], unattributed: ['b.js'] }) + '\n');
+      fs.appendFileSync(file, JSON.stringify({ sha: 'A', ts: 't3', project: projOrder, sessions: [{ session: 'w1', files: manyFiles }], unattributed: [] }) + '\n');
+      assert.strictEqual(commits.lastRecordedSha(projOrder), 'A');
+    });
+
+    check('commits: lastRecordedSha degrades to null (never throws) for a missing/unreadable file', () => {
+      const projMissing = path.join(ROOT, 'projects', 'commit-idem-missing-app');
+      assert.strictEqual(commits.lastRecordedSha(projMissing), null);
+    });
+
+    check('commits: dedupe-by-sha keeps one row — a real-session row beats an empty-session row, either write order', () => {
+      const projDedupA = path.join(ROOT, 'projects', 'commit-dedupe-a-app');
+      fs.mkdirSync(path.join(projDedupA, '.membridge'), { recursive: true });
+      const empty = { sha: 'dup1', ts: 't1', project: projDedupA, sessions: [], unattributed: ['x.js'] };
+      const real = { sha: 'dup1', ts: 't2', project: projDedupA, sessions: [{ session: 'w1', files: ['x.js'] }], unattributed: [] };
+      commits.recordCommit(projDedupA, empty);
+      commits.recordCommit(projDedupA, real);
+      const mapA = commits.loadCommitMap(projDedupA);
+      assert.strictEqual(mapA.length, 1, `expected 1 deduped row, got ${JSON.stringify(mapA)}`);
+      assert.deepStrictEqual(mapA[0], real, 'the real-session row must win over the empty one');
+
+      const projDedupB = path.join(ROOT, 'projects', 'commit-dedupe-b-app');
+      fs.mkdirSync(path.join(projDedupB, '.membridge'), { recursive: true });
+      commits.recordCommit(projDedupB, real);
+      commits.recordCommit(projDedupB, empty);
+      const mapB = commits.loadCommitMap(projDedupB);
+      assert.strictEqual(mapB.length, 1, `expected 1 deduped row, got ${JSON.stringify(mapB)}`);
+      assert.deepStrictEqual(mapB[0], real, 'the real-session row must win over the empty one, reverse write order too');
+    });
+
+    check('commits: dedupe-by-sha — two consecutive identical writes for the same sha produce one row', () => {
+      const projDedupC = path.join(ROOT, 'projects', 'commit-dedupe-c-app');
+      fs.mkdirSync(path.join(projDedupC, '.membridge'), { recursive: true });
+      const rec = { sha: 'dup2', ts: 't1', project: projDedupC, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [] };
+      commits.recordCommit(projDedupC, rec);
+      commits.recordCommit(projDedupC, rec);
+      const mapC = commits.loadCommitMap(projDedupC);
+      assert.strictEqual(mapC.length, 1, `expected 1 row for a consecutive duplicate write, got ${JSON.stringify(mapC)}`);
+      assert.deepStrictEqual(mapC[0], rec);
+    });
+
+    check('commits: dedupe-by-sha does not disturb an otherwise duplicate-free map (regression)', () => {
+      const projNoDup = path.join(ROOT, 'projects', 'commit-nodupe-app');
+      fs.mkdirSync(path.join(projNoDup, '.membridge'), { recursive: true });
+      const r1 = { sha: 'n1', ts: 't1', project: projNoDup, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [] };
+      const r2 = { sha: 'n2', ts: 't2', project: projNoDup, sessions: [], unattributed: ['b.js'] };
+      commits.recordCommit(projNoDup, r1);
+      commits.recordCommit(projNoDup, r2);
+      assert.deepStrictEqual(commits.loadCommitMap(projNoDup), [r1, r2]);
+    });
+
+    // Test 3 (brief's list) + the full precedence rule: a SETTLED row (real
+    // or empty) always beats a PROVISIONAL one for the same sha, regardless
+    // of write order — this is the invariant a provisional-hook-row-never-
+    // wins reconciliation design leans on.
+    check('commits: isProvisionalCommit reads the flag; absent/falsy means settled', () => {
+      assert.ok(commits.isProvisionalCommit, 'isProvisionalCommit missing');
+      assert.strictEqual(commits.isProvisionalCommit({ sha: 'x', provisional: true }), true);
+      assert.strictEqual(commits.isProvisionalCommit({ sha: 'x', provisional: false }), false);
+      assert.strictEqual(commits.isProvisionalCommit({ sha: 'x' }), false, 'absent provisional means settled');
+      assert.strictEqual(commits.isProvisionalCommit(null), false);
+    });
+
+    check('commits: dedupe-by-sha — a settled row always beats a provisional row, either write order', () => {
+      const projSettleDedupe = path.join(ROOT, 'projects', 'commit-settle-dedupe-app');
+      fs.mkdirSync(path.join(projSettleDedupe, '.membridge'), { recursive: true });
+
+      // provisional written, then settled-real arrives — settled wins.
+      const provA = { sha: 'pv1', ts: 't1', project: projSettleDedupe, sessions: [], unattributed: ['a.js'], provisional: true };
+      const settledRealA = { sha: 'pv1', ts: 't1', project: projSettleDedupe, sessions: [{ session: 'w1', files: ['a.js'] }], unattributed: [], provisional: false };
+      commits.recordCommit(projSettleDedupe, provA);
+      commits.recordCommit(projSettleDedupe, settledRealA);
+      assert.deepStrictEqual(commits.loadCommitMap(projSettleDedupe).find(r => r.sha === 'pv1'), settledRealA,
+        'settled-real must win over an earlier provisional row');
+
+      // settled-real written FIRST, then a stray provisional for the same sha
+      // arrives later — settled must still win (order must not matter).
+      const settledRealB = { sha: 'pv2', ts: 't1', project: projSettleDedupe, sessions: [{ session: 'w1', files: ['b.js'] }], unattributed: [], provisional: false };
+      const provB = { sha: 'pv2', ts: 't2', project: projSettleDedupe, sessions: [], unattributed: ['b.js'], provisional: true };
+      commits.recordCommit(projSettleDedupe, settledRealB);
+      commits.recordCommit(projSettleDedupe, provB);
+      assert.deepStrictEqual(commits.loadCommitMap(projSettleDedupe).find(r => r.sha === 'pv2'), settledRealB,
+        'a LATER-arriving provisional row must never overwrite an already-settled row');
+
+      // provisional, then settled-EMPTY (foreign/unattributable) — settled,
+      // even though uninformative, still beats provisional.
+      const provC = { sha: 'pv3', ts: 't1', project: projSettleDedupe, sessions: [], unattributed: ['c.js'], provisional: true };
+      const settledEmptyC = { sha: 'pv3', ts: 't1', project: projSettleDedupe, sessions: [], unattributed: ['c.js'], provisional: false };
+      commits.recordCommit(projSettleDedupe, provC);
+      commits.recordCommit(projSettleDedupe, settledEmptyC);
+      assert.deepStrictEqual(commits.loadCommitMap(projSettleDedupe).find(r => r.sha === 'pv3'), settledEmptyC,
+        'settled-empty must still beat provisional');
+
+      // two provisional rows for the same sha (should not happen, but the
+      // existing later-wins tie-break must still hold within the tier).
+      const provD1 = { sha: 'pv4', ts: 't1', project: projSettleDedupe, sessions: [], unattributed: ['d.js'], provisional: true };
+      const provD2 = { sha: 'pv4', ts: 't2', project: projSettleDedupe, sessions: [], unattributed: ['d.js', 'e.js'], provisional: true };
+      commits.recordCommit(projSettleDedupe, provD1);
+      commits.recordCommit(projSettleDedupe, provD2);
+      assert.deepStrictEqual(commits.loadCommitMap(projSettleDedupe).find(r => r.sha === 'pv4'), provD2,
+        'within the provisional tier, later append still wins');
+
+      // Discriminating case: today's writers never produce a provisional row
+      // with a REAL session list (the hook only ever writes provisional with
+      // sessions:[]), but the precedence rule is defined to hold even then —
+      // settled ALWAYS outranks provisional, even settled-EMPTY vs
+      // provisional-REAL. (Under the old real-beats-empty-only rule, ignoring
+      // the provisional flag, provisional-real would have incorrectly won.)
+      const provRealE = { sha: 'pv5', ts: 't1', project: projSettleDedupe, sessions: [{ session: 'x', files: ['e.js'] }], unattributed: [], provisional: true };
+      const settledEmptyE = { sha: 'pv5', ts: 't2', project: projSettleDedupe, sessions: [], unattributed: ['e.js'], provisional: false };
+      commits.recordCommit(projSettleDedupe, provRealE);
+      commits.recordCommit(projSettleDedupe, settledEmptyE);
+      assert.deepStrictEqual(commits.loadCommitMap(projSettleDedupe).find(r => r.sha === 'pv5'), settledEmptyE,
+        'settled-empty must beat provisional-real — settled always outranks provisional, not just real-vs-empty');
+
+      const settledEmptyF = { sha: 'pv6', ts: 't1', project: projSettleDedupe, sessions: [], unattributed: ['f.js'], provisional: false };
+      const provRealF = { sha: 'pv6', ts: 't2', project: projSettleDedupe, sessions: [{ session: 'x', files: ['f.js'] }], unattributed: [], provisional: true };
+      commits.recordCommit(projSettleDedupe, settledEmptyF);
+      commits.recordCommit(projSettleDedupe, provRealF);
+      assert.deepStrictEqual(commits.loadCommitMap(projSettleDedupe).find(r => r.sha === 'pv6'), settledEmptyF,
+        'reverse order: a later provisional-real must not overwrite an earlier settled-empty');
+    });
+
+    // Backfill through the real syncOnce over a real repo (git init prior
+    // art: the auto-link and gitignore tests above). Events are planted a
+    // minute in the past so they predate the commits made now.
+    {
+      const projCap = path.join(ROOT, 'projects', 'commit-cap-app');
+      fs.mkdirSync(path.join(projCap, 'src'), { recursive: true });
+      const gitCap = args => spawnSync('git',
+        ['-C', projCap, '-c', 'user.email=t@t.t', '-c', 'user.name=T', ...args],
+        { encoding: 'utf8' });
+      gitCap(['init', '-q']);
+      // Persist the local identity so the authorship gate (committer email ==
+      // local user.email) recognises these commits as locally authored.
+      gitCap(['config', 'user.email', 't@t.t']);
+      gitCap(['config', 'user.name', 'T']);
+      const past = ms => new Date(Date.now() - ms).toISOString();
+      {
+        const st = util.loadState();
+        st.projects[projCap] = { events: [
+          { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projCap, 'src', 'one.js'), session: 'cap1' },
+          { ts: past(60000), source: 'Codex', kind: 'edit', file: path.join(projCap, 'src', 'two.js'), session: 'cap2' },
+        ] };
+        util.saveState(st);
+      }
+      fs.writeFileSync(path.join(projCap, 'src', 'one.js'), 'one\n');
+      gitCap(['add', '-A']);
+      gitCap(['commit', '-q', '-m', 'c1']);
+      const sha1 = gitCap(['rev-parse', 'HEAD']).stdout.trim();
+      syncOnce({ project: projCap });
+
+      // Round 3, commit 2: the WALK no longer attributes either — the same
+      // stale-evidence audit bug the hook had survives verbatim in the walk
+      // (daemon-off commits, rebases, non-hook repos are discovered here
+      // against events that may not include the committing session's edits
+      // yet). A walk-discovered LOCAL commit lands provisional and goes
+      // through the same settle gates as a hook-recorded one.
+      check('commits: syncOnce records a walk-discovered local commit PROVISIONALLY and advances the cursor', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 1, `expected 1 record, got ${JSON.stringify(map)}`);
+        assert.strictEqual(map[0].sha, sha1);
+        assert.ok(map[0].ts, 'record missing commit ts');
+        assert.strictEqual(map[0].provisional, true,
+          'the walk must not attribute from possibly-stale events — provisional, settle gates decide');
+        assert.deepStrictEqual(map[0].sessions, []);
+        assert.deepStrictEqual(map[0].unattributed, ['src/one.js']);
+        assert.strictEqual(util.loadState().projects[projCap].lastCommitSha, sha1, 'cursor not advanced');
+      });
+
+      // cap1's own post-commit activity arrives — the same settle fast path
+      // that serves hook-recorded rows now settles the walk-discovered one.
+      {
+        const st = util.loadState();
+        st.projects[projCap].events.push(
+          { ts: new Date(Date.now() + 5000).toISOString(), source: 'Claude Code', kind: 'prompt', text: 'cap1 continues', session: 'cap1' });
+        util.saveState(st);
+      }
+      syncOnce({ project: projCap });
+      check('commits: a walk-discovered commit settles attributed once its session\'s own events pass it', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 1, 'settle must dedupe, not grow the map');
+        assert.notStrictEqual(map[0].provisional, true, 'must be settled now');
+        assert.deepStrictEqual(map[0].sessions, [{ session: 'cap1', files: ['src/one.js'] }]);
+        assert.deepStrictEqual(map[0].unattributed, []);
+      });
+
+      fs.writeFileSync(path.join(projCap, 'src', 'two.js'), 'two\n');
+      gitCap(['add', '-A']);
+      gitCap(['commit', '-q', '-m', 'c2']);
+      const sha2 = gitCap(['rev-parse', 'HEAD']).stdout.trim();
+      syncOnce({ project: projCap });
+      syncOnce({ project: projCap }); // and once more with nothing new
+
+      check('commits: a second sync appends only the new commit (provisional); a third adds nothing (idempotent)', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 2, `expected 2 records, got ${JSON.stringify(map.map(r => r.sha))}`);
+        assert.strictEqual(map[0].sha, sha1, 'first record must be untouched');
+        assert.strictEqual(map[1].sha, sha2);
+        assert.strictEqual(map[1].provisional, true, 'walk-discovered c2 must land provisional too');
+        assert.deepStrictEqual(map[1].sessions, []);
+        assert.strictEqual(util.loadState().projects[projCap].lastCommitSha, sha2);
+      });
+
+      {
+        const st = util.loadState();
+        st.projects[projCap].events.push(
+          { ts: new Date(Date.now() + 5000).toISOString(), source: 'Codex', kind: 'prompt', text: 'cap2 continues', session: 'cap2' });
+        util.saveState(st);
+      }
+      syncOnce({ project: projCap });
+      check('commits: walk-discovered c2 settles to cap2; MemBridge\'s own swept-in files stay unattributed', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 2);
+        const rec = map.find(r => r.sha === sha2);
+        assert.notStrictEqual(rec.provisional, true);
+        assert.deepStrictEqual(rec.sessions, [{ session: 'cap2', files: ['src/two.js'] }]);
+        // c2's `git add -A` also swept .membridge/* (no .gitignore in this
+        // fixture) — those stay unattributed; two.js must not be among them.
+        assert.ok(!rec.unattributed.includes('src/two.js'), `two.js must be attributed, got ${JSON.stringify(rec.unattributed)}`);
+      });
+
+      check('commits: a non-repo project leaves sync green with zero commit rows', () => {
+        syncOnce(); // full pass over every tracked project, incl. non-repos
+        assert.ok(!fs.existsSync(path.join(proj1, '.membridge', 'commits.jsonl')),
+          'a project without a git repo must get no commit map');
+      });
+
+      // --- Phase 2 Task 4: instant capture via the git post-commit hook ----
+      {
+        const st = util.loadState();
+        st.projects[projCap].events.push(
+          { ts: past(30000), source: 'Claude Code', kind: 'edit', file: path.join(projCap, 'src', 'three.js'), session: 'cap3' });
+        util.saveState(st);
+      }
+      fs.writeFileSync(path.join(projCap, 'src', 'three.js'), 'three\n');
+      gitCap(['add', '-A']);
+      gitCap(['commit', '-q', '-m', 'c3']);
+      const sha3 = gitCap(['rev-parse', 'HEAD']).stdout.trim();
+      const hookEnv = { ...process.env };
+      const hook1 = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projCap, env: hookEnv, encoding: 'utf8' });
+      const hook2 = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projCap, env: hookEnv, encoding: 'utf8' });
+
+      // --- Provenance reconciliation (fix/provenance-reconciliation) -------
+      // Test 1 (brief's list): the hook writes a PROVISIONAL, unattributed
+      // row — it must never call attributeCommit itself anymore, because
+      // state.json at commit time is exactly the stale data that used to
+      // cause mis-attribution (see the dedicated core-scenario test below).
+      check('commits: `membridge hook post-commit` records HEAD once, PROVISIONALLY — second run is a no-op', () => {
+        assert.strictEqual(hook1.status, 0, `exit ${hook1.status}, stderr: ${hook1.stderr}`);
+        assert.strictEqual(hook1.stdout, '', 'a git hook must be silent');
+        assert.strictEqual(hook2.status, 0);
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 3, `expected 3 records, got ${JSON.stringify(map.map(r => r.sha))}`);
+        assert.strictEqual(map[2].sha, sha3);
+        assert.strictEqual(map[2].provisional, true, 'a fresh local-committer commit must be recorded provisional, not attributed');
+        assert.deepStrictEqual(map[2].sessions, [], 'the hook must not attribute — that is now the daemon settle step\'s job');
+        // `git add -A` on this fixture also sweeps in .membridge/* (no
+        // .gitignore is installed here), so c3's diff is src/three.js plus
+        // MemBridge's own housekeeping files — only assert what matters.
+        assert.ok(map[2].unattributed.includes('src/three.js'), `expected src/three.js in ${JSON.stringify(map[2].unattributed)}`);
+      });
+
+      check('commits: daemon sync after the hook adds no duplicate row and advances the cursor, but leaves it provisional (no newer events yet)', () => {
+        syncOnce({ project: projCap });
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        assert.strictEqual(map.length, 3, 'sync duplicated a hook-recorded commit');
+        assert.strictEqual(util.loadState().projects[projCap].lastCommitSha, sha3, 'cursor must advance over hook-recorded shas');
+        const rec = map.find(r => r.sha === sha3);
+        assert.strictEqual(rec.provisional, true,
+          'no event exists AFTER the commit yet, so the daemon has not necessarily caught up — must stay provisional, not force-settle');
+      });
+
+      // Settle happy path: once the CREDITED session's OWN events include
+      // activity after the commit (a session's file is read sequentially by
+      // offset, so its newer scanned event proves its older edits were
+      // scanned), the next pass settles the attribution. The pushed event is
+      // deliberately cap3's own — an UNRELATED session's newer event must
+      // NOT trigger settling (see the cross-session race block below).
+      {
+        const st = util.loadState();
+        st.projects[projCap].events.push(
+          { ts: new Date(Date.now() + 5000).toISOString(), source: 'Claude Code', kind: 'edit', file: path.join(projCap, 'src', 'four.js'), session: 'cap3' });
+        util.saveState(st);
+      }
+      syncOnce({ project: projCap });
+      check('commits: settle pass attributes a provisional row once the credited session\'s own events pass the commit', () => {
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projCap);
+        const rec = map.find(r => r.sha === sha3);
+        assert.ok(rec, 'settled row missing');
+        assert.notStrictEqual(rec.provisional, true, 'row must be settled after the daemon catches up');
+        assert.deepStrictEqual(rec.sessions, [{ session: 'cap3', files: ['src/three.js'] }]);
+        assert.ok(!rec.unattributed.includes('src/three.js'), 'src/three.js must now be attributed, not unattributed');
+      });
+
+      check('commits: hook outside a tracked project exits 0, silent, records nothing', () => {
+        const stray = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-stray-'));
+        spawnSync('git', ['-C', stray, 'init', '-q'], { encoding: 'utf8' });
+        const out = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: stray, env: hookEnv, encoding: 'utf8' });
+        assert.strictEqual(out.status, 0, `exit ${out.status}, stderr: ${out.stderr}`);
+        assert.strictEqual(out.stdout, '', 'must be silent outside a tracked project');
+        assert.ok(!fs.existsSync(path.join(stray, '.membridge')), 'stray repo must get no .membridge');
+      });
+
+      // Install/remove, mirroring the Stop-hook safety: fresh settings file,
+      // one repo with a pre-existing user hook (projCap), one bare tracked
+      // repo (projHook) that gets a fresh membridge-only hook file.
+      const projHook = path.join(ROOT, 'projects', 'hook-app');
+      fs.mkdirSync(projHook, { recursive: true });
+      spawnSync('git', ['-C', projHook, 'init', '-q'], { encoding: 'utf8' });
+      {
+        const st = util.loadState();
+        st.projects[projHook] = { events: [] };
+        util.saveState(st);
+      }
+      const userHook = '#!/bin/sh\necho user-post-commit\n';
+      fs.mkdirSync(path.join(projCap, '.git', 'hooks'), { recursive: true });
+      fs.writeFileSync(path.join(projCap, '.git', 'hooks', 'post-commit'), userHook);
+      const pcSettings = path.join(ROOT, 'claude-settings-pc.json');
+      const envPc = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: pcSettings };
+      const pcSetup1 = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+      const pcSetup2 = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+
+      check('commits: setup-hooks installs an executable post-commit hook with the absolute command', () => {
+        assert.strictEqual(pcSetup1.status, 0, pcSetup1.stderr);
+        const f = path.join(projHook, '.git', 'hooks', 'post-commit');
+        assert.ok(fs.existsSync(f), 'post-commit hook not written to a tracked repo');
+        const body = read(f);
+        assert.ok(body.startsWith('#!/bin/sh'), 'fresh hook file needs a shebang');
+        assert.ok(body.includes('membridge-hook.js') && body.includes('post-commit'), `hook body: ${body}`);
+        assert.ok(body.includes(`"${process.execPath}"`), 'command must be absolute (quoted runtime binary)');
+        if (process.platform !== 'win32') {
+          assert.ok(fs.statSync(f).mode & 0o111, 'hook file not executable');
+        }
+      });
+
+      check('commits: setup-hooks preserves an existing user post-commit byte-for-byte and never duplicates', () => {
+        assert.strictEqual(pcSetup2.status, 0, pcSetup2.stderr);
+        const body = read(path.join(projCap, '.git', 'hooks', 'post-commit'));
+        assert.ok(body.startsWith(userHook), 'user hook bytes changed');
+        assert.strictEqual(count(body, 'membridge-hook.js'), 1, 'membridge line missing or duplicated across two setup runs');
+      });
+
+      const pcRemove = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: envPc, encoding: 'utf8' });
+      check('commits: remove-hooks strips only the membridge line; a membridge-only hook file is deleted', () => {
+        assert.strictEqual(pcRemove.status, 0, pcRemove.stderr);
+        assert.ok(/post-commit/.test(pcRemove.stdout), `remove-hooks must report the post-commit cleanup, said: ${pcRemove.stdout}`);
+        assert.strictEqual(read(path.join(projCap, '.git', 'hooks', 'post-commit')), userHook,
+          'user hook must be restored byte-for-byte');
+        assert.ok(!fs.existsSync(path.join(projHook, '.git', 'hooks', 'post-commit')),
+          'a hook file that was only ours must be deleted');
+      });
+
+      // A user hook whose OWN line mentions membridge (their script calling
+      // the CLI) is theirs: install must append, never replace it; remove
+      // must leave it untouched. Only lines invoking our shim are ours.
+      const userMb = '#!/bin/sh\nmembridge sync --project . &\n';
+      fs.writeFileSync(path.join(projHook, '.git', 'hooks', 'post-commit'), userMb);
+      const mbSetup = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+      check('commits: a user hook line that merely mentions membridge is appended-to, never replaced', () => {
+        assert.strictEqual(mbSetup.status, 0, mbSetup.stderr);
+        const body = read(path.join(projHook, '.git', 'hooks', 'post-commit'));
+        assert.ok(body.startsWith(userMb), `user's membridge-mentioning line was replaced; body: ${body}`);
+        assert.ok(body.includes('membridge-hook.js'), 'our line must still be appended');
+      });
+      const mbRemove = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: envPc, encoding: 'utf8' });
+      check('commits: remove-hooks leaves a user line that merely mentions membridge intact', () => {
+        assert.strictEqual(mbRemove.status, 0, mbRemove.stderr);
+        assert.strictEqual(read(path.join(projHook, '.git', 'hooks', 'post-commit')), userMb,
+          'the user-owned membridge-mentioning line must survive removal');
+      });
+
+      // One unwritable hooks dir must not abort the whole install for every
+      // other repo (or block the Stop-hook settings write).
+      const projRo = path.join(ROOT, 'projects', 'ro-hook-app');
+      fs.mkdirSync(projRo, { recursive: true });
+      spawnSync('git', ['-C', projRo, 'init', '-q'], { encoding: 'utf8' });
+      {
+        const st = util.loadState();
+        st.projects[projRo] = { events: [] };
+        util.saveState(st);
+      }
+      fs.chmodSync(path.join(projRo, '.git', 'hooks'), 0o555);
+      const roSetup = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: envPc, encoding: 'utf8' });
+      fs.chmodSync(path.join(projRo, '.git', 'hooks'), 0o755);
+      check('commits: one unwritable hooks dir does not abort setup-hooks for the other repos', () => {
+        assert.strictEqual(roSetup.status, 0, `setup-hooks aborted: ${roSetup.stderr}`);
+        assert.ok(read(path.join(projHook, '.git', 'hooks', 'post-commit')).includes('membridge-hook.js'),
+          'healthy repos must still get their hook');
+        const settings = JSON.parse(read(pcSettings));
+        assert.ok((settings.hooks.Stop || []).length >= 1, 'the Stop hook settings write must still happen');
+      });
+
+      // A big backlog behind a VALID cursor drains in bounded per-pass slices
+      // (the first-run 50 cap alone does not cover this path), converging
+      // over passes instead of stalling one sync on hundreds of git calls.
+      const projMany = path.join(ROOT, 'projects', 'many-commits-app');
+      fs.mkdirSync(projMany, { recursive: true });
+      spawnSync('sh', ['-c',
+        `cd "${projMany}" && git init -q && git config user.email t@t.t && git config user.name T && git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m c0`],
+        { encoding: 'utf8' });
+      {
+        const st = util.loadState();
+        st.projects[projMany] = { events: [] };
+        util.saveState(st);
+      }
+      syncOnce({ project: projMany }); // cursor now at c0
+      spawnSync('sh', ['-c',
+        `cd "${projMany}" && for i in $(seq 1 54); do git -c user.email=t@t.t -c user.name=T commit -q --allow-empty -m c$i; done`],
+        { encoding: 'utf8' });
+      syncOnce({ project: projMany });
+      check('commits: a valid-cursor backlog is capped per pass and converges over passes', () => {
+        const commitsMod = require('../lib/commits');
+        assert.strictEqual(commitsMod.loadCommitMap(projMany).length, 51,
+          'second pass must record at most 50 new commits (1 + 50)');
+        syncOnce({ project: projMany });
+        assert.strictEqual(commitsMod.loadCommitMap(projMany).length, 55, 'third pass must drain the rest');
+        const head = spawnSync('git', ['-C', projMany, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+        assert.strictEqual(util.loadState().projects[projMany].lastCommitSha, head, 'cursor must converge to HEAD');
+      });
+
+      // Test 4 (brief's list): a commit with no matching (or no newer) events
+      // must stay provisional, not be force-settled to empty — recording a
+      // blind empty row here would be indistinguishable from "the daemon
+      // hasn't caught up yet". It settles once a newer event exists.
+      spawnSync('sh', ['-c',
+        `cd "${projMany}" && echo x > later.js && git add later.js && git -c user.email=t@t.t -c user.name=T commit -q -m c55`],
+        { encoding: 'utf8' });
+      const provRun = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projMany, env: hookEnv, encoding: 'utf8' });
+      check('commits: the hook records an unattributable-so-far commit PROVISIONALLY, never a frozen blind row', () => {
+        assert.strictEqual(provRun.status, 0, provRun.stderr);
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projMany);
+        assert.strictEqual(map.length, 56, 'the hook must record a provisional row for a new local commit');
+        assert.strictEqual(map[55].provisional, true);
+        assert.deepStrictEqual(map[55].sessions, []);
+      });
+
+      check('commits: a settle pass with NO newer events leaves the commit provisional (not force-settled empty)', () => {
+        syncOnce({ project: projMany }); // projMany has zero events, ever — nothing is "newer" than the commit
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projMany);
+        assert.strictEqual(map.length, 56, 'no duplicate row from the settle pass');
+        assert.strictEqual(map[55].provisional, true,
+          'with no events at all, the daemon cannot know it has caught up — must not guess "unattributed"');
+      });
+
+      // Grace window (validator regression, test b): when attributeCommit
+      // credits NOBODY, a newer event from an UNRELATED session is NOT proof
+      // the committing session's edits were scanned — cross-file discovery
+      // order is not ts-ordered, so the real author's edit may still be
+      // sitting unscanned in its own session file. Settling unattributed
+      // therefore waits out a grace window (SETTLE_GRACE_MS past the commit
+      // ts, measured in DATA timestamps, no wall clock) that bounds the
+      // cross-file scan race; only past it does "nobody" become the settled
+      // answer.
+      check('commits: within the grace window, an unrelated session\'s newer event must NOT settle the commit unattributed', () => {
+        const st = util.loadState();
+        st.projects[projMany] = st.projects[projMany] || { events: [] };
+        st.projects[projMany].events = [
+          ...(st.projects[projMany].events || []),
+          { ts: new Date(Date.now() + 5000).toISOString(), source: 'Claude Code', kind: 'edit', file: path.join(projMany, 'unrelated.js'), session: 'later-session' },
+        ];
+        util.saveState(st);
+        syncOnce({ project: projMany });
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projMany);
+        assert.strictEqual(map.length, 56, 'settling must never grow the deduped view');
+        assert.strictEqual(map[55].provisional, true,
+          'an unrelated session newer by seconds is NOT proof the author\'s edits were scanned — must stay provisional inside the grace window');
+      });
+
+      check('commits: beyond the grace window with still no candidate session, the commit settles unattributed (not stuck forever)', () => {
+        const scanMod = require('../lib/scan');
+        assert.ok(Number.isFinite(scanMod.SETTLE_GRACE_MS), 'SETTLE_GRACE_MS missing from lib/scan.js');
+        const st = util.loadState();
+        st.projects[projMany].events.push(
+          { ts: new Date(Date.now() + scanMod.SETTLE_GRACE_MS + 60000).toISOString(), source: 'Claude Code', kind: 'prompt', text: 'much later', session: 'later-session' });
+        util.saveState(st);
+        syncOnce({ project: projMany });
+        const commitsMod = require('../lib/commits');
+        const map = commitsMod.loadCommitMap(projMany);
+        assert.strictEqual(map.length, 56, 'settling must never grow the deduped view');
+        assert.notStrictEqual(map[55].provisional, true, 'past the grace window, no-candidate must settle unattributed');
+        assert.deepStrictEqual(map[55].sessions, []);
+        assert.deepStrictEqual(map[55].unattributed, ['later.js'], 'settled row carries the real attribution result');
+      });
+    }
+  }
+
+  // --- Provenance reconciliation, Test 2 (brief's list) — THE core scenario:
+  // stale state that WOULD have mis-attributed under the old hook. Session A
+  // has an OLD edit to shared.js already in state.json when the commit
+  // lands. Session B is the session that ACTUALLY made the commit's edit to
+  // shared.js — but B's edit event has NOT been scanned into state.json yet
+  // at commit time (exactly the daemon-hasn't-caught-up-yet window the audit
+  // describes). Under the OLD hook, attributeCommit would run against
+  // state.json as it stood at commit time — which only has A's edit — and
+  // credit A. The new hook must not attribute at all (provisional, sessions
+  // empty); only once B's edit is scanned in (plus a later event proving the
+  // daemon has caught up) does the settle pass attribute the commit, and it
+  // must attribute to B, never A.
+  {
+    const projCore = path.join(ROOT, 'projects', 'core-scenario-app');
+    fs.mkdirSync(path.join(projCore, 'src'), { recursive: true });
+    const gc = args => spawnSync('git', ['-C', projCore, '-c', 'user.email=core@local.dev', '-c', 'user.name=Core', ...args], { encoding: 'utf8' });
+    gc(['init', '-q']);
+    gc(['config', 'user.email', 'core@local.dev']);
+    gc(['config', 'user.name', 'Core']);
+    const past = ms => new Date(Date.now() - ms).toISOString();
+    // Session A's stale edit is the ONLY thing in state.json at commit time —
+    // this is the data the OLD hook would have (mis)attributed from.
+    {
+      const st = util.loadState();
+      st.projects[projCore] = { events: [
+        { ts: past(600000), source: 'Claude Code', kind: 'edit', file: path.join(projCore, 'src', 'shared.js'), session: 'sessionA' },
+      ] };
+      util.saveState(st);
+    }
+    // Session B makes the REAL edit that produces the commit — its event is
+    // deliberately NOT in state yet (not scanned this tick).
+    fs.writeFileSync(path.join(projCore, 'src', 'shared.js'), 'export const shared = () => "B";\n');
+    gc(['add', '-A']);
+    gc(['commit', '-q', '-m', 'B commits']);
+    const coreSha = gc(['rev-parse', 'HEAD']).stdout.trim();
+
+    const coreHookEnv = { ...process.env };
+    const coreHook = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projCore, env: coreHookEnv, encoding: 'utf8' });
+    check('provenance reconciliation: the hook does NOT credit stale session A at commit time — provisional, unattributed', () => {
+      assert.strictEqual(coreHook.status, 0, coreHook.stderr);
+      const map = require('../lib/commits').loadCommitMap(projCore);
+      const rec = map.find(r => r.sha === coreSha);
+      assert.ok(rec, 'commit not recorded');
+      assert.strictEqual(rec.provisional, true);
+      assert.deepStrictEqual(rec.sessions, [], 'the OLD hook would have credited sessionA here — the new hook must credit nobody yet');
+    });
+
+    // Now the daemon catches up: B's edit is scanned in (timestamped just
+    // before the commit, exactly like a real edit-then-commit), plus a
+    // trailing event proving the daemon has scanned PAST the commit's ts.
+    {
+      const st = util.loadState();
+      st.projects[projCore].events.push(
+        { ts: past(2000), source: 'Claude Code', kind: 'edit', file: path.join(projCore, 'src', 'shared.js'), session: 'sessionB' },
+        { ts: new Date(Date.now() + 5000).toISOString(), source: 'Claude Code', kind: 'prompt', text: 'next prompt', session: 'sessionB' },
+      );
+      util.saveState(st);
+    }
+    syncOnce({ project: projCore });
+    check('provenance reconciliation: the settle pass attributes the commit to the ACTUAL session B, never stale session A', () => {
+      const map = require('../lib/commits').loadCommitMap(projCore);
+      const rec = map.find(r => r.sha === coreSha);
+      assert.ok(rec, 'settled commit missing');
+      assert.notStrictEqual(rec.provisional, true, 'must be settled by now');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'sessionB', files: ['src/shared.js'] }],
+        'the commit must be credited to sessionB (the real author), not sessionA (the stale one)');
+      assert.deepStrictEqual(rec.unattributed, []);
+    });
+  }
+
+  // --- Cross-session premature-settle race (validator regression, test a) --
+  // The settle gate must be PER-CREDITED-SESSION, not global: an UNRELATED
+  // session C's newer scanned event says nothing about whether the true
+  // author B's edit was scanned — event discovery across different session
+  // files is not ts-ordered (only WITHIN one session's file does sequential
+  // offset reading guarantee order). A global newest-event-ts gate would fire
+  // on C's event and settle the commit to stale session A while B's edit is
+  // still unscanned — permanently, since settled rows are never reprocessed.
+  {
+    const projX = path.join(ROOT, 'projects', 'cross-session-app');
+    fs.mkdirSync(path.join(projX, 'src'), { recursive: true });
+    const gx = args => spawnSync('git', ['-C', projX, '-c', 'user.email=x@local.dev', '-c', 'user.name=X', ...args], { encoding: 'utf8' });
+    gx(['init', '-q']);
+    gx(['config', 'user.email', 'x@local.dev']);
+    gx(['config', 'user.name', 'X']);
+    const past = ms => new Date(Date.now() - ms).toISOString();
+    const future = ms => new Date(Date.now() + ms).toISOString();
+    // Session A's STALE edit to shared.js is scanned; that is ALL state
+    // holds at commit time.
+    {
+      const st = util.loadState();
+      st.projects[projX] = { events: [
+        { ts: past(600000), source: 'Claude Code', kind: 'edit', file: path.join(projX, 'src', 'shared.js'), session: 'sessionA' },
+      ] };
+      util.saveState(st);
+    }
+    // Session B makes the real edit and commits.
+    fs.writeFileSync(path.join(projX, 'src', 'shared.js'), 'export const shared = () => "B";\n');
+    gx(['add', '-A']);
+    gx(['commit', '-q', '-m', 'B commits']);
+    const xSha = gx(['rev-parse', 'HEAD']).stdout.trim();
+    const xHook = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projX, env: { ...process.env }, encoding: 'utf8' });
+    // An UNRELATED session C's event NEWER than the commit is scanned
+    // (within the grace window); B's edit is still unscanned — the exact
+    // cross-file race the validator reproduced.
+    {
+      const st = util.loadState();
+      st.projects[projX].events.push(
+        { ts: future(5000), source: 'Codex', kind: 'prompt', text: 'unrelated work', session: 'sessionC' });
+      util.saveState(st);
+    }
+    syncOnce({ project: projX });
+    check('cross-session race: an unrelated session\'s newer event must NOT settle the commit to stale session A', () => {
+      assert.strictEqual(xHook.status, 0, xHook.stderr);
+      const rec = require('../lib/commits').loadCommitMap(projX).find(r => r.sha === xSha);
+      assert.ok(rec, 'commit not recorded');
+      assert.strictEqual(rec.provisional, true,
+        `must stay provisional: the only credited candidate (stale sessionA) has no post-commit events of its own, so B's real edit may still be unscanned — got ${JSON.stringify(rec)}`);
+      assert.deepStrictEqual(rec.sessions, [], 'stale sessionA must never be credited');
+    });
+    // Now B's real edit — and B's own post-commit activity, proving B's file
+    // was read past the commit — is scanned in.
+    {
+      const st = util.loadState();
+      st.projects[projX].events.push(
+        { ts: past(2000), source: 'Claude Code', kind: 'edit', file: path.join(projX, 'src', 'shared.js'), session: 'sessionB' },
+        { ts: future(6000), source: 'Claude Code', kind: 'prompt', text: 'B continues', session: 'sessionB' });
+      util.saveState(st);
+    }
+    syncOnce({ project: projX });
+    check('cross-session race: once the true author\'s own events pass the commit, it settles to B — never A', () => {
+      const rec = require('../lib/commits').loadCommitMap(projX).find(r => r.sha === xSha);
+      assert.ok(rec, 'row missing');
+      assert.notStrictEqual(rec.provisional, true, 'must be settled once B\'s own events pass the commit');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'sessionB', files: ['src/shared.js'] }],
+        'the settled row must credit sessionB, the true author');
+      assert.deepStrictEqual(rec.unattributed, []);
+    });
+  }
+
+  // --- Attributed-gate starvation (panel regression, round 3) --------------
+  // Commit-as-last-act: the session's edit is scanned, the commit lands, and
+  // the chat ENDS — the session never produces a post-commit event, so the
+  // strict per-credited-session gate can never fire. Without a bounded
+  // escape, the row stays provisional forever (why: "pending" indefinitely,
+  // churn excludes it) and — worse — once the events cap evicts the
+  // session's edit, attributeCommit credits nobody and the no-candidate
+  // grace settles the row PERMANENTLY unattributed, destroying provenance
+  // the daemon had already scanned. The escape: once the GLOBAL newest
+  // scanned event is past commit + SETTLE_GRACE_MS, settle WITH the current
+  // attribution — grace (minutes of data time) vastly precedes cap eviction
+  // (hundreds of events).
+  {
+    const projLA = path.join(ROOT, 'projects', 'last-act-app');
+    fs.mkdirSync(path.join(projLA, 'src'), { recursive: true });
+    const gla = args => spawnSync('git', ['-C', projLA, '-c', 'user.email=la@local.dev', '-c', 'user.name=LA', ...args], { encoding: 'utf8' });
+    gla(['init', '-q']);
+    gla(['config', 'user.email', 'la@local.dev']);
+    gla(['config', 'user.name', 'LA']);
+    // The session's edit IS scanned before the commit — evidence is complete.
+    {
+      const st = util.loadState();
+      st.projects[projLA] = { events: [
+        { ts: new Date(Date.now() - 2000).toISOString(), source: 'Claude Code', kind: 'edit', file: path.join(projLA, 'src', 'only.js'), session: 'lastS' },
+      ] };
+      util.saveState(st);
+    }
+    fs.writeFileSync(path.join(projLA, 'src', 'only.js'), 'export const only = 1;\n');
+    gla(['add', '-A']);
+    gla(['commit', '-q', '-m', 'last act of the session']);
+    const laSha = gla(['rev-parse', 'HEAD']).stdout.trim();
+    const laHook = spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projLA, env: { ...process.env }, encoding: 'utf8' });
+    // The session ends here: NO post-commit lastS event, ever. Other,
+    // unrelated activity moves data time past the grace window.
+    {
+      const scanMod = require('../lib/scan');
+      const st = util.loadState();
+      st.projects[projLA].events.push(
+        { ts: new Date(Date.now() + scanMod.SETTLE_GRACE_MS + 60000).toISOString(), source: 'Codex', kind: 'prompt', text: 'unrelated later work', session: 'otherU' });
+      util.saveState(st);
+    }
+    syncOnce({ project: projLA });
+    check('last-act: a credited session with no post-commit events settles ATTRIBUTED once data time passes the grace window', () => {
+      assert.strictEqual(laHook.status, 0, laHook.stderr);
+      const rec = require('../lib/commits').loadCommitMap(projLA).find(r => r.sha === laSha);
+      assert.ok(rec, 'commit not recorded');
+      assert.notStrictEqual(rec.provisional, true,
+        'must not stay provisional forever — the session\'s last act was the commit, so its own post-commit event will never come');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'lastS', files: ['src/only.js'] }],
+        'must settle WITH the scanned attribution, to lastS');
+      assert.deepStrictEqual(rec.unattributed, []);
+    });
+
+    check('last-act: eviction of the credited session\'s events can no longer flip the row to unattributed', () => {
+      // Simulate the events-cap eviction that, under the starved gate, used
+      // to destroy the attribution: drop every lastS event, then settle
+      // again. The row settled ATTRIBUTED before eviction could happen, and
+      // settled rows are final — the attribution must survive.
+      const st = util.loadState();
+      st.projects[projLA].events = st.projects[projLA].events.filter(e => e.session !== 'lastS');
+      util.saveState(st);
+      syncOnce({ project: projLA });
+      const rec = require('../lib/commits').loadCommitMap(projLA).find(r => r.sha === laSha);
+      assert.ok(rec, 'row missing');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'lastS', files: ['src/only.js'] }],
+        'the settled attribution must survive eviction — never be replaced by a settled-unattributed row');
+      assert.notStrictEqual(rec.provisional, true);
+    });
+  }
+
+  // --- Corrupt-future-timestamp clamp (panel hardening, round 3) -----------
+  // One garbage event ts far in the future would otherwise satisfy every
+  // data-time grace comparison instantly, voiding the window's protection
+  // (premature unattributed — or, with the escape above, premature
+  // attributed — settling). Events absurdly past the pending commits' own
+  // ts must be ignored by the settle gates.
+  {
+    const projCl = path.join(ROOT, 'projects', 'clamp-app');
+    fs.mkdirSync(projCl, { recursive: true });
+    const gcl = args => spawnSync('git', ['-C', projCl, '-c', 'user.email=cl@local.dev', '-c', 'user.name=CL', ...args], { encoding: 'utf8' });
+    gcl(['init', '-q']);
+    gcl(['config', 'user.email', 'cl@local.dev']);
+    gcl(['config', 'user.name', 'CL']);
+    {
+      const st = util.loadState();
+      st.projects[projCl] = { events: [
+        // Corrupt: decades in the future. Must not count as "caught up".
+        { ts: '2099-01-01T00:00:00.000Z', source: 'Codex', kind: 'prompt', text: 'corrupt clock', session: 'corruptS' },
+      ] };
+      util.saveState(st);
+    }
+    fs.writeFileSync(path.join(projCl, 'solo.js'), 'solo\n');
+    gcl(['add', 'solo.js']);
+    gcl(['commit', '-q', '-m', 'nobody\'s commit']);
+    const clSha = gcl(['rev-parse', 'HEAD']).stdout.trim();
+    spawnSync(process.execPath, [BIN, 'hook', 'post-commit'], { cwd: projCl, env: { ...process.env }, encoding: 'utf8' });
+    check('clamp: one corrupt far-future event ts must not void the grace window and settle the commit prematurely', () => {
+      syncOnce({ project: projCl });
+      const commitsMod = require('../lib/commits');
+      let rec = commitsMod.loadCommitMap(projCl).find(r => r.sha === clSha);
+      assert.ok(rec, 'commit not recorded');
+      assert.strictEqual(rec.provisional, true,
+        'a 2099 timestamp is corruption, not proof the daemon caught up — must stay provisional');
+      // Sane data time really passing the grace window still settles.
+      const scanMod = require('../lib/scan');
+      const st = util.loadState();
+      st.projects[projCl].events.push(
+        { ts: new Date(Date.now() + scanMod.SETTLE_GRACE_MS + 60000).toISOString(), source: 'Codex', kind: 'prompt', text: 'legit later work', session: 'otherV' });
+      util.saveState(st);
+      syncOnce({ project: projCl });
+      rec = commitsMod.loadCommitMap(projCl).find(r => r.sha === clSha);
+      assert.notStrictEqual(rec.provisional, true, 'legitimate post-grace data time must still settle');
+      assert.deepStrictEqual(rec.sessions, []);
+      assert.deepStrictEqual(rec.unattributed, ['solo.js']);
+    });
+  }
+
+  // --- Weekend gap (validator/attacker regression, round 4) ----------------
+  // The sanity clamp must be anchored to the WALL CLOCK, not to the newest
+  // pending commit: a Friday-evening last-act commit followed by a legit
+  // >24h quiet gap must not turn Monday's real events into "corrupt future"
+  // timestamps — that froze settling (and stretched the eviction window)
+  // until the NEXT local commit happened to move the old anchor. Corruption
+  // is an event claiming to be from the machine's own future, nothing else.
+  {
+    const HOUR = 3600 * 1000;
+    const T0 = Date.now() - 63 * HOUR; // Friday evening, ~2.6 days ago
+    const projWk = path.join(ROOT, 'projects', 'weekend-gap-app');
+    fs.mkdirSync(path.join(projWk, 'src'), { recursive: true });
+    const gwk = (args, env) => spawnSync('git', ['-C', projWk, ...args],
+      { encoding: 'utf8', env: { ...process.env, ...(env || {}) } });
+    gwk(['init', '-q']);
+    gwk(['config', 'user.email', 'wk@local.dev']);
+    gwk(['config', 'user.name', 'WK']);
+    // The author's edit is scanned, then the commit lands Friday evening as
+    // the session's last act.
+    {
+      const st = util.loadState();
+      st.projects[projWk] = { events: [
+        { ts: new Date(T0 - 60000).toISOString(), source: 'Claude Code', kind: 'edit', file: path.join(projWk, 'src', 'only.js'), session: 'authorS' },
+      ] };
+      util.saveState(st);
+    }
+    fs.writeFileSync(path.join(projWk, 'src', 'only.js'), 'friday work\n');
+    gwk(['add', '-A']);
+    gwk(['commit', '-q', '-m', 'friday last act'],
+      { GIT_AUTHOR_DATE: new Date(T0).toISOString(), GIT_COMMITTER_DATE: new Date(T0).toISOString() });
+    const wkSha = gwk(['rev-parse', 'HEAD']).stdout.trim();
+    syncOnce({ project: projWk }); // walk records provisional; nothing newer than the commit yet
+    // Monday: the author's own session resumes (>24h after the commit) plus
+    // fresh unrelated activity — all with correct clocks, all in the PAST.
+    {
+      const st = util.loadState();
+      st.projects[projWk].events.push(
+        { ts: new Date(Date.now() - 2 * HOUR).toISOString(), source: 'Claude Code', kind: 'prompt', text: 'resume Monday', session: 'authorS' },
+        { ts: new Date(Date.now() - 60000).toISOString(), source: 'Codex', kind: 'prompt', text: 'other work', session: 'otherS' });
+      util.saveState(st);
+    }
+    syncOnce({ project: projWk });
+    check('weekend gap: a legit >24h quiet gap must not freeze settling — the resumed session settles the row attributed, no next commit needed', () => {
+      const rec = require('../lib/commits').loadCommitMap(projWk).find(r => r.sha === wkSha);
+      assert.ok(rec, 'commit not recorded');
+      assert.notStrictEqual(rec.provisional, true,
+        'Monday events are real, past-tense data — the clamp must not discard them just because the last pending commit was Friday');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'authorS', files: ['src/only.js'] }],
+        'the author\'s own resumed event satisfies the per-session fast path');
+    });
+  }
+
+  // --- Phase 3 Task 1: authorship gate end-to-end over a real repo ---------
+  // A commit whose committer is the local identity is attributed; a commit
+  // pulled from a teammate (foreign committer) is recorded unattributed-locally
+  // and NEVER falsely credited; a repo with no local user.email fails closed.
+  {
+    const projGate = path.join(ROOT, 'projects', 'authorship-gate-app');
+    fs.mkdirSync(path.join(projGate, 'src'), { recursive: true });
+    const rawGit = args => spawnSync('git', ['-C', projGate, ...args], { encoding: 'utf8' });
+    rawGit(['init', '-q']);
+    rawGit(['config', 'user.email', 'me@local.dev']);
+    rawGit(['config', 'user.name', 'Me']);
+    const past = ms => new Date(Date.now() - ms).toISOString();
+    {
+      const st = util.loadState();
+      st.projects[projGate] = { events: [
+        { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projGate, 'src', 'mine.js'), session: 'gLocal' },
+        { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projGate, 'src', 'pulled.js'), session: 'gForeign' },
+      ] };
+      util.saveState(st);
+    }
+    // A local commit (committer == me@local.dev).
+    fs.writeFileSync(path.join(projGate, 'src', 'mine.js'), 'mine\n');
+    rawGit(['add', '-A']);
+    rawGit(['commit', '-q', '-m', 'local edit']);
+    const shaLocal = rawGit(['rev-parse', 'HEAD']).stdout.trim();
+    // A commit whose committer is a teammate (as after a `git pull`).
+    fs.writeFileSync(path.join(projGate, 'src', 'pulled.js'), 'pulled\n');
+    rawGit(['add', '-A']);
+    spawnSync('git', ['-C', projGate, '-c', 'user.email=teammate@remote.dev', '-c', 'user.name=Teammate',
+      'commit', '-q', '-m', 'teammate edit'], { encoding: 'utf8' });
+    const shaForeign = rawGit(['rev-parse', 'HEAD']).stdout.trim();
+    syncOnce({ project: projGate });
+
+    check('gate: a walk-discovered local-committer commit lands provisional (attribution deferred to the settle gates)', () => {
+      const map = require('../lib/commits').loadCommitMap(projGate);
+      const rec = map.find(r => r.sha === shaLocal);
+      assert.ok(rec, 'local commit not recorded');
+      assert.strictEqual(rec.provisional, true, 'the walk must not attribute from possibly-stale events');
+      assert.deepStrictEqual(rec.sessions, []);
+    });
+
+    check('gate: a foreign-committer (pulled) commit is recorded settled-unattributed, never credited, never provisional', () => {
+      const map = require('../lib/commits').loadCommitMap(projGate);
+      const rec = map.find(r => r.sha === shaForeign);
+      assert.ok(rec, 'foreign commit not recorded');
+      assert.deepStrictEqual(rec.sessions, [], 'a foreign committer must never be credited to a local session');
+      assert.deepStrictEqual(rec.unattributed, ['src/pulled.js'], 'its files are unattributed-locally');
+      assert.notStrictEqual(rec.provisional, true,
+        'a foreign commit must be settled at discovery — provisional would leave a path to attributing it later');
+    });
+
+    // The local commit settles attributed once gLocal's own events pass it —
+    // the walk feeds the same gates as the hook.
+    {
+      const st = util.loadState();
+      st.projects[projGate].events.push(
+        { ts: new Date(Date.now() + 5000).toISOString(), source: 'Claude Code', kind: 'prompt', text: 'g continues', session: 'gLocal' });
+      util.saveState(st);
+    }
+    syncOnce({ project: projGate });
+    check('gate: the walk-discovered local commit settles attributed to its session; the foreign row is untouched', () => {
+      const map = require('../lib/commits').loadCommitMap(projGate);
+      const rec = map.find(r => r.sha === shaLocal);
+      assert.notStrictEqual(rec.provisional, true, 'must be settled now');
+      assert.deepStrictEqual(rec.sessions, [{ session: 'gLocal', files: ['src/mine.js'] }]);
+      assert.deepStrictEqual(rec.unattributed, []);
+      const foreign = map.find(r => r.sha === shaForeign);
+      assert.deepStrictEqual(foreign.sessions, [], 'the settled foreign row must never be revisited into attribution');
+    });
+
+    check('gate: a repo with no local user.email fails closed (no throw, nothing credited)', () => {
+      const projNoId = path.join(ROOT, 'projects', 'no-identity-app');
+      fs.mkdirSync(path.join(projNoId, 'src'), { recursive: true });
+      const g = args => spawnSync('git', ['-C', projNoId, ...args], { encoding: 'utf8' });
+      g(['init', '-q']);
+      // Deliberately no user.email config. Commit with an ad-hoc identity.
+      {
+        const st = util.loadState();
+        st.projects[projNoId] = { events: [
+          { ts: past(120000), source: 'Claude Code', kind: 'edit', file: path.join(projNoId, 'src', 'x.js'), session: 'nLocal' },
+        ] };
+        util.saveState(st);
+      }
+      fs.writeFileSync(path.join(projNoId, 'src', 'x.js'), 'x\n');
+      g(['add', '-A']);
+      spawnSync('git', ['-C', projNoId, '-c', 'user.email=whoever@nowhere.dev', '-c', 'user.name=W',
+        'commit', '-q', '-m', 'c'], { encoding: 'utf8' });
+      const sha = g(['rev-parse', 'HEAD']).stdout.trim();
+      assert.doesNotThrow(() => syncOnce({ project: projNoId }));
+      const rec = require('../lib/commits').loadCommitMap(projNoId).find(r => r.sha === sha);
+      assert.ok(rec, 'commit should still be recorded');
+      assert.deepStrictEqual(rec.sessions, [], 'fail closed: nothing credited without a local identity');
+    });
+  }
+
+  // --- Phase 3 Task 3: churn — landed-vs-reverted diagnostic (local-only) ---
+  // Pure, injected: a fixture commit map + a fake runGit answering `git show
+  // --numstat` (additions per commit) and `git blame HEAD` (which HEAD lines
+  // still originate from the session's commits). No real repo, no wall clock,
+  // and — by design — NO author/teammate parameter anywhere in the signature.
+  {
+    const { churn } = require('../lib/churn');
+    const C1 = '1'.repeat(40), C2 = '2'.repeat(40), OTHER = '9'.repeat(40);
+    const DAY = 24 * 60 * 60 * 1000;
+    const NOW = Date.parse('2026-07-18T00:00:00Z');
+    const settledTs = new Date(NOW - 30 * DAY).toISOString(); // 30d old = settled
+    const recentTs = new Date(NOW - 1 * DAY).toISOString();   // 1d old = too recent
+    // A porcelain blame block: one header line per source line, sha first.
+    const blame = shas => shas.map((s, i) => `${s} ${i + 1} ${i + 1} 1\nauthor X\ncommitter X\n\tcode ${i}\n`).join('');
+    const mapSettled = [
+      { sha: C1, ts: settledTs, project: '/repo', sessions: [{ session: 'S', files: ['a.js'] }], unattributed: [] },
+      { sha: C2, ts: settledTs, project: '/repo', sessions: [{ session: 'S', files: ['b.js'] }], unattributed: [] },
+    ];
+    const numstat = { [C1]: '10\t0\ta.js\n', [C2]: '6\t0\tb.js\n' };
+    const blameByFile = {
+      'a.js': blame([...Array(7).fill(C1), OTHER]), // 7 of 10 introduced lines survive
+      'b.js': blame(Array(6).fill(C2)),             // all 6 survive
+    };
+    const mkRun = () => {
+      const calls = [];
+      const runGit = args => {
+        calls.push(args);
+        if (args[0] === 'show') {
+          const sha = args.find(a => /^[0-9a-f]{40}$/.test(a));
+          return numstat[sha] || '';
+        }
+        if (args[0] === 'blame') return blameByFile[args[args.length - 1]] || '';
+        throw new Error(`unexpected git ${args.join(' ')}`);
+      };
+      return { calls, runGit };
+    };
+
+    check('churn: landed-vs-written is computed from numstat additions and HEAD blame survival', () => {
+      const { runGit } = mkRun();
+      const res = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit });
+      assert.strictEqual(res.status, 'ok', `status: ${res.status}`);
+      assert.strictEqual(res.written, 16, 'written = 10 + 6 additions');
+      assert.strictEqual(res.landed, 13, 'landed = 7 (a.js) + 6 (b.js) surviving lines');
+      assert.ok(Math.abs(res.fraction - 13 / 16) < 1e-9, `fraction: ${res.fraction}`);
+      assert.strictEqual(res.commits, 2, 'two settled commits evaluated');
+    });
+
+    check('churn: a session whose commits are all within the window is too-recent (not yet judgeable)', () => {
+      const recentMap = mapSettled.map(r => ({ ...r, ts: recentTs }));
+      const res = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => recentMap, runGit: mkRun().runGit });
+      assert.strictEqual(res.status, 'too-recent');
+      assert.strictEqual(res.fraction, null);
+    });
+
+    check('churn: an empty commit set is insufficient, never a divide-by-zero', () => {
+      const res = churn('/repo', { session: 'ghost', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit: mkRun().runGit });
+      assert.strictEqual(res.status, 'insufficient');
+      assert.strictEqual(res.fraction, null);
+      assert.strictEqual(res.written, 0);
+    });
+
+    check('churn: any git failure degrades to unavailable and never throws', () => {
+      const dead = () => { throw new Error('fatal: not a git repository'); };
+      let res;
+      assert.doesNotThrow(() => { res = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit: dead }); });
+      assert.strictEqual(res.status, 'unavailable');
+      assert.strictEqual(res.fraction, null);
+    });
+
+    check('churn: has no author/teammate parameter — cross-person input is impossible by construction', () => {
+      // The signature is churn(projectPath, {session, sinceDays, now}, deps):
+      // an author-like option is simply not read, so it can never scope results.
+      const { runGit } = mkRun();
+      const base = churn('/repo', { session: 'S', sinceDays: 7, now: NOW }, { loadCommitMap: () => mapSettled, runGit });
+      const withAuthor = churn('/repo', { session: 'S', sinceDays: 7, now: NOW, author: 'marco', teammate: 'x' }, { loadCommitMap: () => mapSettled, runGit: mkRun().runGit });
+      assert.deepStrictEqual(withAuthor, base, 'an author/teammate option must be ignored, not honored');
+      assert.ok(!('author' in base) && !('who' in base), 'the churn result exposes no person dimension');
+    });
+
+    // --- Phase 3 Task 3: churn CLI renderer + wiring -----------------------
+    const churnLib = require('../lib/churn');
+    check('churn: parseSince reads "7d"/bare numbers and defaults to 7 days', () => {
+      assert.strictEqual(churnLib.parseSince('7d'), 7);
+      assert.strictEqual(churnLib.parseSince('30d'), 30);
+      assert.strictEqual(churnLib.parseSince('14'), 14);
+      assert.strictEqual(churnLib.parseSince(null), 7);
+      assert.strictEqual(churnLib.parseSince('garbage'), 7);
+    });
+
+    const CAVEAT_RE = /diagnostic.*not a target|never compared across (people|teammates)/i;
+    check('churn: renderChurn always ships the fixed caveat, and shows numbers only when ok', () => {
+      assert.ok(churnLib.renderChurn, 'renderChurn missing');
+      const ok = churnLib.renderChurn({ commits: 2, written: 16, landed: 13, fraction: 13 / 16, status: 'ok' }, { session: 'S', sinceDays: 7 });
+      assert.ok(/16/.test(ok) && /13/.test(ok), `ok render must show written/landed: ${ok}`);
+      assert.ok(/8[01]%|0\.8/.test(ok), `ok render must show the fraction: ${ok}`);
+      assert.ok(CAVEAT_RE.test(ok), `caveat missing from ok render: ${ok}`);
+      assert.ok(/approximate/i.test(ok), `pre-gate approximate note missing: ${ok}`);
+      for (const status of ['too-recent', 'insufficient', 'unavailable']) {
+        const out = churnLib.renderChurn({ commits: 0, written: 0, landed: 0, fraction: null, status }, { session: 'S', sinceDays: 7 });
+        assert.ok(CAVEAT_RE.test(out), `caveat missing from ${status} render: ${out}`);
+        assert.ok(out.length > 0 && !/NaN|undefined/.test(out), `${status} render must be an honest message: ${out}`);
+      }
+    });
+
+    // CLI wiring: real spawn. churn over projWhy (a tracked non-repo) degrades
+    // to 'unavailable' but must still exit 0 and print the caveat; an author-
+    // like flag must be REJECTED rather than silently scoping to a teammate.
+    const churnRun = spawnSync(process.execPath, [BIN, 'churn'], { cwd: proj1, encoding: 'utf8', env: process.env });
+    check('churn: `membridge churn` exits 0 and always prints the diagnostic caveat', () => {
+      assert.strictEqual(churnRun.status, 0, `exit ${churnRun.status}, stderr: ${churnRun.stderr}`);
+      assert.ok(CAVEAT_RE.test(churnRun.stdout), `caveat missing from CLI: ${churnRun.stdout}`);
+    });
+    const churnBad = spawnSync(process.execPath, [BIN, 'churn', '--teammate', 'marco'], { cwd: proj1, encoding: 'utf8', env: process.env });
+    check('churn: an author/teammate-like flag is rejected, never honored', () => {
+      assert.notStrictEqual(churnBad.status, 0, 'churn must reject an unknown per-person flag');
+      assert.ok(/no.*(per-person|teammate|author)|unknown option/i.test(churnBad.stderr + churnBad.stdout),
+        `expected a rejection message, got: ${churnBad.stderr}${churnBad.stdout}`);
+    });
+  }
+
+  // --- Phase 3 Task 4: spine hardening -------------------------------------
+  // (a) honor core.hooksPath; (b) atomic O_APPEND on commits.jsonl; (c) skip a
+  // repo whose HEAD is unchanged since the cursor last caught up.
+  {
+    // (a) A repo with a custom core.hooksPath must get its post-commit hook in
+    // THAT directory (else those users get no capture), and lose it on removal.
+    const projHP = path.join(ROOT, 'projects', 'hookspath-app');
+    fs.mkdirSync(projHP, { recursive: true });
+    const ghp = args => spawnSync('git', ['-C', projHP, ...args], { encoding: 'utf8' });
+    ghp(['init', '-q']);
+    ghp(['config', 'core.hooksPath', '.myhooks']);
+    { const st = util.loadState(); st.projects[projHP] = { events: [] }; util.saveState(st); }
+    const hpSettings = path.join(ROOT, 'claude-settings-hp.json');
+    const hpEnv = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: hpSettings };
+    const hpSetup = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env: hpEnv, encoding: 'utf8' });
+    check('spine: setup-hooks honors core.hooksPath (writes into the configured hooks dir)', () => {
+      assert.strictEqual(hpSetup.status, 0, hpSetup.stderr);
+      const custom = path.join(projHP, '.myhooks', 'post-commit');
+      assert.ok(fs.existsSync(custom), `hook not written to core.hooksPath dir; expected ${custom}`);
+      assert.ok(read(custom).includes('membridge-hook.js'), 'membridge line missing from the custom hooks dir');
+      assert.ok(!fs.existsSync(path.join(projHP, '.git', 'hooks', 'post-commit')),
+        'must NOT fall back to .git/hooks when core.hooksPath is set');
+    });
+    const hpRemove = spawnSync(process.execPath, [BIN, 'remove-hooks'], { env: hpEnv, encoding: 'utf8' });
+    check('spine: remove-hooks honors core.hooksPath (strips from the configured hooks dir)', () => {
+      assert.strictEqual(hpRemove.status, 0, hpRemove.stderr);
+      assert.ok(!fs.existsSync(path.join(projHP, '.myhooks', 'post-commit')),
+        'a membridge-only hook in the custom dir must be removed');
+    });
+
+    // (b) Two processes appending concurrently to commits.jsonl must not
+    // interleave or tear a line — a single atomic O_APPEND write per record.
+    const projAppend = path.join(ROOT, 'projects', 'concurrent-append-app');
+    fs.mkdirSync(path.join(projAppend, '.membridge'), { recursive: true });
+    const commitsPath = path.join(__dirname, '..', 'lib', 'commits.js');
+    const childSrc = tag => `const c=require(${JSON.stringify(commitsPath)});` +
+      `for(let i=0;i<200;i++){c.recordCommit(${JSON.stringify(projAppend)},{sha:'${tag}'+i,ts:'t',project:'p',sessions:[],unattributed:[]});}`;
+    const p1 = spawn(process.execPath, ['-e', childSrc('A')], { encoding: 'utf8' });
+    const p2 = spawn(process.execPath, ['-e', childSrc('B')], { encoding: 'utf8' });
+    await Promise.all([p1, p2].map(p => new Promise(res => p.on('close', res))));
+    check('spine: concurrent appends to commits.jsonl never interleave or tear a line', () => {
+      const raw = read(path.join(projAppend, '.membridge', 'commits.jsonl'));
+      const lines = raw.split('\n').filter(l => l.trim());
+      assert.strictEqual(lines.length, 400, `expected 400 intact lines, got ${lines.length}`);
+      let bad = 0;
+      for (const l of lines) { try { JSON.parse(l); } catch { bad++; } }
+      assert.strictEqual(bad, 0, `${bad} torn/interleaved line(s) — appends were not atomic`);
+      assert.strictEqual(require('../lib/commits').loadCommitMap(projAppend).length, 400);
+    });
+
+    // (c) An unchanged HEAD (cursor already at HEAD) must skip the git-log
+    // backfill entirely — proven by spying on newCommitsSince.
+    const projTick = path.join(ROOT, 'projects', 'tick-skip-app');
+    fs.mkdirSync(path.join(projTick, 'src'), { recursive: true });
+    const gt = args => spawnSync('git', ['-C', projTick, ...args], { encoding: 'utf8' });
+    gt(['init', '-q']); gt(['config', 'user.email', 'me@local.dev']); gt(['config', 'user.name', 'Me']);
+    { const st = util.loadState(); st.projects[projTick] = { events: [] }; util.saveState(st); }
+    fs.writeFileSync(path.join(projTick, 'src', 't.js'), 't\n');
+    gt(['add', '-A']); gt(['commit', '-q', '-m', 'c1']);
+    syncOnce({ project: projTick }); // cursor now caught up to HEAD
+    const cm = require('../lib/commits');
+    const origNCS = cm.newCommitsSince;
+    let ncsCalls = 0;
+    cm.newCommitsSince = (...a) => { ncsCalls++; return origNCS(...a); };
+    try {
+      syncOnce({ project: projTick }); // HEAD unchanged since cursor caught up
+      check('spine: an unchanged HEAD skips the git-log backfill (cheap rev-parse compare)', () => {
+        assert.strictEqual(ncsCalls, 0, 'newCommitsSince must NOT run when HEAD is unchanged and the cursor is at HEAD');
+      });
+      fs.writeFileSync(path.join(projTick, 'src', 't2.js'), 't2\n');
+      gt(['add', '-A']); gt(['commit', '-q', '-m', 'c2']);
+      const sha2 = gt(['rev-parse', 'HEAD']).stdout.trim();
+      ncsCalls = 0;
+      syncOnce({ project: projTick }); // HEAD moved: backfill must run again
+      check('spine: a moved HEAD resumes the backfill and records the new commit', () => {
+        assert.ok(ncsCalls > 0, 'newCommitsSince must run once HEAD moves');
+        assert.ok(cm.loadCommitMap(projTick).some(r => r.sha === sha2), 'the new commit must be recorded');
+      });
+    } finally {
+      cm.newCommitsSince = origNCS;
+    }
   }
 
   check('project-resolve: resolveRoot returns nearest tracked ancestor, else null', () => {
@@ -4198,6 +6966,179 @@ async function main() {
     assert.strictEqual(projectResolve.sessionDominantRoot(events, 's1', new Set()), repo);
     assert.strictEqual(projectResolve.sessionDominantRoot(events, 's2', new Set()), null);
   });
+
+  // --- 30. ingestion gate: only sessions landing in a tracked root are kept ---
+  // Pure cases mirror syncOnce's pipeline: rehomeEvents first, then
+  // filterTrackedSessions with the same tracked set. hasMembridge is injected
+  // so nothing touches the disk.
+  check('gate: session editing a file inside a tracked root keeps all its events', () => {
+    const A = '/gate/repoA';
+    const tracked = new Set([util.normPath(A)]);
+    const events = [
+      { kind: 'prompt', project: A, session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'go' },
+      { kind: 'edit', project: A, session: 's1', ts: '2026-07-10T10:01:00.000Z', file: A + '/src/x.js' },
+      { kind: 'summary', project: A, session: 's1', ts: '2026-07-10T10:02:00.000Z', text: 'did' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: f => (f.startsWith(A) ? A : null) });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.strictEqual(kept.length, 3, 'all events of a tracked-root session survive');
+    assert.ok(kept.every(e => util.normPath(e.project) === util.normPath(A)));
+  });
+
+  check('gate: prompt-only session in an untracked cwd is dropped entirely', () => {
+    const tracked = new Set([util.normPath('/gate/repoA')]);
+    const events = [
+      { kind: 'prompt', project: '/home/personal', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'life advice pls' },
+      { kind: 'summary', project: '/home/personal', session: 's1', ts: '2026-07-10T10:05:00.000Z', text: 'chatted' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: () => null });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.deepStrictEqual(kept, [], 'no event of an untracked personal session survives');
+  });
+
+  check('gate: session editing only files under an untracked cwd is dropped', () => {
+    const tracked = new Set([util.normPath('/gate/repoA')]);
+    const events = [
+      { kind: 'prompt', project: '/home/personal', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'tweak my notes' },
+      { kind: 'edit', project: '/home/personal', session: 's1', ts: '2026-07-10T10:01:00.000Z', file: '/home/personal/notes.txt' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: () => null });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.deepStrictEqual(kept, [], 'untracked edits must not spawn a project');
+  });
+
+  check('gate: multi-repo session keeps only its tracked-root portion', () => {
+    const A = '/gate/repoA';
+    const tracked = new Set([util.normPath(A)]);
+    const events = [
+      { kind: 'prompt', project: '/home', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'go' },
+      { kind: 'edit', project: '/home', session: 's1', ts: '2026-07-10T10:01:00.000Z', file: A + '/x.js' },
+      { kind: 'edit', project: '/home', session: 's1', ts: '2026-07-10T10:02:00.000Z', file: A + '/y.js' },
+      { kind: 'edit', project: '/home', session: 's1', ts: '2026-07-10T10:03:00.000Z', file: '/elsewhere/u.js' },
+      { kind: 'summary', project: '/home', session: 's1', ts: '2026-07-10T10:04:00.000Z', text: 'did' },
+    ];
+    projectResolve.rehomeEvents(events, tracked, { resolveRoot: f => (f.startsWith(A) ? A : null) });
+    const kept = filterTrackedSessions(events, tracked, { hasMembridge: () => false });
+    assert.strictEqual(kept.length, 4, 'tracked edits + prompt + summary survive, untracked edit dropped');
+    assert.ok(kept.every(e => util.normPath(e.project) === util.normPath(A)), 'kept events all file under the tracked root');
+    assert.ok(!kept.some(e => e.file === '/elsewhere/u.js'), 'the untracked edit is gone');
+  });
+
+  check('gate: a dir with .membridge counts as tracked even before it is a state key', () => {
+    const M = '/gate/marker-repo';
+    const events = [
+      { kind: 'prompt', project: M, session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'go' },
+    ];
+    const kept = filterTrackedSessions(events, new Set(), { hasMembridge: d => util.normPath(d) === util.normPath(M) });
+    assert.strictEqual(kept.length, 1, '.membridge marker keeps the session');
+  });
+
+  check('gate: defensive — bad events or a throwing resolver drop, never throw', () => {
+    const tracked = new Set([util.normPath('/gate/repoA')]);
+    assert.deepStrictEqual(filterTrackedSessions(null, tracked, {}), [], 'null events -> []');
+    assert.deepStrictEqual(filterTrackedSessions(undefined, tracked, {}), [], 'undefined events -> []');
+    const events = [
+      null,
+      { kind: 'prompt', session: 's1', ts: '2026-07-10T10:00:00.000Z', text: 'no project field' },
+      { kind: 'prompt', project: '/boom', session: 's2', ts: '2026-07-10T10:01:00.000Z', text: 'resolver throws' },
+    ];
+    let kept;
+    assert.doesNotThrow(() => {
+      kept = filterTrackedSessions(events, tracked, { hasMembridge: () => { throw new Error('disk on fire'); } });
+    });
+    assert.deepStrictEqual(kept, [], 'unresolvable events are dropped, not thrown');
+  });
+
+  // e2e: a personal session in an untracked dir must neither create a project
+  // nor surface in the feed; a tracked project's session still ingests.
+  const untrackedDir = path.join(ROOT, 'untracked-dir');
+  fs.mkdirSync(untrackedDir, { recursive: true });
+  const gateSlug = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-untracked-dir');
+  fs.mkdirSync(gateSlug, { recursive: true });
+  fs.writeFileSync(path.join(gateSlug, 'gate-personal.jsonl'), jsonl([
+    { type: 'user', message: { role: 'user', content: 'GATE-PERSONAL what should I cook tonight' }, cwd: untrackedDir, timestamp: '2026-07-10T09:00:00.000Z' },
+  ]));
+  const gateRegSess = path.join(process.env.MEMBRIDGE_CLAUDE_DIR, 'slug-shop-app', 'gate-regression.jsonl');
+  fs.writeFileSync(gateRegSess, jsonl([
+    { type: 'user', message: { role: 'user', content: 'GATE-REGRESSION polish the checkout page' }, cwd: proj1, timestamp: '2026-07-10T09:10:00.000Z' },
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Edit', input: { file_path: path.join(proj1, 'src', 'login.js') } }] }, cwd: proj1, timestamp: '2026-07-10T09:11:00.000Z' },
+  ]));
+  syncOnce();
+  const gateState = util.loadState();
+  const gateFeed = await feedPayload({ limit: 200 });
+
+  check('gate e2e: untracked-dir session creates no state.projects entry', () => {
+    const hit = Object.keys(gateState.projects || {}).find(k => util.normPath(k) === util.normPath(untrackedDir));
+    assert.ok(!hit, `untracked cwd became a project: ${hit}`);
+    const leaked = Object.values(gateState.projects || {}).some(p =>
+      (p.events || []).some(e => (e.text || '').includes('GATE-PERSONAL')));
+    assert.ok(!leaked, 'personal prompt leaked into some project history');
+  });
+
+  check('gate e2e: /api/feed shows nothing from the untracked session', () => {
+    const entries = gateFeed.entries || gateFeed.local || [];
+    const leaked = JSON.stringify(entries).includes('GATE-PERSONAL');
+    assert.ok(!leaked, 'personal session surfaced in the feed');
+    assert.ok(!JSON.stringify(gateFeed).includes(util.normPath(untrackedDir) + '"'), 'untracked dir appears as a feed project');
+  });
+
+  check('gate e2e: tracked project session still ingests exactly as before', () => {
+    const key = Object.keys(gateState.projects || {}).find(k => util.normPath(k) === util.normPath(proj1));
+    assert.ok(key, 'proj1 missing from state');
+    const evs = gateState.projects[key].events || [];
+    assert.ok(evs.some(e => (e.text || '').includes('GATE-REGRESSION')), 'tracked prompt missing');
+    assert.ok(evs.some(e => e.kind === 'edit' && (e.file || '').includes('login.js') && e.ts === '2026-07-10T09:11:00.000Z'), 'tracked edit missing');
+  });
+
+  // --- 31. saveState: atomic write (temp file + rename) ---
+  // The app and CLI daemons can both rewrite state.json; a crash or a write
+  // error mid-save must never destroy the previously-good file. We prove
+  // this by letting the real write actually land (so old direct-write code
+  // truly mutates the file) and then forcing the underlying call to raise —
+  // an atomic (write-temp, then rename) implementation only ever writes the
+  // temp path, so the real state.json is untouched no matter when the
+  // injected failure fires.
+  {
+    const priorRaw = read(util.statePath());
+
+    check('saveState: a failed write leaves the previous state.json byte-for-byte intact', () => {
+      const realWriteFileSync = fs.writeFileSync;
+      fs.writeFileSync = function (...args) {
+        const result = realWriteFileSync.apply(fs, args); // the write itself really happens...
+        throw new Error('simulated disk failure after write'); // ...but the call still reports failure
+      };
+      try {
+        assert.throws(
+          () => util.saveState({ version: util.STATE_VERSION, files: {}, projects: { marker: { events: [] } } }),
+          /simulated disk failure/,
+          'saveState swallowed the write failure instead of propagating it'
+        );
+      } finally {
+        fs.writeFileSync = realWriteFileSync;
+      }
+      assert.strictEqual(read(util.statePath()), priorRaw,
+        'state.json changed even though the save reported failure — writes are not atomic');
+      const leftovers = fs.readdirSync(util.homeDir()).filter(f => f.endsWith('.tmp'));
+      assert.deepStrictEqual(leftovers, [], 'a temp file was left behind after a failed save');
+    });
+
+    check('saveState: happy path still round-trips through loadState', () => {
+      const fresh = {
+        version: util.STATE_VERSION,
+        files: {},
+        projects: { '/tmp/atomic-roundtrip-project': { events: [{ kind: 'prompt', session: 's1', ts: '2026-07-18T00:00:00.000Z', text: 'atomic write check' }] } },
+        catchup: { ...util.DEFAULT_CATCHUP },
+      };
+      util.saveState(fresh);
+      assert.deepStrictEqual(util.loadState(), fresh, 'state did not round-trip through save/load');
+      const leftovers = fs.readdirSync(util.homeDir()).filter(f => f.endsWith('.tmp'));
+      assert.deepStrictEqual(leftovers, [], 'a temp file was left behind after a successful save');
+    });
+
+    // Restore the real accumulated state so nothing after this section (just
+    // the summary print below) is affected by these probes.
+    fs.writeFileSync(util.statePath(), priorRaw);
+  }
 
   // --- summary ---
   const failed = results.filter(([, e]) => e);

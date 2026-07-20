@@ -15,6 +15,8 @@ function createMockSupabase() {
   const projects = [];              // { id, teamId, name, repoUrl }
   const entries = [];               // memory_entries rows
   const invites = new Map();        // token -> { token, teamId, expiresAt, maxUses, useCount, revokedAt }
+  const pubkeys = new Map();        // member_pubkeys: userId -> public_key (009)
+  const teamKeys = [];              // team_keys rows: { team_id, epoch, member_user_id, sealed_team_key } (009)
   const stats = { refreshCalls: 0, inserts: 0, deniedInserts: 0 };
   // Test knobs for backend quirks. rejectSummary is kept for back-compat;
   // rejectColumns is the general form — any column name added here provokes the
@@ -324,11 +326,62 @@ function createMockSupabase() {
           .map(p => ({ id: p.id, team_id: p.teamId, name: p.name, repo_url: p.repoUrl }));
         return json(res, 200, rows);
       }
+      // ---- 009_e2e_encryption.sql tables, RLS mirrored from its policies ----
+      if (url.pathname === '/rest/v1/member_pubkeys') {
+        const userId = authedUser(req);
+        if (!userId) return json(res, 401, { message: 'not authenticated' });
+        if (req.method === 'POST') {
+          // Upsert on user_id, own row only (009: insert/update policies).
+          const rows = Array.isArray(body) ? body : [body];
+          for (const r of rows) {
+            if (r.user_id !== userId) return json(res, 403, { message: 'row-level security violation' });
+            pubkeys.set(r.user_id, r.public_key);
+          }
+          res.writeHead(201);
+          return res.end();
+        }
+        // GET ?user_id=in.(a,b): own row always; a teammate's only when the
+        // caller shares a team with them (009: select policy).
+        const inRaw = (url.searchParams.get('user_id') || '').replace(/^in\.\(/, '').replace(/\)$/, '');
+        const ids = inRaw ? inRaw.split(',') : [...pubkeys.keys()];
+        const sharesTeam = other => other === userId ||
+          members.some(m => m.userId === userId &&
+            members.some(x => x.teamId === m.teamId && x.userId === other));
+        const rows = ids
+          .filter(id => pubkeys.has(id) && sharesTeam(id))
+          .map(id => ({ user_id: id, public_key: pubkeys.get(id) }));
+        return json(res, 200, rows);
+      }
+      if (url.pathname === '/rest/v1/team_keys') {
+        const userId = authedUser(req);
+        if (!userId) return json(res, 401, { message: 'not authenticated' });
+        if (req.method === 'POST') {
+          // Any member may seal rows for the team, including rows addressed
+          // to teammates (009: insert policy checks the WRITER's membership).
+          const rows = Array.isArray(body) ? body : [body];
+          for (const r of rows) {
+            if (!isMember(r.team_id, userId)) return json(res, 403, { message: 'row-level security violation' });
+            teamKeys.push({ ...r });
+          }
+          res.writeHead(201);
+          return res.end();
+        }
+        // GET: only rows sealed TO the caller, and only while a member
+        // (009: select policy) — regardless of what filters were requested.
+        const q = url.searchParams;
+        const tEq = (q.get('team_id') || '').replace(/^eq\./, '');
+        const eEq = (q.get('epoch') || '').replace(/^eq\./, '');
+        const rows = teamKeys
+          .filter(k => k.member_user_id === userId && isMember(k.team_id, userId) &&
+            (!tEq || k.team_id === tEq) && (!eEq || String(k.epoch) === eEq))
+          .map(k => ({ sealed_team_key: k.sealed_team_key }));
+        return json(res, 200, rows);
+      }
       json(res, 404, { message: 'not found' });
     });
   });
 
-  return { server, users, teams, members, projects, entries, invites, stats, flags };
+  return { server, users, teams, members, projects, entries, invites, pubkeys, teamKeys, stats, flags };
 }
 
 module.exports = { createMockSupabase };
