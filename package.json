@@ -45,10 +45,12 @@
     "afterPack": "scripts/afterPack.js",
     "mac": {
       "target": [
-        "zip"
-      ],
-      "arch": [
-        "arm64"
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
       "artifactName": "MemBridge-${version}-${arch}.${ext}",
       "category": "public.app-category.developer-tools",
