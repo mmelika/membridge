@@ -171,6 +171,29 @@ async function main() {
     assert.ok(fs.existsSync(binned), 'app/bin/membridge.js not created by prepare-app');
   });
 
+  check('gen-install: sha256File hashes file contents', () => {
+    const gen = require('../scripts/install/gen-install');
+    const f = path.join(ROOT, 'fixture.zip');
+    fs.writeFileSync(f, 'hello'); // sha256("hello") is a known constant
+    assert.strictEqual(gen.sha256File(f),
+      '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
+  });
+  check('gen-install: renderInstallScript stamps version + sha256 and leaves no placeholders', () => {
+    const gen = require('../scripts/install/gen-install');
+    const out = gen.renderInstallScript('V=__MEMBRIDGE_VERSION__ H=__MEMBRIDGE_SHA256__',
+      { version: '9.9.9', sha256: 'abc123' });
+    assert.strictEqual(out, 'V=9.9.9 H=abc123');
+    assert.ok(!out.includes('__MEMBRIDGE_'), 'placeholders left unstamped');
+  });
+  check('install.sh template carries the safety-critical steps', () => {
+    const tmpl = read(path.join(__dirname, '..', 'scripts', 'install', 'install.sh.tmpl'));
+    assert.ok(tmpl.includes('com.apple.quarantine'), 'quarantine strip missing');
+    assert.ok(tmpl.includes('ELECTRON_RUN_AS_NODE=1'), 'CLI wrapper runtime missing');
+    assert.ok(tmpl.includes('shasum -a 256'), 'sha256 verification missing');
+    assert.ok(tmpl.includes('__MEMBRIDGE_VERSION__') && tmpl.includes('__MEMBRIDGE_SHA256__'),
+      'pin placeholders missing');
+  });
+
   // --- 1. fresh sync ---
   const r1 = syncOnce();
   const claudeMd = () => read(path.join(proj1, 'CLAUDE.md'));
