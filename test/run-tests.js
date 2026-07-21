@@ -3821,6 +3821,56 @@ async function main() {
     await new Promise(r => mockRS.server.close(r));
   }
 
+  // Task 5 (per-session prompt sharing): reshareSession with an explicit
+  // opts.crypto runs each row through encryptRow, so the re-pushed row
+  // carries ciphertext/nonce whose decrypted payload holds the new
+  // (backfilled or scrubbed) ask. Proves the encrypted reshare path, not
+  // just the plaintext one above. Skips as a pass if libsodium isn't
+  // installed in this environment.
+  {
+    const tc = require('../lib/teamcrypto');
+    const mockRE = createMockSupabase();
+    await new Promise(r => mockRE.server.listen(17956, '127.0.0.1', r));
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17956';
+    process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+    try {
+      const projRE = path.join(ROOT, 'projects', 'reshare-enc-app');
+      fs.mkdirSync(projRE, { recursive: true });
+      await teamsync.signup(util.getConfig(), 'reshareenc@test.dev', 'pw-re', 'ReshaEnc');
+      const teamRE = await teamsync.createTeam(util.getConfig(), 'ReshareEncTeam');
+      await teamsync.linkProject(util.getConfig(), projRE, teamRE.team_id, 'ReshareEncTeam');
+      { const rc = util.loadUserConfig(); if (rc.team) delete rc.team.sharePrompts; util.saveUserConfig(rc); }
+      const reAgo = sec => new Date(Date.now() - sec * 1000).toISOString();
+      const st = util.loadState();
+      st.projects[projRE] = { events: [
+        { ts: reAgo(50), source: 'Claude Code', kind: 'prompt', session: 'sB', text: 'do the encrypted thing' },
+        { ts: reAgo(40), source: 'Claude Code', kind: 'edit', session: 'sB', file: path.join(projRE, 'src', 'b.js') },
+        { ts: reAgo(30), source: 'Distilled', kind: 'summary', session: 'sB', text: 'Did it.', goal: 'g', decisions: '', gotchas: '', highlights: [{ file: 'src/b.js', note: 'n' }] },
+      ] };
+      util.saveState(st);
+      await teamsync.syncTeams({ project: projRE }); // plaintext push, ask=null (unshared)
+      const creds = await teamsync.getAccessToken(util.getConfig());
+      await check('teamsync: reshareSession encrypts the backfilled prompt', async () => {
+        if (!tc.available()) return; // libsodium unavailable in this env — skip as pass
+        await tc.ready();
+        const teamKey = tc.genTeamKey();
+        await teamsync.reshareSession(util.getConfig(), projRE, 'sB', true, { creds, crypto: { teamKey, epoch: 1, teamcrypto: tc } });
+        const row = mockRE.entries.filter(e => e.session === 'sB')[0];
+        assert.ok(row.ciphertext && row.nonce, 'row was not encrypted');
+        const payload = tc.decrypt(row.ciphertext, row.nonce, teamKey);
+        assert.ok(payload && /do the encrypted thing/.test(payload.ask), 'encrypted payload missing the shared prompt');
+        await teamsync.reshareSession(util.getConfig(), projRE, 'sB', false, { creds, crypto: { teamKey, epoch: 1, teamcrypto: tc } });
+        const row2 = mockRE.entries.filter(e => e.session === 'sB')[0];
+        const payload2 = tc.decrypt(row2.ciphertext, row2.nonce, teamKey);
+        assert.strictEqual(payload2.ask, null, 'scrub left the prompt in the ciphertext');
+      });
+    } finally {
+      delete process.env.MEMBRIDGE_TEAM_URL;
+      delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+      await new Promise(r => mockRE.server.close(r));
+    }
+  }
+
   // Task 8: ship decisions/gotchas to teammates end to end, and pull must
   // survive a backend still missing goal/changes (or any optional column).
   const mockS = createMockSupabase();
