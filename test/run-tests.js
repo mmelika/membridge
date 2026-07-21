@@ -1886,6 +1886,14 @@ async function main() {
       assert.strictEqual(a.provider, 'local');
       assert.strictEqual(a.baseUrl, 'http://h/v1');
       assert.strictEqual(a.model, 'llama3.1');
+      // Regression: a legacy user who sets ONLY a model (via the new UI) creates a
+      // partial providers.anthropic entry with no key — the legacy top-level key
+      // must still survive rather than being shadowed to ''.
+      cfg = { advisor: { apiKey: 'sk-legacy', model: 'claude-haiku-4-5', providers: { anthropic: { model: 'claude-opus-4-8' } } } };
+      a = advisorLib.getAdvisorConfig(cfg);
+      assert.strictEqual(a.apiKey, 'sk-legacy', 'legacy key dropped by a model-only providers entry');
+      assert.strictEqual(a.model, 'claude-opus-4-8');
+      assert.strictEqual(a.source, 'config');
     });
     await check('advisor: generatePlan routes to the selected provider', async () => {
       const srv = await startJsonMock(17963, (req, body, send) => {
