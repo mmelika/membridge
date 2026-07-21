@@ -1120,6 +1120,320 @@ async function main() {
       assert.ok(/runHeadline\(/.test(sub), 'subagentLine does not call runHeadline');
       assert.ok(!/repHarvested/.test(sub), 'subagentLine still references repHarvested');
     });
+    // buildDayCards (docs/superpowers/specs/2026-07-21-activity-day-drilldown-design.md, Task 1): groups
+    // buildUnits' output into one card per (author, project, local day). Pure
+    // client function, same extractFn+sandbox technique as the runHeadline
+    // checks above. unitWith builds a fixture shaped like a real buildUnits/
+    // finalizeUnit output (key, ts, author(Id), project(Id/Path), self, source,
+    // agentCount, promptCount, rep [a run with its own .rep distilled entry, or
+    // null], live, runs) so evalDayCards exercises the real grouping/rollup
+    // logic, not a stub.
+    const dayCardsNow = new Date();
+    function dayCardsLocalTs(daysAgo, hour) {
+      return new Date(dayCardsNow.getFullYear(), dayCardsNow.getMonth(), dayCardsNow.getDate() - daysAgo, hour, 0, 0).toISOString();
+    }
+    let dayCardsSeq = 0;
+    function unitWith(overrides) {
+      overrides = overrides || {};
+      const id = dayCardsSeq++;
+      const ts = overrides.ts !== undefined ? overrides.ts : dayCardsLocalTs(0, 10);
+      const author = overrides.author !== undefined ? overrides.author : 'Marco';
+      const authorId = overrides.authorId; // no default: exercises the author fallback in the key
+      const project = overrides.project !== undefined ? overrides.project : 'ProjA';
+      const projectId = overrides.projectId; // no default: exercises the project fallback in the key
+      const projectPath = overrides.projectPath;
+      const repEntry = Object.prototype.hasOwnProperty.call(overrides, 'repEntry') ? overrides.repEntry : null;
+      const ask = overrides.ask !== undefined ? overrides.ask : 'Do the thing';
+      const entry = { ts, ask, author, authorId };
+      const run = { ts, key: 'run' + id, entries: [entry], rep: repEntry };
+      return {
+        key: 'unit' + id,
+        ts,
+        author, authorId,
+        self: overrides.self !== undefined ? overrides.self : false,
+        source: overrides.source !== undefined ? overrides.source : 'Claude Code',
+        project, projectId, projectPath,
+        agentCount: overrides.agentCount !== undefined ? overrides.agentCount : 1,
+        promptCount: overrides.promptCount !== undefined ? overrides.promptCount : 1,
+        rep: repEntry ? run : null,
+        live: overrides.live !== undefined ? overrides.live : false,
+        runs: overrides.runs !== undefined ? overrides.runs : [run],
+      };
+    }
+    function evalDayCards(units) {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const fnSrc = ['normKeyPart', 'homeDayLabel', 'firstSentence', 'askHeadline', 'runHeadline', 'buildDayCards']
+        .map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function(escSrc + '\n' + fnSrc + '\nreturn { buildDayCards: buildDayCards };')();
+      return sandbox.buildDayCards(units);
+    }
+    const uToday1 = unitWith({ ts: dayCardsLocalTs(0, 14) });
+    const uToday2 = unitWith({ ts: dayCardsLocalTs(0, 9) });
+    const uYesterday = unitWith({ ts: dayCardsLocalTs(1, 14) });
+    const uMarco = unitWith({ author: 'Marco', ts: dayCardsLocalTs(0, 10) });
+    const uAndrew = unitWith({ author: 'Andrew', ts: dayCardsLocalTs(0, 10) });
+    const uMarcoOtherProj = unitWith({ author: 'Marco', project: 'ProjB', ts: dayCardsLocalTs(0, 10) });
+    const liveUnit3prompts = unitWith({ promptCount: 3, agentCount: 2, live: true, ts: dayCardsLocalTs(0, 14) });
+    const staleUnit2prompts = unitWith({ promptCount: 2, agentCount: 1, live: false, ts: dayCardsLocalTs(0, 9) });
+    const big5PromptsDistilled = unitWith({ promptCount: 5, ts: dayCardsLocalTs(0, 14), repEntry: { headline: 'Shipped the big feature' } });
+    big5PromptsDistilled.expectedHeadline = 'Shipped the big feature';
+    const small2PromptsDistilled = unitWith({ promptCount: 2, ts: dayCardsLocalTs(0, 13), repEntry: { headline: 'Small fix' } });
+    small2PromptsDistilled.expectedHeadline = 'Small fix';
+    const tieOldDistilled = unitWith({ promptCount: 4, ts: dayCardsLocalTs(0, 9), repEntry: { headline: 'Older tie headline' } });
+    tieOldDistilled.expectedHeadline = 'Older tie headline';
+    const tieNewDistilled = unitWith({ promptCount: 4, ts: dayCardsLocalTs(0, 15), repEntry: { headline: 'Newer tie headline' } });
+    tieNewDistilled.expectedHeadline = 'Newer tie headline';
+    const liveNoRep = unitWith({ live: true, repEntry: null, ts: dayCardsLocalTs(0, 10) });
+    const staleNoRep = unitWith({ live: false, repEntry: null, ts: dayCardsLocalTs(0, 9) });
+    const staleNoRep2 = unitWith({ live: false, repEntry: null, ts: dayCardsLocalTs(0, 10) });
+    check('dayCards: groups by author+project+local day, newest first', () => {
+      // three units: marco/projA today x2, marco/projA yesterday x1
+      const cards = evalDayCards([uToday1, uToday2, uYesterday]);
+      assert.strictEqual(cards.length, 2);
+      assert.strictEqual(cards[0].units.length, 2, 'today card holds both units');
+      assert.ok(cards[0].ts >= cards[1].ts, 'newest day first');
+    });
+    check('dayCards: same day, different author or project -> separate cards', () => {
+      const cards = evalDayCards([uMarco, uAndrew, uMarcoOtherProj]);
+      assert.strictEqual(cards.length, 3);
+    });
+    check('dayCards: key normalization matches unitKeyOf (case/trim never splits)', () => {
+      const cards = evalDayCards([unitWith({ author: 'Marco ' }), unitWith({ author: 'marco' })]);
+      assert.strictEqual(cards.length, 1);
+    });
+    check('dayCards: counts sum and live ORs across units', () => {
+      const c = evalDayCards([liveUnit3prompts, staleUnit2prompts])[0];
+      assert.strictEqual(c.promptCount, 5);
+      assert.strictEqual(c.sessionCount, liveUnit3prompts.agentCount + staleUnit2prompts.agentCount);
+      assert.strictEqual(c.live, true);
+    });
+    check('dayCards: headline picks highest-promptCount distilled unit, tie -> newer', () => {
+      assert.ok(evalDayCards([big5PromptsDistilled, small2PromptsDistilled])[0]
+        .headline.includes(big5PromptsDistilled.expectedHeadline));
+      assert.ok(evalDayCards([tieOldDistilled, tieNewDistilled])[0]
+        .headline.includes(tieNewDistilled.expectedHeadline));
+    });
+    check('dayCards: no distilled rep -> live "Working…" / finished "N sessions · no summaries shared"', () => {
+      assert.ok(/Working/.test(evalDayCards([liveNoRep])[0].headline));
+      assert.ok(/no summaries shared/.test(evalDayCards([staleNoRep, staleNoRep2])[0].headline));
+    });
+    check('dayCards: pure and total — empty input, bad ts never throw', () => {
+      assert.deepStrictEqual(evalDayCards([]), []);
+      assert.ok(evalDayCards([unitWith({ ts: 'not-a-date' })]).length === 1);
+    });
+    // v2 checklist data (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 1):
+    // each card carries a checklist[] — one {glyph, text, live} row per unit,
+    // live rows first — and a fileCount summed over the day. Same fixtures and
+    // sandbox as the grouping checks above.
+    check('dayCards v2: checklist is one {glyph, text, live} row per unit, live rows first', () => {
+      const distilledNewest = unitWith({ ts: dayCardsLocalTs(0, 14), repEntry: { headline: 'Shipped checklist item' } });
+      const liveMid = unitWith({ ts: dayCardsLocalTs(0, 13), live: true, ask: 'Wire the toggle' });
+      const staleNoSum = unitWith({ ts: dayCardsLocalTs(0, 12), ask: 'Old chore' });
+      const c = evalDayCards([distilledNewest, liveMid, staleNoSum])[0];
+      assert.ok(Array.isArray(c.checklist), 'card has a checklist array');
+      assert.strictEqual(c.checklist.length, 3, 'one row per unit');
+      assert.strictEqual(c.checklist[0].glyph, '◐', 'live row sorts first with the half-moon glyph');
+      assert.strictEqual(c.checklist[0].live, true, 'live row carries live:true');
+      assert.ok(c.checklist[0].text.includes('Wire the toggle'), 'live row text is its runHeadline (the ask)');
+      assert.strictEqual(c.checklist[1].glyph, '✓', 'distilled finished row gets the check glyph');
+      assert.strictEqual(c.checklist[1].live, false, 'finished row carries live:false');
+      assert.ok(c.checklist[1].text.includes('Shipped checklist item'), 'distilled row text is its rep headline');
+      assert.strictEqual(c.checklist[2].glyph, '○', 'finished-no-summary row gets the open-circle glyph');
+      assert.ok(c.checklist[2].text.includes('Old chore'), 'no-summary row text falls back to the ask');
+    });
+    check('dayCards v2: fileCount = distinct files across the day (changes first, files fallback, deduped)', () => {
+      const u1 = unitWith({ ts: dayCardsLocalTs(0, 14) });
+      u1.runs[0].entries[0].changes = [{ file: 'lib/a.js' }, { file: 'lib/b.js' }];
+      u1.runs[0].entries[0].files = ['lib/ignored-when-changes-present.js'];
+      const u2 = unitWith({ ts: dayCardsLocalTs(0, 13) });
+      u2.runs[0].entries[0].files = ['lib/b.js', 'lib/c.js'];
+      const u3 = unitWith({ ts: dayCardsLocalTs(0, 12) });
+      const c = evalDayCards([u1, u2, u3])[0];
+      assert.strictEqual(c.fileCount, 3, 'a.js, b.js, c.js — changes beat files per entry, deduped across units');
+    });
+    // v2 renderer (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 2):
+    // dayCardHtml consumes the precomputed card (headline/checklist/counts), so
+    // its sandbox needs only esc/ago/MONO/personColor — none of the unitHtml
+    // graph. extractConst lifts a one-line `var NAME = …;` declaration, the
+    // same helper shape the drilldown branch used.
+    function extractConst(src, name) {
+      const m = src.match(new RegExp('var ' + name + '\\s*=[^;]*;'));
+      return m ? m[0] : '';
+    }
+    function evalDayCardHtml(card, opts, expandedKeys) {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
+      const constSrc = extractConst(embeddedScript, 'MONO');
+      const fnSrc = ['personColor', 'dayCardHtml'].map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function('expandedKeys',
+        escSrc + '\n' + agoSrc + '\n' + constSrc + '\nvar catchupExpanded = expandedKeys || {};\n' + fnSrc +
+        '\nreturn { dayCardHtml: dayCardHtml };'
+      )(expandedKeys);
+      return sandbox.dayCardHtml(card, opts || {});
+    }
+    const v2Units6 = [15, 14, 13, 12, 11, 10].map(h => unitWith({ ts: dayCardsLocalTs(0, h), repEntry: { headline: 'Change at ' + h } }));
+    const v2Card6 = evalDayCards(v2Units6)[0];
+    const v2Card3 = evalDayCards([15, 14, 13].map(h => unitWith({ ts: dayCardsLocalTs(0, h), repEntry: { headline: 'Change at ' + h } })))[0];
+    const v2Distilled = unitWith({ ts: dayCardsLocalTs(0, 15), repEntry: { headline: 'Shipped the v2 cards' } });
+    const v2Live = unitWith({ ts: dayCardsLocalTs(0, 14), live: true, ask: 'Wire the level two view' });
+    const v2Stale = unitWith({ ts: dayCardsLocalTs(0, 13), ask: 'Tidy the styles' });
+    const v2MixedCard = evalDayCards([v2Distilled, v2Live, v2Stale])[0];
+    check('dayCardHtml v2: header carries the sentence headline and is the data-day-open drill target', () => {
+      const h = evalDayCardHtml(v2MixedCard);
+      assert.ok(h.indexOf('data-day-open="') !== -1, 'header must be a data-day-open target');
+      assert.ok(h.includes('Shipped the v2 cards'), 'day headline sentence missing');
+      assert.ok(h.indexOf('data-day-open') < h.indexOf('Shipped the v2 cards'), 'headline lives inside the drill-target header');
+      assert.ok(!/data-card-toggle/.test(h), 'v2 header navigates — the v1 in-place toggle contract must be gone');
+    });
+    check('dayCardHtml v2: first 4 checklist rows visible, rest behind the bottom-right expander, collapsed by default', () => {
+      const h = evalDayCardHtml(v2Card6);
+      const moreAt = h.indexOf('data-day-more');
+      assert.ok(moreAt !== -1, 'hidden-rows container missing');
+      assert.strictEqual((h.slice(0, moreAt).match(/✓/g) || []).length, 4, 'exactly 4 rows before the fold');
+      assert.strictEqual((h.slice(moreAt).match(/✓/g) || []).length, 2, 'rows 5+ live inside the fold');
+      assert.ok(/<div data-day-more="[^"]*"[^>]*display:none/.test(h), 'fold must start hidden (collapsed by default)');
+      assert.ok(/data-day-expand/.test(h), 'expander control missing');
+      assert.ok(h.includes('Show all 6 changes'), 'expander label counts every change');
+      assert.ok(h.indexOf('6 sessions') < h.indexOf('data-day-expand'), 'stat row sits left of the expander in the footer');
+      assert.ok(!/data-day-expand/.test(evalDayCardHtml(v2Card3)), 'a 4-rows-or-fewer card needs no expander');
+    });
+    check('dayCardHtml v2: live row first with the working-now tag; glyphs ◐/✓/○ by state', () => {
+      const h = evalDayCardHtml(v2MixedCard);
+      const iLive = h.indexOf('◐'), iDone = h.indexOf('✓'), iBare = h.indexOf('○');
+      assert.ok(iLive !== -1 && iDone !== -1 && iBare !== -1, 'all three state glyphs render');
+      assert.ok(iLive < iDone && iDone < iBare, 'live row first, then distilled, then no-summary');
+      assert.strictEqual((h.match(/working now/g) || []).length, 1, 'exactly the live row carries the tag');
+    });
+    check('dayCardHtml v2: stat row sums sessions · prompts · files over the day', () => {
+      const su1 = unitWith({ ts: dayCardsLocalTs(0, 15), agentCount: 2, promptCount: 5 });
+      su1.runs[0].entries[0].files = ['lib/x.js', 'lib/y.js'];
+      const su2 = unitWith({ ts: dayCardsLocalTs(0, 12), agentCount: 1, promptCount: 7 });
+      su2.runs[0].entries[0].changes = [{ file: 'lib/x.js' }, { file: 'lib/z.js' }];
+      const h = evalDayCardHtml(evalDayCards([su1, su2])[0]);
+      assert.ok(/3 sessions/.test(h) && /12 prompts/.test(h) && /3 files/.test(h), 'stat row sums the day');
+    });
+    check('dayCardHtml v2: catchupExpanded[key] reopens the checklist across repaints', () => {
+      const exp = {};
+      exp[v2Card6.key] = true;
+      const h = evalDayCardHtml(v2Card6, {}, exp);
+      assert.ok(/<div data-day-more="[^"]*"[^>]*display:block/.test(h), 'expanded fold must render open');
+      assert.ok(/Show fewer/.test(h), 'expander label flips when open');
+    });
+    // feedDayGroupHtml wiring: like the drilldown branch's wiring checks, a
+    // plain pageHtml.includes() can't tell "defined" from "wired", so these run
+    // the REAL feedDayGroupHtml (full call graph down through buildDayCards/
+    // dayCardHtml/unitHtml/threadHtml) against hand-seeded raw feed entries.
+    function evalFeedDayGroupHtml() {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
+      const constSrc = ['MONO', 'STALE_GAP', 'BURST_GAP'].map(n => extractConst(embeddedScript, n)).join('\n');
+      const fnSrc = [
+        'personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'promptRowsHtml', 'cardCloseHtml', 'shareToggleHtml',
+        'threadHtml', 'unitHtml', 'dayCardHtml',
+        'feedKey', 'normKeyPart', 'threadKey', 'buildThreads', 'unitKeyOf', 'finalizeUnit', 'buildUnits',
+        'homeDayLabel', 'buildDayCards', 'feedDayGroupHtml',
+      ].map(n => extractFn(embeddedScript, n)).join('\n');
+      return new Function(
+        escSrc + '\n' + agoSrc + '\n' + constSrc + '\nvar catchupExpanded = {};\n' + fnSrc +
+        '\nreturn { feedDayGroupHtml: feedDayGroupHtml };'
+      )();
+    }
+    // Raw seeded feed entries (buildThreads' input shape, not unitWith's
+    // unit shape): 4 entries -> 3 (author, project, local day) day cards over
+    // 2 distinct days.
+    function feedEntryWith(overrides) {
+      overrides = overrides || {};
+      return {
+        ts: overrides.ts,
+        ask: overrides.ask !== undefined ? overrides.ask : 'Do the thing',
+        author: overrides.author !== undefined ? overrides.author : 'Marco',
+        authorId: overrides.authorId,
+        self: overrides.self !== undefined ? overrides.self : false,
+        source: overrides.source !== undefined ? overrides.source : 'Claude Code',
+        project: overrides.project !== undefined ? overrides.project : 'ProjA',
+        projectId: overrides.projectId,
+        projectPath: overrides.projectPath,
+        session: overrides.session,
+      };
+    }
+    const v2FeedEntries = [
+      feedEntryWith({ ts: dayCardsLocalTs(0, 14), author: 'Marco', project: 'ProjA', session: 's-a1' }),
+      feedEntryWith({ ts: dayCardsLocalTs(0, 9), author: 'Marco', project: 'ProjA', session: 's-a2' }),
+      feedEntryWith({ ts: dayCardsLocalTs(0, 10), author: 'Andrew', self: true, project: 'ProjA', session: 's-b1' }),
+      feedEntryWith({ ts: dayCardsLocalTs(1, 10), author: 'Marco', project: 'ProjB', session: 's-c1' }),
+    ];
+    check('feedDayGroupHtml v2: Activity top level renders day cards under day separators, no per-unit cards', () => {
+      const h = evalFeedDayGroupHtml().feedDayGroupHtml(v2FeedEntries);
+      assert.strictEqual((h.match(/data-day-open="/g) || []).length, 3, 'one drill target per author-day');
+      assert.strictEqual((h.match(/margin:28px 0 4px/g) || []).length, 2, 'two day separators (today + yesterday)');
+      assert.ok(!/data-card-toggle/.test(h), 'no per-unit card at the Activity top level');
+    });
+    check('feedDayGroupHtml v2: opts.unitCards keeps the project page per-unit', () => {
+      const h = evalFeedDayGroupHtml().feedDayGroupHtml(v2FeedEntries, { unitCards: true, hideProject: true });
+      assert.ok(!/data-day-open/.test(h), 'project page must not render day cards');
+      assert.ok(/<article/.test(h), 'per-unit cards must still render');
+    });
+    // Level-2 day-detail view (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 3):
+    // dayDetailHtml renders the session view for one author-day card —
+    // breadcrumb + day headline, one session card per unit (live-first), the
+    // 2–3 sentence distilled summary, prompts inline behind a bottom-left
+    // toggle, and NO deeper drill target anywhere (two levels only).
+    function evalDayDetailHtml(card, opts, expandedKeys) {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
+      const constSrc = extractConst(embeddedScript, 'MONO');
+      const fnSrc = ['personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'dayDetailHtml']
+        .map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function('expandedKeys',
+        escSrc + '\n' + agoSrc + '\n' + constSrc + '\nvar catchupExpanded = expandedKeys || {};\n' + fnSrc +
+        '\nreturn { dayDetailHtml: dayDetailHtml };'
+      )(expandedKeys);
+      return sandbox.dayDetailHtml(card, opts || {});
+    }
+    const dSum = unitWith({ ts: dayCardsLocalTs(0, 15), repEntry: { headline: 'Shipped it', summary: 'Did the thing end to end. Wired the tests. Landed green.' } });
+    const dLive = unitWith({ ts: dayCardsLocalTs(0, 14), live: true, ask: 'Keep wiring' });
+    const dBare = unitWith({ ts: dayCardsLocalTs(0, 13), ask: 'Chore run' });
+    const dNoAsk = unitWith({ ts: dayCardsLocalTs(0, 12), ask: '' });
+    const dDetailCard = evalDayCards([dSum, dLive, dBare, dNoAsk])[0];
+    check('dayDetailHtml: breadcrumb + day headline; one session card per unit, live-first', () => {
+      const h = evalDayDetailHtml(dDetailCard);
+      assert.ok(/data-day-back/.test(h), 'breadcrumb back control missing');
+      assert.ok(h.includes('Activity'), 'crumb names the Activity feed');
+      assert.ok(h.includes('Shipped it'), 'day headline missing');
+      assert.strictEqual((h.match(/<article/g) || []).length, 4, 'one session card per unit');
+      const iLive = h.indexOf('Keep wiring');
+      const iSum = h.indexOf('Shipped it', h.indexOf('<article'));
+      assert.ok(iLive !== -1 && iSum !== -1 && iLive < iSum, 'live unit card renders first');
+      assert.ok(/working now/i.test(h), 'live unit keeps its working-now marker');
+    });
+    check('dayDetailHtml: 2–3 sentence distilled summary shown, not just the headline', () => {
+      const h = evalDayDetailHtml(dDetailCard);
+      assert.ok(h.includes('Did the thing end to end. Wired the tests. Landed green.'), 'full distilled summary missing');
+    });
+    check('dayDetailHtml: prompts hidden behind the bottom-left toggle; display-only rows; no level-3 target', () => {
+      const h = evalDayDetailHtml(dDetailCard);
+      assert.ok(/data-prompts-toggle/.test(h), 'prompts toggle missing');
+      assert.ok(/show 1 prompt\b/.test(h), 'toggle label counts the prompts');
+      assert.ok(/<div data-prompts-fold="[^"]*"[^>]*display:none/.test(h), 'prompt fold must start hidden');
+      assert.ok(h.includes('(prompt not shared)'), 'unshared prompt renders the placeholder row');
+      assert.ok(h.indexOf('Chore run') !== -1, 'shared ask renders as a prompt row');
+      assert.ok(!/data-sess-open|data-day-open|data-prompt-open/.test(h), 'no deeper-open attribute anywhere — two levels only');
+      const exp = {};
+      exp['prompts|' + dLive.key] = true;
+      const h2 = evalDayDetailHtml(dDetailCard, {}, exp);
+      assert.ok(/<div data-prompts-fold="[^"]*"[^>]*display:block/.test(h2), 'catchupExpanded reopens a prompt fold across repaints');
+    });
+    check('dayDetailHtml: a missing day degrades to the friendly not-found state', () => {
+      const h = evalDayDetailHtml(null);
+      assert.ok(/data-day-back/.test(h), 'not-found still offers the way back');
+      assert.ok(/isn|scrolled|no longer/i.test(h), 'not-found copy missing');
+    });
+    check('day route: container, tab, poller, and back handler wired', () => {
+      assert.ok(pageHtml.includes('id="view-day"') && pageHtml.includes('id="dayRoot"'), 'day view container missing from the page');
+      assert.ok(embeddedScript.includes("indexOf('#day=') === 0"), 'currentTab must recognize #day=');
+      assert.ok(/function startDay\(\)/.test(embeddedScript) && /function loadDay\(\)/.test(embeddedScript) && /function stopDay\(\)/.test(embeddedScript), 'day poller trio missing');
+      assert.ok(embeddedScript.includes("getElementById('view-day')"), 'view-day delegated listener missing');
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
