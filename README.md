@@ -196,11 +196,12 @@ any time (CLI: `membridge setup-hooks` / `remove-hooks`).
 Enabled, it registers a
 [Stop hook](https://docs.claude.com/en/docs/claude-code/hooks) in
 `~/.claude/settings.json`. When a Claude Code session that edited files
-tries to stop, the hook blocks the stop once and asks the agent to append
-one JSON line to `<project>/.membridge/summaries.jsonl`:
+tries to stop, the hook blocks the stop once and asks the agent to save
+one JSON line — via a single pre-approved append command, no narration — to
+`<project>/.membridge/summaries.jsonl`:
 
 ```json
-{"session":"<id>","ts":"<ISO time>","did":"What was accomplished.","decisions":"Key choices.","gotchas":"Surprises."}
+{"session":"<id>","ts":"<ISO time>","goal":"What was asked.","did":"What changed in the project.","decisions":"Key choices.","gotchas":"Surprises.","highlights":[{"file":"lib/feed.js","note":"why it matters"}]}
 ```
 
 MemBridge merges these as high-quality `Distilled` summaries that take
@@ -213,19 +214,22 @@ the agent that did the work, on purpose.
 summary it wrote in turn two. The first checkpoint is asked once a session
 has `distill.minEdits` edits (default 1); after that, the hook re-blocks
 every `distill.checkpointEvery` further edits (default 4) and asks for a
-fresh line covering only the new work. Each line is appended; earlier ones
-are never edited. The context block and team feed always show the latest
-checkpoint, while `memory.md` keeps the full numbered sequence so anyone can
-read the whole arc of a long session. Both knobs live under Settings →
-Session summaries → Advanced.
+fresh line summarizing the whole session so far, phrased as the outcome a
+teammate would experience. Each line is appended, never edited — the newest
+line is the summary; older ones are the session's history. The context
+block and team feed always show the latest checkpoint, while `memory.md`
+keeps the full numbered sequence so anyone can read the whole arc of a long
+session. Both knobs live under Settings → Session summaries → Advanced.
 
 **Consent model.** Nothing is installed silently: the daemon never touches
 `~/.claude/settings.json` on its own — only the first-run prompt, the
 Settings toggle, or `membridge setup-hooks` do, they append without
-disturbing your existing hooks, and turning it off strips exactly what was
-added. The hook itself is strictly fail-open — any error, a paused/untracked
-project, a too-small session, or `distill.enabled: false` means Claude Code
-stops normally, uninterrupted. It never blocks the same stop twice.
+disturbing your existing hooks — the Stop hook plus one narrow auto-approve
+rule so the summary write never raises a permission prompt — and turning it
+off strips exactly what was added. The hook itself is strictly fail-open —
+any error, a paused/untracked project, a too-small session, or
+`distill.enabled: false` means Claude Code stops normally, uninterrupted. It
+never blocks the same stop twice.
 
 **Codex fallback (tiering).** Claude Code is the *enforced* tier — the Stop
 hook guarantees the ask. Tools reading `AGENTS.md` (Codex and friends) have

@@ -923,6 +923,90 @@ async function main() {
       }
       return src.slice(startIdx, end);
     }
+    // esc is declared as `var esc = function (s) { ... };`, not a `function
+    // esc(` declaration, so extractFn's pattern can't find it. Card-headline
+    // sandbox tests below need esc's real source (runHeadline calls it), so
+    // brace-match the var-assignment form separately.
+    function extractVarFn(src, name) {
+      const startIdx = src.indexOf('var ' + name + ' = function');
+      if (startIdx === -1) return null;
+      let i = src.indexOf('{', startIdx);
+      let depth = 0, end = i;
+      for (; end < src.length; end++) {
+        if (src[end] === '{') depth++;
+        else if (src[end] === '}') { depth--; if (depth === 0) { end++; break; } }
+      }
+      return src.slice(startIdx, end) + ';';
+    }
+    // Card-headline helpers (firstSentence / askHeadline / runHeadline) are pure
+    // client functions with no DOM dependency — extract their source from the
+    // embedded script and evaluate them in a sandbox, same technique as
+    // deleteProjectsBulk above. See specs/2026-07-20-activity-display-headline.
+    check('headline helpers: firstSentence / askHeadline behavior', () => {
+      const src = ['esc', 'firstSentence', 'askHeadline'].map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function(src + '\nreturn { firstSentence: firstSentence, askHeadline: askHeadline };')();
+      assert.strictEqual(sandbox.firstSentence('One thing. Two thing.'), 'One thing.');
+      assert.strictEqual(sandbox.firstSentence(''), '');
+      assert.ok(sandbox.firstSentence('x'.repeat(200)).length <= 92, 'not capped');
+      assert.strictEqual(sandbox.askHeadline(''), null);
+      assert.strictEqual(sandbox.askHeadline('Add a logout button'), 'Add a logout button');
+      assert.strictEqual(sandbox.askHeadline('Install failed: Error at /x lockdownd\n\n\nstack'), null, 'noisy ask not degraded');
+    });
+    check('headline helpers: runHeadline behavior', () => {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const fnSrc = ['firstSentence', 'askHeadline', 'runHeadline'].map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function(escSrc + '\n' + fnSrc + '\nreturn { runHeadline: runHeadline };')();
+      // Distilled rep WITH a headline wins outright, and is escaped.
+      assert.strictEqual(
+        sandbox.runHeadline({ headline: 'Fixed the <bug>', summary: 'Long summary text. More.' }, null, false),
+        'Fixed the &lt;bug&gt;'
+      );
+      // Distilled rep with NO headline falls back to the first sentence of the summary.
+      assert.strictEqual(
+        sandbox.runHeadline({ summary: 'Did the thing. And then some more.' }, null, false),
+        'Did the thing.'
+      );
+      // No rep + live + clean ask -> guarded "Working on: <ask>".
+      const liveClean = sandbox.runHeadline(null, { ask: 'Add a logout button' }, true);
+      assert.ok(liveClean.includes('Working on:') && liveClean.includes('Add a logout button'), 'clean live ask not shown');
+      // No rep + live + noisy ask -> "Working…", never the raw noisy ask.
+      const liveNoisy = sandbox.runHeadline(null, { ask: 'Install failed: Error at /x lockdownd\n\n\nstack' }, true);
+      assert.ok(liveNoisy.includes('Working…'), 'noisy live ask not guarded to Working…');
+      assert.ok(!liveNoisy.includes('lockdownd'), 'noisy live ask text leaked through');
+      // No rep + finished + no ask -> plain placeholder, never harvested prose.
+      // runHeadline's signature is (rep, newest, live) — it has no repHarvested
+      // parameter at all, so any harvested-looking data hanging off `newest`
+      // cannot reach the headline; this proves the finished branch ignores it.
+      const finished = sandbox.runHeadline(null, { ask: '', repHarvested: { summary: 'HARVESTED PROSE' } }, false);
+      assert.ok(finished.includes('session ended') && finished.includes('no summary shared'), 'finished no-ask placeholder missing');
+      assert.ok(!finished.includes('HARVESTED PROSE'), 'harvested text leaked into the headline');
+    });
+    // Task 3 (specs/2026-07-20-activity-display-headline): threadHtml/unitHtml
+    // must call runHeadline for their card headline instead of the old inline
+    // three-way ternary that could fall back to repHarvested prose, the
+    // headline div must 2-line-clamp, and the expander must carry the FULL
+    // brief (summaryFull || summary) that the clamp pushed out of the headline.
+    check('cards: headline uses runHeadline and never repHarvested; headline clamps; expander carries full brief', () => {
+      const th = extractFn(embeddedScript, 'threadHtml');
+      const uh = extractFn(embeddedScript, 'unitHtml');
+      assert.ok(/runHeadline\(/.test(th) && /runHeadline\(/.test(uh), 'cards do not call runHeadline');
+      assert.ok(!/repHarvested\)\s*\?/.test(th) && !/repHarvested\)\s*\?/.test(uh), 'repHarvested still in a headline ternary');
+      assert.ok(/-webkit-line-clamp:2/.test(th), 'threadHtml headline is not 2-line clamped');
+      assert.ok(/-webkit-line-clamp:2/.test(uh), 'unitHtml headline is not 2-line clamped');
+      assert.ok(/summaryFull \|\| t\.rep\.summary/.test(th) || /t\.rep\.summaryFull \|\| t\.rep\.summary/.test(th), 'threadHtml expander missing full-brief fallback');
+      assert.ok(/fd-label/.test(th) && /fd-label/.test(uh), 'expander missing a Summary label block');
+      // The per-run agent-thread label inside unitHtml (the u.runs map, `rlabel`)
+      // is a third headline/label site — same ban applies.
+      assert.ok(!/r\.repHarvested\s*\?/.test(uh), 'per-run agent-thread label still falls back to r.repHarvested');
+      // subagentLine (the one-line label for a subagent run shown in the
+      // session detail page's per-prompt dropdown) is a fourth headline/label
+      // site found by grepping repHarvested — it must route through
+      // runHeadline too, never returning raw harvested prose.
+      const sub = extractFn(embeddedScript, 'subagentLine');
+      assert.ok(sub, 'subagentLine not found');
+      assert.ok(/runHeadline\(/.test(sub), 'subagentLine does not call runHeadline');
+      assert.ok(!/repHarvested/.test(sub), 'subagentLine still references repHarvested');
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
@@ -3035,6 +3119,16 @@ async function main() {
     assert.deepStrictEqual(ev.highlights, [{ file: 'lib/mcp.js', note: 'the server' }]);
   });
 
+  check('headline: scanSummaries carries headline when present', () => {
+    const proj = path.join(ROOT, 'projects', 'hl-scan'); fs.mkdirSync(path.join(proj, '.membridge'), { recursive: true });
+    fs.writeFileSync(path.join(proj, '.membridge', 'summaries.jsonl'),
+      JSON.stringify({ session: 's1', ts: '2026-07-20T00:00:00Z', did: 'full did', headline: 'tight line' }) + '\n');
+    const st = { projects: { [proj]: { events: [] } }, files: {} };
+    const evs = require('../lib/scan').scanSummaries(st, {});
+    const ev = evs.find(e => e.session === 's1');
+    assert.ok(ev && ev.headline === 'tight line', 'headline not carried by scanSummaries');
+  });
+
   // --- 10. distillation: Stop hook, settings surgery, Distilled precedence ---
   const summariesFile = path.join(projR, '.membridge', 'summaries.jsonl');
   const runHook = payload => spawnSync(process.execPath, [BIN, 'hook', 'stop'], {
@@ -3276,6 +3370,55 @@ async function main() {
     assert.deepStrictEqual(afterRemove.hooks.Stop, seedSettings.hooks.Stop, 'user Stop hooks not intact');
     assert.deepStrictEqual(afterRemove.hooks.PreToolUse, seedSettings.hooks.PreToolUse, 'unrelated hooks changed');
     assert.strictEqual(afterRemove.model, 'opus');
+  });
+  check('distill: setup-hooks installs the append auto-approve rule; remove-hooks strips it, user rules survive', () => {
+    const permFile = path.join(ROOT, 'claude-settings-perm.json');
+    fs.writeFileSync(permFile, JSON.stringify({ permissions: { allow: ['Bash(npm run test:*)'] } }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: permFile };
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    const after = JSON.parse(read(permFile));
+    assert.ok(after.permissions.allow.includes(hooks.appendAllowRule()), 'allow rule missing after setup');
+    assert.ok(after.permissions.allow.includes('Bash(npm run test:*)'), 'user rule dropped by setup');
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' }); // idempotent
+    const after2 = JSON.parse(read(permFile));
+    assert.strictEqual(after2.permissions.allow.filter(r => /membridge/i.test(r)).length, 1, 'rule duplicated on re-run');
+    spawnSync(process.execPath, [BIN, 'remove-hooks'], { env, encoding: 'utf8' });
+    const after3 = JSON.parse(read(permFile));
+    const allow3 = ((after3.permissions || {}).allow) || [];
+    assert.ok(!allow3.some(r => /membridge/i.test(r)), 'rule not removed by remove-hooks');
+    assert.ok(allow3.includes('Bash(npm run test:*)'), 'user rule dropped by remove-hooks');
+  });
+  check('distill: remove-hooks preserves a user allow rule that merely contains "membridge"', () => {
+    const f = path.join(ROOT, 'claude-settings-usermembridge.json');
+    const userRule = 'Bash(npm test --prefix /Users/x/Documents/Membridge:*)';
+    fs.writeFileSync(f, JSON.stringify({ permissions: { allow: [userRule] } }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: f };
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    let allow = JSON.parse(read(f)).permissions.allow;
+    assert.ok(allow.includes(userRule) && allow.includes(hooks.appendAllowRule()), 'setup should add ours and keep the user rule');
+    spawnSync(process.execPath, [BIN, 'remove-hooks'], { env, encoding: 'utf8' });
+    allow = ((JSON.parse(read(f)).permissions || {}).allow) || [];
+    assert.ok(allow.includes(userRule), 'remove-hooks deleted a user rule that only contains "membridge"');
+    assert.ok(!allow.includes(hooks.appendAllowRule()), 'our append rule should be gone');
+  });
+  check('distill: setup-hooks upgrades a stale append allow rule in place', () => {
+    const staleFile = path.join(ROOT, 'claude-settings-stale-rule.json');
+    fs.writeFileSync(staleFile, JSON.stringify({
+      permissions: { allow: ['Bash("/old/node" "/old/lib/membridge-hook.js" append:*)'] },
+    }, null, 2));
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: staleFile };
+    spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    const after = JSON.parse(read(staleFile));
+    assert.deepStrictEqual(after.permissions.allow.filter(r => /membridge/i.test(r)), [hooks.appendAllowRule()], 'stale rule not rewritten to current form');
+  });
+  check('distill: setup-hooks refuses a settings file whose permissions shape is malformed', () => {
+    const badFile = path.join(ROOT, 'claude-settings-badperm.json');
+    const badBody = JSON.stringify({ permissions: [] });
+    fs.writeFileSync(badFile, badBody);
+    const env = { ...process.env, MEMBRIDGE_CLAUDE_SETTINGS: badFile };
+    const out = spawnSync(process.execPath, [BIN, 'setup-hooks'], { env, encoding: 'utf8' });
+    assert.ok(/refusing/i.test(out.stdout + out.stderr), 'expected a refusal message');
+    assert.strictEqual(read(badFile), badBody, 'malformed file must not be rewritten');
   });
   // A settings.json MemBridge cannot safely parse must be refused, never
   // overwritten — a silent default-to-{} regression would wipe the user's
@@ -3644,19 +3787,34 @@ async function main() {
     assert.strictEqual(out.status, 0);
     assert.strictEqual(out.stdout, '');
   });
-  check('checkpoint: blockReason scopes later checkpoints to only new work', () => {
+  check('checkpoint: blockReason asks every checkpoint for a cumulative whole-session line', () => {
     const first = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 0);
     const later = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 2);
-    assert.ok(!/since your previous summary/i.test(first), 'first checkpoint should not reference prior lines');
-    assert.ok(/only the work done since your previous summary/i.test(later), 'later checkpoint must scope to new work');
-    assert.ok(later.includes('2 already written'), 'later checkpoint should state the count');
-    assert.ok(later.includes('do not repeat or modify earlier lines'), 'later checkpoint must forbid editing earlier lines');
+    assert.ok(/whole session/i.test(first), 'first checkpoint asks for the whole session');
+    assert.ok(/whole session/i.test(later), 'later checkpoint asks for the whole session');
+    assert.ok(/supersed/i.test(later), 'later checkpoint declares it supersedes earlier lines');
+    assert.ok(later.includes('2 earlier lines'), 'later checkpoint states the count');
+    assert.ok(/never modify existing lines/i.test(later), 'append-only rule preserved');
+    assert.ok(!/only the work done since/i.test(later), 'delta scoping must be gone');
+    const one = hooks.blockReason('/p/.membridge/summaries.jsonl', 'ck1', 1);
+    assert.ok(one.includes('1 earlier line ') && !/1 earlier lines/.test(one), 'n=1 uses singular "earlier line"');
   });
-  check('hooks: blockReason asks for goal and highlights', () => {
+  check('checkpoint: blockReason demands outcome phrasing and the discreet append command', () => {
     const r = hooks.blockReason('/p/.membridge/summaries.jsonl', 'sess-x', 0);
-    assert.ok(/"goal"/.test(r), 'mentions goal field');
-    assert.ok(/"highlights"/.test(r), 'mentions highlights field');
-    assert.ok(/"did"/.test(r), 'still asks for did');
+    assert.ok(/what changed in the project/i.test(r), 'outcome phrasing present');
+    assert.ok(/never a list of files edited/i.test(r), 'activity-list phrasing forbidden');
+    assert.ok(r.includes(hooks.hookCommand() + ' append "/p/.membridge/summaries.jsonl"'), 'canonical append command with quoted target');
+    assert.ok(/no commentary/i.test(r), 'no-commentary instruction present');
+    assert.ok(/exactly ONE command/.test(r), 'single-command instruction present');
+    assert.ok(r.includes('"sess-x"'), 'session id present in the template');
+    assert.ok(/"goal"/.test(r) && /"did"/.test(r) && /"highlights"/.test(r), 'field template intact');
+    assert.ok(/escape it for the shell/i.test(r), 'shell-escaping guidance present');
+    assert.ok(r.includes(String.raw`'\''`), 'shows the apostrophe escape sequence');
+  });
+  check('headline: blockReason asks for a short headline field', () => {
+    const r = hooks.blockReason('/p/.membridge/summaries.jsonl', 's1', 0);
+    assert.ok(/"headline"/.test(r), 'JSON template includes headline');
+    assert.ok(/10 words|glance/i.test(r), 'headline guidance present');
   });
   check('checkpoint: countSummaryLines ignores malformed lines, empty did, and other sessions', () => {
     fs.writeFileSync(ckSummaries,
@@ -3668,6 +3826,59 @@ async function main() {
     assert.strictEqual(hooks.countSummaryLines(projCk, 'ck1'), 2);
     assert.strictEqual(hooks.countSummaryLines(projCk, 'nope'), 0);
     assert.strictEqual(hooks.hasSummaryLine(projCk, 'ck1'), true);
+  });
+  const HOOK_SCRIPT = path.join(__dirname, '..', 'lib', 'membridge-hook.js');
+  const runAppendCli = args => spawnSync(process.execPath, [HOOK_SCRIPT, 'append', ...args], { encoding: 'utf8' });
+  check('append: writes one validated line, creates .membridge, never truncates', () => {
+    const proj = path.join(ROOT, 'projects', 'append-app');
+    fs.mkdirSync(proj, { recursive: true });
+    const target = path.join(proj, '.membridge', 'summaries.jsonl');
+    const line = f => JSON.stringify({ session: 'ap1', ts: '2026-07-17T00:00:00Z', goal: 'g', did: 'shipped the thing', decisions: '', gotchas: '', highlights: [], ...f });
+    const out = runAppendCli([target, line({})]);
+    assert.strictEqual(out.status, 0, out.stderr);
+    assert.strictEqual(out.stdout, '', 'append must be silent on success');
+    const rows = read(target).trim().split('\n');
+    assert.strictEqual(rows.length, 1);
+    assert.strictEqual(JSON.parse(rows[0]).did, 'shipped the thing');
+    const out2 = runAppendCli([target, line({ did: 'second line' })]);
+    assert.strictEqual(out2.status, 0, out2.stderr);
+    const rows2 = read(target).trim().split('\n');
+    assert.strictEqual(rows2.length, 2, 'second append must not truncate the first');
+    assert.strictEqual(JSON.parse(rows2[1]).did, 'second line');
+  });
+  check('append: rejects bad input loudly and writes nothing', () => {
+    const proj = path.join(ROOT, 'projects', 'append-bad');
+    fs.mkdirSync(proj, { recursive: true });
+    const target = path.join(proj, '.membridge', 'summaries.jsonl');
+    const mk = f => JSON.stringify({ session: 's1', did: 'real work', ...f });
+    for (const [args, why] of [
+      [[target, 'not json {'], 'malformed JSON'],
+      [[target, '["array"]'], 'JSON but not an object'],
+      [[target, mk({ session: '  ' })], 'blank session'],
+      [[target, mk({ did: '' })], 'empty did'],
+      [[path.join(proj, 'elsewhere.jsonl'), mk({})], 'target not a .membridge/summaries.jsonl path'],
+      [[path.join(proj, 'evil.membridge', 'summaries.jsonl'), mk({})], 'suffix match but not a real .membridge dir'],
+      [[target], 'missing json argument'],
+    ]) {
+      const out = runAppendCli(args);
+      assert.notStrictEqual(out.status, 0, `${why}: expected non-zero exit`);
+      assert.ok(out.stderr.trim(), `${why}: expected a stderr message`);
+    }
+    assert.ok(!fs.existsSync(target), 'invalid input must write nothing');
+  });
+  check('headline: append accepts a line with headline and one without; rejects non-string headline', () => {
+    const proj = path.join(ROOT, 'projects', 'hl-app'); fs.mkdirSync(proj, { recursive: true });
+    const target = path.join(proj, '.membridge', 'summaries.jsonl');
+    const base = { session: 's1', ts: '2026-07-20T00:00:00Z', did: 'did a thing' };
+    const run = obj => spawnSync(process.execPath, [HOOK_SCRIPT, 'append', target, JSON.stringify(obj)], { encoding: 'utf8' });
+    assert.strictEqual(run({ ...base, headline: 'Short outcome' }).status, 0, 'headline line rejected');
+    assert.strictEqual(run(base).status, 0, 'headline-less line rejected');
+    assert.notStrictEqual(run({ ...base, headline: 42 }).status, 0, 'non-string headline accepted');
+  });
+  check('append: bare invocation still runs the stop hook (allows on garbage stdin)', () => {
+    const out = spawnSync(process.execPath, [HOOK_SCRIPT], { input: 'not json', encoding: 'utf8' });
+    assert.strictEqual(out.status, 0);
+    assert.strictEqual(out.stdout, '');
   });
   check('checkpoint: checkpointEvery below 1 or non-finite falls back to 4', () => {
     const rawCfg = util.loadUserConfig();
@@ -4760,6 +4971,17 @@ async function main() {
       author_name: 'A', ts: '2026-07-14T05:00:00Z', source: 'Codex', ask: 'q', files: [],
       created_at: '2026-07-14T05:00:00Z' }, { selfUserId: 'me' });
     assert.strictEqual(n.summary, null);
+  });
+  check('headline: feed normalizeLocal and normalizeTeam carry headline', () => {
+    const local = feed.normalizeLocal(
+      { session: 's', headline: 'H', did: 'D', summary: 'D', ts: '2026-07-20T00:00:00Z', files: [] },
+      { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(local.headline, 'H', 'headline not carried by normalizeLocal');
+    const team = feed.normalizeTeam(
+      { id: 1, project_id: 'p', project_name: 'p', author_id: 'a', author_name: 'A',
+        ts: '2026-07-20T00:00:00Z', source: 'Distilled', ask: 'q', headline: 'H', files: [],
+        created_at: '2026-07-20T00:00:00Z' }, { selfUserId: 'me' });
+    assert.strictEqual(team.headline, 'H', 'headline not carried by normalizeTeam');
   });
   check('feed: local entry carries goal + changes', () => {
     const proj = { events: [
