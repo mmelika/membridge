@@ -1172,6 +1172,36 @@ async function main() {
       assert.deepStrictEqual(evalDayCards([]), []);
       assert.ok(evalDayCards([unitWith({ ts: 'not-a-date' })]).length === 1);
     });
+    // v2 checklist data (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 1):
+    // each card carries a checklist[] — one {glyph, text, live} row per unit,
+    // live rows first — and a fileCount summed over the day. Same fixtures and
+    // sandbox as the grouping checks above.
+    check('dayCards v2: checklist is one {glyph, text, live} row per unit, live rows first', () => {
+      const distilledNewest = unitWith({ ts: dayCardsLocalTs(0, 14), repEntry: { headline: 'Shipped checklist item' } });
+      const liveMid = unitWith({ ts: dayCardsLocalTs(0, 13), live: true, ask: 'Wire the toggle' });
+      const staleNoSum = unitWith({ ts: dayCardsLocalTs(0, 12), ask: 'Old chore' });
+      const c = evalDayCards([distilledNewest, liveMid, staleNoSum])[0];
+      assert.ok(Array.isArray(c.checklist), 'card has a checklist array');
+      assert.strictEqual(c.checklist.length, 3, 'one row per unit');
+      assert.strictEqual(c.checklist[0].glyph, '◐', 'live row sorts first with the half-moon glyph');
+      assert.strictEqual(c.checklist[0].live, true, 'live row carries live:true');
+      assert.ok(c.checklist[0].text.includes('Wire the toggle'), 'live row text is its runHeadline (the ask)');
+      assert.strictEqual(c.checklist[1].glyph, '✓', 'distilled finished row gets the check glyph');
+      assert.strictEqual(c.checklist[1].live, false, 'finished row carries live:false');
+      assert.ok(c.checklist[1].text.includes('Shipped checklist item'), 'distilled row text is its rep headline');
+      assert.strictEqual(c.checklist[2].glyph, '○', 'finished-no-summary row gets the open-circle glyph');
+      assert.ok(c.checklist[2].text.includes('Old chore'), 'no-summary row text falls back to the ask');
+    });
+    check('dayCards v2: fileCount = distinct files across the day (changes first, files fallback, deduped)', () => {
+      const u1 = unitWith({ ts: dayCardsLocalTs(0, 14) });
+      u1.runs[0].entries[0].changes = [{ file: 'lib/a.js' }, { file: 'lib/b.js' }];
+      u1.runs[0].entries[0].files = ['lib/ignored-when-changes-present.js'];
+      const u2 = unitWith({ ts: dayCardsLocalTs(0, 13) });
+      u2.runs[0].entries[0].files = ['lib/b.js', 'lib/c.js'];
+      const u3 = unitWith({ ts: dayCardsLocalTs(0, 12) });
+      const c = evalDayCards([u1, u2, u3])[0];
+      assert.strictEqual(c.fileCount, 3, 'a.js, b.js, c.js — changes beat files per entry, deduped across units');
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
