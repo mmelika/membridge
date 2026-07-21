@@ -202,7 +202,7 @@ function createMockSupabase() {
     json(res, 404, { message: `unknown rpc ${fn}` });
   }
 
-  function handleEntries(res, url, method, body, userId) {
+  function handleEntries(res, url, method, body, userId, prefer) {
     if (!userId) return json(res, 401, { message: 'not authenticated' });
     if (method === 'POST') {
       const rows = Array.isArray(body) ? body : [body];
@@ -217,14 +217,18 @@ function createMockSupabase() {
           return json(res, 400, { message: `Could not find the '${col}' column of 'memory_entries' in the schema cache` });
         }
       }
+      const merge = /merge-duplicates/.test(prefer || '');
       for (const r of rows) {
         if (r.author_id !== userId || !isMember(projectTeam(r.project_id), userId)) {
           stats.deniedInserts++;
           return json(res, 403, { message: 'row-level security violation' });
         }
-        const dup = entries.some(e => e.project_id === r.project_id &&
+        const idx = entries.findIndex(e => e.project_id === r.project_id &&
           e.author_id === r.author_id && e.ts === r.ts && e.source === r.source);
-        if (dup) continue; // Prefer: resolution=ignore-duplicates
+        if (idx >= 0) {
+          if (merge) entries[idx] = { ...entries[idx], ...r }; // Prefer: resolution=merge-duplicates (overwrite in place)
+          continue; // Prefer: resolution=ignore-duplicates (leave as-is)
+        }
         stats.inserts++;
         entries.push({ ...r, id: entries.length + 1, created_at: new Date(Date.now() + entries.length).toISOString() });
       }
@@ -296,7 +300,7 @@ function createMockSupabase() {
       const rpcMatch = url.pathname.match(/^\/rest\/v1\/rpc\/(\w+)$/);
       if (rpcMatch) return handleRpc(res, rpcMatch[1], body, authedUser(req));
       if (url.pathname === '/rest/v1/memory_entries') {
-        return handleEntries(res, url, req.method, body, authedUser(req));
+        return handleEntries(res, url, req.method, body, authedUser(req), req.headers.prefer || '');
       }
       if (url.pathname === '/rest/v1/project_stats' && req.method === 'GET') {
         // The security_invoker view: per-project last activity / contributor /
@@ -381,7 +385,7 @@ function createMockSupabase() {
     });
   });
 
-  return { server, users, teams, members, projects, entries, invites, pubkeys, teamKeys, stats, flags };
+  return { server, users, sessions, teams, members, projects, entries, invites, pubkeys, teamKeys, stats, flags };
 }
 
 module.exports = { createMockSupabase };

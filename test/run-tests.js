@@ -4983,6 +4983,27 @@ async function main() {
     await new Promise(r => mock5.server.close(r));
   }
 
+  await check('mock: merge-duplicates overwrites an existing row in place', async () => {
+    const m = createMockSupabase();
+    await new Promise(r => m.server.listen(0, '127.0.0.1', r));
+    const base = 'http://127.0.0.1:' + m.server.address().port + '/rest/v1/';
+    const uid = 'u1', pid = 'p1', tid = 't1';
+    m.teams.set(tid, { id: tid, name: 'T', inviteCode: 'x' });
+    m.projects.push({ id: pid, teamId: tid, name: 'proj', repoUrl: null });
+    m.members.push({ teamId: tid, userId: uid, displayName: 'U', role: 'owner' });
+    const token = 'at-merge-test'; m.sessions.set(token, uid);
+    const row = { project_id: pid, author_id: uid, author_name: 'U', ts: '2026-01-01T00:00:00Z', source: 'Claude Code', session: 's1', ask: null };
+    const post = (body, prefer) => fetch(base + 'memory_entries?on_conflict=project_id,author_id,ts,source', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token, Prefer: prefer }, body: JSON.stringify([body]),
+    });
+    await post(row, 'resolution=ignore-duplicates,return=minimal');
+    await post({ ...row, ask: 'the shared prompt' }, 'resolution=ignore-duplicates,return=minimal'); // ignored (dup)
+    assert.strictEqual(m.entries.filter(e => e.session === 's1')[0].ask, null, 'ignore-duplicates wrongly overwrote');
+    await post({ ...row, ask: 'the shared prompt' }, 'resolution=merge-duplicates,return=minimal'); // overwrites
+    assert.strictEqual(m.entries.filter(e => e.session === 's1')[0].ask, 'the shared prompt', 'merge-duplicates did not overwrite');
+    m.server.close();
+  });
+
   // --- 12. consent: needsConsentPrompt + applyConsent + digest gating ---
   const consent = require('../lib/consent');
 
