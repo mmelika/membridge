@@ -1324,6 +1324,67 @@ async function main() {
       assert.ok(!/data-day-open/.test(h), 'project page must not render day cards');
       assert.ok(/<article/.test(h), 'per-unit cards must still render');
     });
+    // Level-2 day-detail view (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 3):
+    // dayDetailHtml renders the session view for one author-day card —
+    // breadcrumb + day headline, one session card per unit (live-first), the
+    // 2–3 sentence distilled summary, prompts inline behind a bottom-left
+    // toggle, and NO deeper drill target anywhere (two levels only).
+    function evalDayDetailHtml(card, opts, expandedKeys) {
+      const escSrc = extractVarFn(embeddedScript, 'esc') || '';
+      const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
+      const constSrc = extractConst(embeddedScript, 'MONO');
+      const fnSrc = ['personColor', 'firstSentence', 'askHeadline', 'runHeadline', 'dayDetailHtml']
+        .map(n => extractFn(embeddedScript, n)).join('\n');
+      const sandbox = new Function('expandedKeys',
+        escSrc + '\n' + agoSrc + '\n' + constSrc + '\nvar catchupExpanded = expandedKeys || {};\n' + fnSrc +
+        '\nreturn { dayDetailHtml: dayDetailHtml };'
+      )(expandedKeys);
+      return sandbox.dayDetailHtml(card, opts || {});
+    }
+    const dSum = unitWith({ ts: dayCardsLocalTs(0, 15), repEntry: { headline: 'Shipped it', summary: 'Did the thing end to end. Wired the tests. Landed green.' } });
+    const dLive = unitWith({ ts: dayCardsLocalTs(0, 14), live: true, ask: 'Keep wiring' });
+    const dBare = unitWith({ ts: dayCardsLocalTs(0, 13), ask: 'Chore run' });
+    const dNoAsk = unitWith({ ts: dayCardsLocalTs(0, 12), ask: '' });
+    const dDetailCard = evalDayCards([dSum, dLive, dBare, dNoAsk])[0];
+    check('dayDetailHtml: breadcrumb + day headline; one session card per unit, live-first', () => {
+      const h = evalDayDetailHtml(dDetailCard);
+      assert.ok(/data-day-back/.test(h), 'breadcrumb back control missing');
+      assert.ok(h.includes('Activity'), 'crumb names the Activity feed');
+      assert.ok(h.includes('Shipped it'), 'day headline missing');
+      assert.strictEqual((h.match(/<article/g) || []).length, 4, 'one session card per unit');
+      const iLive = h.indexOf('Keep wiring');
+      const iSum = h.indexOf('Shipped it', h.indexOf('<article'));
+      assert.ok(iLive !== -1 && iSum !== -1 && iLive < iSum, 'live unit card renders first');
+      assert.ok(/working now/i.test(h), 'live unit keeps its working-now marker');
+    });
+    check('dayDetailHtml: 2–3 sentence distilled summary shown, not just the headline', () => {
+      const h = evalDayDetailHtml(dDetailCard);
+      assert.ok(h.includes('Did the thing end to end. Wired the tests. Landed green.'), 'full distilled summary missing');
+    });
+    check('dayDetailHtml: prompts hidden behind the bottom-left toggle; display-only rows; no level-3 target', () => {
+      const h = evalDayDetailHtml(dDetailCard);
+      assert.ok(/data-prompts-toggle/.test(h), 'prompts toggle missing');
+      assert.ok(/show 1 prompt\b/.test(h), 'toggle label counts the prompts');
+      assert.ok(/<div data-prompts-fold="[^"]*"[^>]*display:none/.test(h), 'prompt fold must start hidden');
+      assert.ok(h.includes('(prompt not shared)'), 'unshared prompt renders the placeholder row');
+      assert.ok(h.indexOf('Chore run') !== -1, 'shared ask renders as a prompt row');
+      assert.ok(!/data-sess-open|data-day-open|data-prompt-open/.test(h), 'no deeper-open attribute anywhere — two levels only');
+      const exp = {};
+      exp['prompts|' + dLive.key] = true;
+      const h2 = evalDayDetailHtml(dDetailCard, {}, exp);
+      assert.ok(/<div data-prompts-fold="[^"]*"[^>]*display:block/.test(h2), 'catchupExpanded reopens a prompt fold across repaints');
+    });
+    check('dayDetailHtml: a missing day degrades to the friendly not-found state', () => {
+      const h = evalDayDetailHtml(null);
+      assert.ok(/data-day-back/.test(h), 'not-found still offers the way back');
+      assert.ok(/isn|scrolled|no longer/i.test(h), 'not-found copy missing');
+    });
+    check('day route: container, tab, poller, and back handler wired', () => {
+      assert.ok(pageHtml.includes('id="view-day"') && pageHtml.includes('id="dayRoot"'), 'day view container missing from the page');
+      assert.ok(embeddedScript.includes("indexOf('#day=') === 0"), 'currentTab must recognize #day=');
+      assert.ok(/function startDay\(\)/.test(embeddedScript) && /function loadDay\(\)/.test(embeddedScript) && /function stopDay\(\)/.test(embeddedScript), 'day poller trio missing');
+      assert.ok(embeddedScript.includes("getElementById('view-day')"), 'view-day delegated listener missing');
+    });
     // ---- Five Electron-runtime UI bug fixes. No DOM runtime in this suite,
     // so these are source-level presence/shape assertions against the served
     // pageHtml/embeddedScript (both already fully rendered by dashboardPage()). ----
