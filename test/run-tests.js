@@ -164,6 +164,42 @@ async function main() {
   console.log(`MemBridge test suite (fixtures in ${ROOT})\n`);
   setupFixtures();
 
+  // --- capture hygiene: temp/scratchpad edits never mint a phantom project ---
+  check('util.isTempPath: scratchpad + claude temp roots are temp; real paths are not', () => {
+    assert.strictEqual(util.isTempPath('/private/tmp/claude-501/-Users-x/abc/scratchpad/mine/lib/x.js'), true);
+    assert.strictEqual(util.isTempPath('/tmp/claude-9/work/file.js'), true);
+    assert.strictEqual(util.isTempPath('/repo/scratchpad/note.md'), true); // scratchpad segment anywhere
+    assert.strictEqual(util.isTempPath('/Users/marco/Documents/AI/src/x.js'), false);
+    assert.strictEqual(util.isTempPath('/tmp/membridge-test-abc/projects/shop/login.js'), false); // fixture-style path
+    assert.strictEqual(util.isTempPath(''), false);
+  });
+
+  check('capture: temp/scratchpad edits are dropped; real edits attributed to the repo', () => {
+    const repo = path.join(ROOT, 'hygiene-repo');
+    fs.mkdirSync(repo, { recursive: true });
+    const events = [
+      { kind: 'edit', file: '/private/tmp/claude-9/x/scratchpad/mine/a.js', project: repo, session: 's1' },
+      { kind: 'edit', file: path.join(repo, 'real.js'), project: repo, session: 's1' },
+      { kind: 'prompt', text: 'do it', project: repo, session: 's1' },
+    ];
+    projectResolve.rehomeEvents(events, new Set([util.normPath(repo)]));
+    const kept = filterTrackedSessions(events, new Set([util.normPath(repo)]));
+    assert.strictEqual(kept.some(e => e.file && e.file.includes('scratchpad')), false, 'temp edit leaked into ingestion');
+    assert.ok(kept.some(e => e.kind === 'edit' && e.file === path.join(repo, 'real.js')), 'real edit missing');
+    assert.ok(kept.every(e => util.normPath(e.project) === util.normPath(repo)), 'kept events not homed to the repo');
+  });
+
+  check('capture: a temp-only session mints no project (all edits dropped)', () => {
+    const container = path.join(ROOT, 'container-cwd'); // e.g. the daemon cwd, tracked
+    fs.mkdirSync(container, { recursive: true });
+    const events = [
+      { kind: 'edit', file: '/private/tmp/claude-9/y/scratchpad/z/a.js', project: container, session: 's2' },
+    ];
+    projectResolve.rehomeEvents(events, new Set([util.normPath(container)]));
+    const kept = filterTrackedSessions(events, new Set([util.normPath(container)]));
+    assert.strictEqual(kept.length, 0, 'a temp-only session should contribute no events');
+  });
+
   check('prepare-app bundles the CLI into app/bin so the packaged asar carries it', () => {
     const r = spawnSync('node', [path.join(__dirname, '..', 'scripts', 'prepare-app.js')], { encoding: 'utf8' });
     assert.strictEqual(r.status, 0, `prepare-app failed: ${r.stderr}`);
