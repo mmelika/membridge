@@ -195,10 +195,13 @@ async function main() {
   });
   check('build config ships an arm64 zip with a deterministic name for the installer URL', () => {
     const pkg = JSON.parse(read(path.join(__dirname, '..', 'package.json')));
-    assert.deepStrictEqual(pkg.build.mac.target, ['zip'], 'mac target should be zip-only');
+    // arm64 pinned inside the target object (electron-builder has no valid
+    // top-level mac.arch), so the emitted asset is deterministically
+    // MemBridge-<version>-arm64.zip and the install.sh URL resolves.
+    assert.deepStrictEqual(pkg.build.mac.target, [{ target: 'zip', arch: ['arm64'] }],
+      'mac target should be a single arm64-pinned zip');
     assert.strictEqual(pkg.build.mac.artifactName, 'MemBridge-${version}-${arch}.${ext}',
       'artifactName must be deterministic so install.sh can build the release URL');
-    assert.deepStrictEqual(pkg.build.mac.arch, ['arm64'], 'mac arch should be pinned to arm64');
   });
 
   // --- 1. fresh sync ---
