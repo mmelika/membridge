@@ -3619,6 +3619,16 @@ async function main() {
     await new Promise(r => mock3.server.close(r));
   }
 
+  check('teamsync: isShared is per-session, default off, with legacy fallback', () => {
+    const proj = { sharedSessions: ['s1'] };
+    assert.strictEqual(teamsync.isShared({}, proj, 's1'), true);
+    assert.strictEqual(teamsync.isShared({}, proj, 's2'), false);
+    assert.strictEqual(teamsync.isShared({}, {}, 's1'), false);            // default off
+    assert.strictEqual(teamsync.isShared({}, {}, null), false);            // no session id
+    assert.strictEqual(teamsync.isShared({ team: { sharePrompts: true } }, {}, 's1'), true);       // legacy fallback
+    assert.strictEqual(teamsync.isShared({ team: { sharePrompts: true } }, { sharedSessions: [] }, 's1'), false); // list wins
+  });
+
   // Task 6: goal is gated by sharePrompts (same convention as ask), and the
   // change model (buildEntries' e.changes) ships inside the `files` column
   // instead of a plain filename list, when present.
