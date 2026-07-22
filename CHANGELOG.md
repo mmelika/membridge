@@ -13,6 +13,11 @@
   optional short `headline`; cards never headline with harvested AI monologue, guard
   noisy live prompts to "Working…", clamp to two lines, and move the full summary
   into the expander.
+- **Card headlines never get cut off.** The hook asks for the headline within a
+  hard 80-character budget and the append command enforces it (an over-budget
+  headline fails loudly so the agent shortens and retries) — the card shows it
+  verbatim, and the longer `did` story stays one click away in the expander.
+  Legacy over-long headlines degrade at a word boundary with an ellipsis.
 
 ## 0.7.0 — 2026-07-14
 
