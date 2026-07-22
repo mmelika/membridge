@@ -9381,6 +9381,69 @@ async function main() {
     });
   }
 
+  // --- git worktrees fold into their main repo's project ---
+  {
+    const pr = require('../lib/project-resolve');
+    const scan = require('../lib/scan');
+    const np = util.normPath;
+
+    check('worktree: worktreeMain parses a .git pointer, ignores real .git dirs', () => {
+      const wt = path.join(ROOT, 'wt-parse');
+      fs.mkdirSync(wt, { recursive: true });
+      fs.writeFileSync(path.join(wt, '.git'), 'gitdir: /some/main/repo/.git/worktrees/feat-x\n');
+      assert.strictEqual(pr.worktreeMain(wt), '/some/main/repo', 'main repo root not derived');
+      const real = path.join(ROOT, 'wt-real');
+      fs.mkdirSync(path.join(real, '.git'), { recursive: true });
+      assert.strictEqual(pr.worktreeMain(real), null, 'a real .git dir must not read as a worktree');
+      const sub = path.join(ROOT, 'wt-sub');
+      fs.mkdirSync(sub, { recursive: true });
+      fs.writeFileSync(path.join(sub, '.git'), 'gitdir: /x/.git/modules/foo\n');
+      assert.strictEqual(pr.worktreeMain(sub), null, 'a submodule pointer must not read as a worktree');
+    });
+
+    check('worktree: resolveRoot redirects a worktree file to its main repo', () => {
+      const main = '/repo';
+      const wt = '/repo/.claude/worktrees/feat-x';
+      const trackedRoots = new Set([np(main)]);
+      const opts = {
+        worktreeMain: dir => (np(dir) === np(wt) ? main : null),
+        hasMembridge: () => false,
+        hasGit: dir => np(dir) === np(main), // main is the only real repo root
+      };
+      assert.strictEqual(pr.resolveRoot(wt + '/lib/a.js', trackedRoots, opts), main,
+        'a worktree file must resolve to the main repo project');
+    });
+
+    check('worktree: foldWorktreeProjects merges a fragment into its main project', () => {
+      const main = '/repo';
+      const wt = '/repo/.claude/worktrees/gone'; // deleted from disk -> path fallback
+      const state = { projects: {
+        [main]: { events: [
+          { ts: '2026-07-20T09:00:00.000Z', source: 'Claude Code', kind: 'edit', session: 'm', file: '/repo/a.js', project: main }] },
+        [wt]: { events: [
+          { ts: '2026-07-20T09:01:00.000Z', source: 'Claude Code', kind: 'prompt', session: 'w', text: 'do it', project: wt },
+          { ts: '2026-07-20T09:02:00.000Z', source: 'Claude Code', kind: 'edit', session: 'w', file: '/repo/.claude/worktrees/gone/b.js', project: wt }] },
+      }, files: {} };
+      const folded = scan.foldWorktreeProjects(state, util.getConfig());
+      assert.strictEqual(folded.length, 1, `expected one fold, got ${JSON.stringify(folded)}`);
+      assert.ok(!state.projects[wt], 'worktree fragment was not removed');
+      const sessions = new Set((state.projects[main].events || []).map(e => e.session));
+      assert.ok(sessions.has('w') && sessions.has('m'), 'worktree events not merged into main (or main lost)');
+      // idempotent: a second pass folds nothing.
+      assert.strictEqual(scan.foldWorktreeProjects(state, util.getConfig()).length, 0, 'fold is not idempotent');
+    });
+
+    check('worktree: fold never touches a real nested project (no worktrees segment)', () => {
+      const state = { projects: {
+        '/repo': { events: [] },
+        '/repo/packages/api': { events: [{ ts: '2026-07-20T09:00:00.000Z', source: 'Claude Code', kind: 'edit', session: 's', file: '/repo/packages/api/x.js', project: '/repo/packages/api' }] },
+      }, files: {} };
+      const folded = scan.foldWorktreeProjects(state, util.getConfig());
+      assert.strictEqual(folded.length, 0, 'a normal nested project must not be folded');
+      assert.ok(state.projects['/repo/packages/api'], 'nested project was wrongly removed');
+    });
+  }
+
   // --- summary ---
   const failed = results.filter(([, e]) => e);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
