@@ -6,7 +6,6 @@
 
 <p align="center">
   <a href="https://github.com/mmelika/membridge/actions/workflows/ci.yml"><img src="https://github.com/mmelika/membridge/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
   <a href="package.json"><img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg" alt="node >= 18"></a>
 </p>
 
