@@ -19,6 +19,7 @@ const { startServer } = require('../lib/server');
 const autostart = require('../lib/autostart');
 const teamsync = require('../lib/teamsync');
 const hooks = require('../lib/hooks');
+const prompts = require('../lib/prompts');
 const pkg = require('../package.json');
 
 const args = process.argv.slice(2);
@@ -58,6 +59,7 @@ function cmdSync() {
   const result = syncOnce({ dryRun, project: opt('--project') });
   console.log(`${dryRun ? '[dry run] ' : ''}${result.newEvents} new event(s), ${result.projects.length} project(s) affected`);
   printChanges(result);
+  prompts.flushValueMoment(util.getConfig());
   if (!dryRun && teamsync.isConfigured(util.getConfig())) {
     return teamSyncPass({ project: opt('--project') }).catch(err => console.error(`team sync failed: ${err.message}`));
   }
@@ -189,6 +191,10 @@ function cmdStart() {
   const config = util.getConfig();
   console.log(`MemBridge daemon started in the background (pid ${child.pid}).`);
   console.log(`Dashboard: http://127.0.0.1:${config.dashboardPort}`);
+  // First-run + any due value-moment nudge, on the interactive foreground
+  // command (never in the detached daemon's logfile — see lib/prompts.js).
+  prompts.maybeFirstRun(config);
+  prompts.flushValueMoment(config);
 }
 
 function cmdStop() {
@@ -229,6 +235,7 @@ function cmdStatus() {
     const paused = util.isProjectOff(key, config) ? ' [paused]' : '';
     console.log(`  ${key}${paused} — ${proj.events.length} event(s), last sync ${proj.lastSync || 'never'}`);
   }
+  prompts.flushValueMoment(config);
 }
 
 function cmdRemove() {
@@ -258,6 +265,30 @@ function cmdRemove() {
   console.log(n ? `Done — ${n} file(s) cleaned.` : 'No MemBridge blocks found.');
 }
 
+// `membridge config <get|set> <key> [value]`. Minimal + generic, but only the
+// `prompts` key is wired today: it toggles the local feedback nudges (no
+// telemetry either way — the messages are the only thing being suppressed).
+function cmdConfig(sub, key, val) {
+  if (sub === 'get' && key === 'prompts') {
+    // Effective value: default on unless explicitly disabled.
+    console.log(`prompts ${util.getConfig().prompts === false ? 'off' : 'on'}`);
+    return;
+  }
+  if (sub === 'set' && key === 'prompts') {
+    if (val !== 'on' && val !== 'off') {
+      console.error('Usage: membridge config set prompts <on|off>');
+      process.exit(1);
+    }
+    const raw = util.loadUserConfig();
+    raw.prompts = (val === 'on');
+    util.saveUserConfig(raw);
+    console.log(`prompts ${val === 'on' ? 'on' : 'off'}`);
+    return;
+  }
+  console.error('Usage:\n  membridge config get prompts\n  membridge config set prompts <on|off>');
+  process.exit(1);
+}
+
 function openBrowser(url) {
   if (process.platform === 'win32') spawnSync('cmd', ['/c', 'start', '', url], { stdio: 'ignore' });
   else if (process.platform === 'darwin') spawnSync('open', [url], { stdio: 'ignore' });
@@ -275,6 +306,7 @@ function cmdDashboard() {
     openBrowser(url);
   }
   console.log(`Dashboard: ${url}`);
+  prompts.flushValueMoment(config);
 }
 
 // lib/mcp.js (and its @modelcontextprotocol/sdk + zod dependencies) is
@@ -732,6 +764,8 @@ Usage: membridge <command>
   disable-autostart   remove the login launcher
   update [--check]    check for a newer release and update in place
                       (--check only reports; never runs anything)
+  config get prompts            show whether feedback nudges are on
+  config set prompts <on|off>   turn the local feedback nudges on or off
   daemon              run in the foreground (used internally / by services)
   help                this text
 
@@ -788,6 +822,7 @@ const commands = {
   stop: cmdStop,
   status: cmdStatus,
   remove: cmdRemove,
+  config: () => cmdConfig(args[1], args[2], args[3]),
   dashboard: cmdDashboard,
   update: cmdUpdate,
   mcp: cmdMcp,

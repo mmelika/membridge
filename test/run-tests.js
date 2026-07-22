@@ -9382,6 +9382,7 @@ async function main() {
         files: {},
         projects: { '/tmp/atomic-roundtrip-project': { events: [{ kind: 'prompt', session: 's1', ts: '2026-07-18T00:00:00.000Z', text: 'atomic write check' }] } },
         catchup: { ...util.DEFAULT_CATCHUP },
+        feedback: { ...util.DEFAULT_FEEDBACK },
       };
       util.saveState(fresh);
       assert.deepStrictEqual(util.loadState(), fresh, 'state did not round-trip through save/load');
@@ -9765,6 +9766,109 @@ async function main() {
       assert.deepStrictEqual(openEpochs, [1, 2],
         `Bob's new device must open epoch 1 AND 2 after recovery, opened: ${JSON.stringify(openEpochs)}`);
     });
+  }
+
+  // --- post-install feedback nudges (feat/feedback-hook) ---
+  // Local-only: these exercise lib/prompts against the sandbox state, toggling
+  // isTTY / CI / config.prompts and capturing console output. No network.
+  {
+    const prompts = require('../lib/prompts');
+    const origTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    const origCI = process.env.CI;
+    const savedState = read(util.statePath());
+    let out = [];
+    const origLog = console.log;
+    const cap = () => { out = []; console.log = (...a) => out.push(a.join(' ')); };
+    const uncap = () => { console.log = origLog; };
+    const printed = () => out.join('\n');
+    const setTTY = v => Object.defineProperty(process.stdout, 'isTTY', { value: v, configurable: true });
+    const withEvents = fb => ({
+      version: util.STATE_VERSION, files: {},
+      projects: { '/tmp/fb-proj': { events: [{ kind: 'prompt', session: 'fb-s1', ts: '2026-07-18T00:00:00.000Z', text: 'x' }] } },
+      catchup: { ...util.DEFAULT_CATCHUP }, feedback: { ...util.DEFAULT_FEEDBACK, ...fb },
+    });
+
+    try {
+      delete process.env.CI;
+      setTTY(true);
+
+      check('feedback: first-run message A prints once under a TTY, then never again', () => {
+        util.saveState(withEvents({ firstRunShown: false }));
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        const first = printed();
+        assert.ok(/MemBridge is running/.test(first), 'message A not printed');
+        assert.ok(/membridge\.me\/feedback\?ref=cli/.test(first), 'message A missing the feedback link');
+        assert.ok(/mmelika\/membridge/.test(first) && !/andrewb-eng/.test(first), 'links must use mmelika/membridge only');
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'message A must not print a second time');
+        assert.strictEqual(util.loadState().feedback.firstRunShown, true, 'firstRunShown not persisted');
+      });
+
+      check('feedback: no message without a TTY, or when CI is set (state untouched)', () => {
+        util.saveState(withEvents({ firstRunShown: false }));
+        setTTY(false);
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'must not print without a TTY');
+        setTTY(true);
+        process.env.CI = '1';
+        cap(); prompts.maybeFirstRun(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'must not print under CI');
+        delete process.env.CI;
+        assert.strictEqual(util.loadState().feedback.firstRunShown, false, 'a suppressed call must not mark firstRunShown');
+      });
+
+      check('feedback: value moment B prints once after 5 amendments (with a real session count), then never again', () => {
+        util.saveState(withEvents({ firstRunShown: true, valueShown: false, amendments: 5 }));
+        cap(); prompts.flushValueMoment(util.getConfig()); uncap();
+        const b = printed();
+        assert.ok(/synced 1 sessions/.test(b), 'message B must carry the real session count: ' + b);
+        assert.ok(/ref=cli-value/.test(b), 'message B missing the value link');
+        assert.ok(!/ 0 sessions/.test(b), 'message B must never say 0 sessions');
+        cap(); prompts.flushValueMoment(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'message B must not print a second time');
+        assert.strictEqual(util.loadState().feedback.valueShown, true, 'valueShown not persisted');
+      });
+
+      check('feedback: below 5 amendments the value moment stays silent', () => {
+        util.saveState(withEvents({ firstRunShown: true, valueShown: false, amendments: 4 }));
+        cap(); prompts.flushValueMoment(util.getConfig()); uncap();
+        assert.strictEqual(printed(), '', 'B must not print before the 5th amendment');
+      });
+
+      check('feedback: config prompts:false suppresses both messages', () => {
+        util.saveState(withEvents({ firstRunShown: false, valueShown: false, amendments: 5 }));
+        const cfg = { ...util.getConfig(), prompts: false };
+        cap(); prompts.maybeFirstRun(cfg); prompts.flushValueMoment(cfg); uncap();
+        assert.strictEqual(printed(), '', 'prompts:false must suppress both A and B');
+        assert.strictEqual(util.loadState().feedback.firstRunShown, false, 'suppressed A must not mark shown');
+      });
+
+      check('feedback: countAmendments counts only updated context-file writes, not memory.md/db', () => {
+        const cfg = util.getConfig();
+        const target = util.effectiveTargets(cfg)[0]; // e.g. CLAUDE.md
+        const changes = [
+          { file: '/p/' + target, action: 'updated' },
+          { file: '/p/' + target, action: 'would update' },        // dry-run action: not counted
+          { file: '/p/.membridge/memory.md', action: 'updated' },  // not a context target
+          { file: '/p/.membridge/memory.json', action: 'updated' },// not a context target
+        ];
+        assert.strictEqual(prompts.countAmendments(changes, cfg), 1, 'only the real context-file update should count');
+      });
+
+      check('feedback: syncOnce increments state.feedback.amendments for real context-file writes', () => {
+        util.saveState(withEvents({ firstRunShown: true, valueShown: false, amendments: 0 }));
+        const before = util.loadState().feedback.amendments;
+        syncOnce({ project: proj1 }); // proj1 has accumulated events + a real CLAUDE.md target
+        const after = util.loadState().feedback.amendments;
+        assert.ok(after >= before, 'amendments must never decrease');
+      });
+    } finally {
+      uncap();
+      if (origTTY) Object.defineProperty(process.stdout, 'isTTY', origTTY);
+      else { try { delete process.stdout.isTTY; } catch { setTTY(undefined); } }
+      if (origCI === undefined) delete process.env.CI; else process.env.CI = origCI;
+      fs.writeFileSync(util.statePath(), savedState); // restore the suite's accumulated state
+    }
   }
 
   // --- summary ---

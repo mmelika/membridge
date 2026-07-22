@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>MemBridge feedback</title>
+<!--
+  Self-contained feedback form for membridge.me/feedback.
+  Privacy: every field is user entered. Nothing is auto captured, there are no
+  cookies, no analytics, and no third party scripts or fonts on this page (a
+  system font stack keeps it fully self contained, so opening the page makes no
+  request to anyone except the one Supabase insert you submit). The only network
+  call this page ever makes is the POST you trigger by pressing Send.
+-->
+<style>
+  :root{
+    --bg:#FAFAFA; --card:#FFFFFF; --surface2:#F1F5F9;
+    --text:#0F172A; --text2:#64748B; --text3:#94A3B8;
+    --border:#E2E8F0; --border2:#CBD5E1;
+    --accent:#0052FF; --accent2:#4D7CFF;
+    --grad:linear-gradient(135deg,#0052FF,#4D7CFF);
+    --green:#0D9673; --danger:#C81E1E;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0B1120; --card:#111A2E; --surface2:#16213A;
+      --text:#F1F5F9; --text2:#94A3B8; --text3:#5B6B84;
+      --border:#1E293B; --border2:#334155;
+      --accent:#4D7CFF; --accent2:#7A9DFF;
+      --grad:linear-gradient(135deg,#2E63FF,#6E93FF);
+      --green:#22C08F; --danger:#F87171;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font);
+    line-height:1.55;-webkit-font-smoothing:antialiased;padding:32px 18px 80px}
+  .wrap{max-width:560px;margin:0 auto}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:26px}
+  .logo{width:30px;height:30px;border-radius:9px;background:var(--grad);
+    box-shadow:0 4px 14px rgba(0,82,255,.28)}
+  .brand b{font-size:15px;font-weight:700;letter-spacing:-.01em}
+  h1{font-size:23px;font-weight:700;letter-spacing:-.02em;margin:0 0 8px}
+  .sub{color:var(--text2);font-size:14.5px;margin:0 0 26px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:18px;
+    padding:24px 22px;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+  label.field{display:block;font-size:13px;font-weight:600;margin:0 0 8px}
+  .req{color:var(--accent);font-weight:600}
+  .group{margin-bottom:22px}
+  .checks{display:flex;flex-wrap:wrap;gap:9px}
+  .chk{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);
+    background:var(--surface2);border-radius:10px;padding:8px 12px;font-size:13.5px;cursor:pointer;
+    user-select:none;transition:border-color .15s,background .15s}
+  .chk:hover{border-color:var(--border2)}
+  .chk input{accent-color:var(--accent);width:15px;height:15px}
+  textarea,input[type=email]{width:100%;font-family:inherit;font-size:14px;color:var(--text);
+    background:var(--card);border:1px solid var(--border);border-radius:11px;padding:11px 13px;
+    outline:none;transition:border-color .15s,box-shadow .15s}
+  textarea:focus,input[type=email]:focus{border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(0,82,255,.12)}
+  textarea{min-height:120px;resize:vertical}
+  .help{color:var(--text3);font-size:12px;margin:6px 0 0}
+  .quote{display:flex;align-items:flex-start;gap:9px;font-size:13.5px;color:var(--text2);cursor:pointer}
+  .quote input{accent-color:var(--accent);width:16px;height:16px;margin-top:2px;flex:none}
+  button{width:100%;margin-top:6px;font-family:inherit;font-size:15px;font-weight:600;color:#fff;
+    background:var(--grad);border:0;border-radius:12px;padding:13px;cursor:pointer;
+    box-shadow:0 6px 18px rgba(0,82,255,.28);transition:transform .1s,opacity .15s}
+  button:hover{transform:translateY(-1px)}
+  button:disabled{opacity:.6;cursor:default;transform:none}
+  .note{margin-top:16px;font-size:13px;text-align:center;min-height:20px}
+  .note.ok{color:var(--green)}
+  .note.err{color:var(--danger)}
+  .foot{margin-top:22px;text-align:center;color:var(--text3);font-size:12px}
+  .foot a{color:var(--text2)}
+  .hp{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand"><span class="logo"></span><b>MemBridge</b></div>
+  <h1>Tell us what is working</h1>
+  <p class="sub">You are one of the first people running MemBridge. This takes about 90 seconds and directly shapes v0.2.</p>
+
+  <form id="form" class="card" autocomplete="off">
+    <div class="group">
+      <label class="field">What is your setup?</label>
+      <div class="checks">
+        <label class="chk"><input type="checkbox" name="setup" value="Claude Code">Claude Code</label>
+        <label class="chk"><input type="checkbox" name="setup" value="Codex">Codex</label>
+        <label class="chk"><input type="checkbox" name="setup" value="Cursor">Cursor</label>
+        <label class="chk"><input type="checkbox" name="setup" value="other">other</label>
+      </div>
+    </div>
+
+    <div class="group">
+      <label class="field" for="message">What is working, and what is broken? <span class="req">required</span></label>
+      <textarea id="message" name="message" required placeholder="Anything at all. What made you install it, what surprised you, what broke, what you wish it did."></textarea>
+    </div>
+
+    <div class="group">
+      <label class="field" for="email">Email (optional)</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com">
+      <p class="help">Only if you are open to us following up.</p>
+    </div>
+
+    <div class="group">
+      <label class="quote"><input type="checkbox" id="quote_ok" name="quote_ok">
+        <span>You may quote my feedback publicly or in applications.</span></label>
+    </div>
+
+    <!-- Honeypot: real people leave this empty; bots tend to fill it. -->
+    <div class="hp" aria-hidden="true">
+      <label>Do not fill this in <input type="text" name="website" tabindex="-1" autocomplete="off"></label>
+    </div>
+
+    <button id="send" type="submit">Send feedback</button>
+    <div id="note" class="note" role="status" aria-live="polite"></div>
+  </form>
+
+  <p class="foot">Local first, no telemetry. This is the one place we ask, and only because you chose to open it.<br>
+    Trouble sending? Email <a href="mailto:andrewludwigbrown@gmail.com">andrewludwigbrown@gmail.com</a>.</p>
+</div>
+
+<script>
+  // Publishable key (safe to ship in a browser; row level security is what
+  // protects the data). NOT the legacy anon JWT.
+  var SUPA_URL = 'https://mefgbiecvoszjorwzkfz.supabase.co';
+  var SUPA_KEY = 'sb_publishable_UQ4b9MiFBIMcBKv6TDiZIQ_pxlsoRoI';
+
+  function refParam(){
+    try {
+      var v = new URLSearchParams(window.location.search).get('ref');
+      return (v && v.length <= 40) ? v : 'site';
+    } catch (e) { return 'site'; }
+  }
+
+  var form = document.getElementById('form');
+  var btn = document.getElementById('send');
+  var note = document.getElementById('note');
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    note.className = 'note';
+    note.textContent = '';
+
+    // Honeypot: silently succeed for bots without sending anything.
+    if (form.website && form.website.value) {
+      note.className = 'note ok';
+      note.textContent = 'Thanks. Your feedback helps a lot.';
+      form.reset();
+      return;
+    }
+
+    var message = document.getElementById('message').value.trim();
+    if (!message) {
+      note.className = 'note err';
+      note.textContent = 'Please add a short note before sending.';
+      return;
+    }
+
+    var setup = Array.prototype.map.call(
+      form.querySelectorAll('input[name="setup"]:checked'), function (c) { return c.value; });
+    var email = document.getElementById('email').value.trim();
+
+    var payload = {
+      setup: setup,
+      message: message,
+      email: email ? email : null,
+      quote_ok: document.getElementById('quote_ok').checked,
+      ref: refParam(),
+      created_at: new Date().toISOString()
+    };
+
+    btn.disabled = true;
+    var prev = btn.textContent;
+    btn.textContent = 'Sending...';
+
+    fetch(SUPA_URL + '/rest/v1/feedback', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: SUPA_KEY,
+        Authorization: 'Bearer ' + SUPA_KEY,
+        Prefer: 'return=minimal'
+      },
+      body: JSON.stringify(payload)
+    }).then(function (res) {
+      if (res.status === 201) {
+        form.reset();
+        note.className = 'note ok';
+        note.textContent = 'Thanks. Your feedback shapes what we build next.';
+      } else {
+        showError();
+      }
+    }).catch(showError).then(function () {
+      btn.disabled = false;
+      btn.textContent = prev;
+    });
+
+    function showError(){
+      note.className = 'note err';
+      note.innerHTML = 'Something went wrong sending that. Please email ' +
+        '<a href="mailto:andrewludwigbrown@gmail.com">andrewludwigbrown@gmail.com</a> instead.';
+    }
+  });
+</script>
+</body>
+</html>
