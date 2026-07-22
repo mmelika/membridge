@@ -102,6 +102,7 @@ function openDashboard() {
     height: 720,
     title: 'MemBridge',
     autoHideMenuBar: true,
+    icon: nativeImage.createFromPath(path.join(__dirname, 'assets', 'icon.png')),
   });
   win.loadURL(dashboardUrl());
   win.on('closed', () => {
@@ -203,11 +204,29 @@ function updateMenu() {
   tray.setContextMenu(menu);
 }
 
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
+// Headless launch-at-login toggle: `MemBridge --set-login=on|off` flips the
+// login item and exits, without opening the tray/UI. Lets an installer (or a
+// script) manage autostart, and stays in sync with the tray "Start at login"
+// checkbox since both use Electron's login-item settings. Handled before the
+// single-instance lock so it works even while the app is already running.
+const loginArg = process.argv.find(a => a.startsWith('--set-login='));
+if (loginArg) {
+  app.whenReady().then(() => {
+    app.setLoginItemSettings({ openAtLogin: loginArg.split('=')[1] !== 'off' });
+    app.exit(0);
+  });
+} else if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
+  // Re-launching the app while it's already running (double-clicking the icon
+  // again) opens the dashboard instead of doing nothing — the single-instance
+  // lock otherwise just quietly quits the second copy.
+  app.on('second-instance', openDashboard);
   app.whenReady().then(async () => {
+    // Windows groups taskbar buttons and picks the window/jump-list icon by
+    // AppUserModelID; without this it can fall back to the generic Electron
+    // icon. Must match build.appId and be set before any window is created.
+    if (process.platform === 'win32') app.setAppUserModelId('com.membridge.app');
     util.ensureConfig();
     takeOverDaemon();
     const config = util.getConfig();
@@ -217,6 +236,12 @@ if (!gotLock) {
     const icon = nativeImage.createFromPath(path.join(__dirname, 'assets', iconName));
     tray = new Tray(icon);
     tray.setToolTip('MemBridge — shared memory across your AI coding tools');
+    // Left-click (or a double-click) the tray icon opens the dashboard — the
+    // primary way to open the app on Windows/Linux, where the context menu is
+    // right-click only. On macOS a click opens the menu by convention, so the
+    // menu already carries "Open dashboard" there.
+    tray.on('click', openDashboard);
+    tray.on('double-click', openDashboard);
     updateMenu();
 
     // First-run consent for session summaries
