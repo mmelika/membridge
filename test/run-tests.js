@@ -1233,9 +1233,12 @@ async function main() {
       const projectId = overrides.projectId; // no default: exercises the project fallback in the key
       const projectPath = overrides.projectPath;
       const repEntry = Object.prototype.hasOwnProperty.call(overrides, 'repEntry') ? overrides.repEntry : null;
+      // A harvested (non-distilled) summary entry, mirroring a thread's
+      // t.repHarvested. One run carries both reps, exactly as finalizeUnit does.
+      const harvestedEntry = Object.prototype.hasOwnProperty.call(overrides, 'harvestedEntry') ? overrides.harvestedEntry : null;
       const ask = overrides.ask !== undefined ? overrides.ask : 'Do the thing';
       const entry = { ts, ask, author, authorId };
-      const run = { ts, key: 'run' + id, entries: [entry], rep: repEntry };
+      const run = { ts, key: 'run' + id, entries: [entry], rep: repEntry, repHarvested: harvestedEntry };
       return {
         key: 'unit' + id,
         ts,
@@ -1246,6 +1249,7 @@ async function main() {
         agentCount: overrides.agentCount !== undefined ? overrides.agentCount : 1,
         promptCount: overrides.promptCount !== undefined ? overrides.promptCount : 1,
         rep: repEntry ? run : null,
+        repHarvested: harvestedEntry ? run : null,
         live: overrides.live !== undefined ? overrides.live : false,
         runs: overrides.runs !== undefined ? overrides.runs : [run],
       };
@@ -1307,6 +1311,44 @@ async function main() {
       assert.ok(/Working/.test(evalDayCards([liveNoRep])[0].headline));
       assert.ok(/no summaries shared/.test(evalDayCards([staleNoRep, staleNoRep2])[0].headline));
     });
+    // Option B — teammate harvested fallback. A teammate's summary can never be
+    // distilled locally (the distilled bit isn't propagated over team sync, and
+    // even with Option A only re-pushed rows carry it), so a day card whose only
+    // teammate summary is harvested must SHOW it, not fall through to "no
+    // summaries shared". Scoped to non-self: your OWN harvested-only days keep
+    // the strict distilled-only headline, so mid-session noise never surfaces.
+    check('dayCards: teammate harvested-only summary shows on the card, not "no summaries shared"', () => {
+      const teammate = unitWith({ self: false, ts: dayCardsLocalTs(0, 11), repEntry: null,
+        harvestedEntry: { summary: 'Refactored the checkout validation path' } });
+      const c = evalDayCards([teammate])[0];
+      assert.ok(c.headline.includes('Refactored the checkout validation path'),
+        `teammate harvested summary missing from headline: ${c.headline}`);
+      assert.ok(!/no summaries shared/.test(c.headline), 'still fell through to the empty fallback');
+    });
+    check('dayCards: your OWN harvested-only summary still reads "no summaries shared"', () => {
+      const mine = unitWith({ self: true, ts: dayCardsLocalTs(0, 11), repEntry: null,
+        harvestedEntry: { summary: 'mid-session reasoning line, not a real brief' } });
+      const c = evalDayCards([mine])[0];
+      assert.ok(/no summaries shared/.test(c.headline),
+        `self harvested summary must not surface on the day card: ${c.headline}`);
+    });
+    check('dayCards: distilled still beats harvested for a teammate, regardless of promptCount', () => {
+      const harvestedBig = unitWith({ self: false, promptCount: 9, ts: dayCardsLocalTs(0, 15),
+        repEntry: null, harvestedEntry: { summary: 'Noisy harvested tail line' } });
+      const distilledSmall = unitWith({ self: false, promptCount: 2, ts: dayCardsLocalTs(0, 14),
+        repEntry: { headline: 'Shipped the real thing' } });
+      const c = evalDayCards([harvestedBig, distilledSmall])[0];
+      assert.ok(c.headline.includes('Shipped the real thing'), `distilled should win: ${c.headline}`);
+      assert.ok(!c.headline.includes('Noisy harvested tail line'), 'harvested leaked past a distilled rep');
+    });
+    check('dayCards v2: teammate harvested unit gets ✓ and its summary text in the checklist', () => {
+      const teammate = unitWith({ self: false, ts: dayCardsLocalTs(0, 11), repEntry: null,
+        harvestedEntry: { summary: 'Harvested outcome for the checklist row' } });
+      const c = evalDayCards([teammate])[0];
+      assert.strictEqual(c.checklist[0].glyph, '✓', 'a shared teammate summary should get the check glyph');
+      assert.ok(c.checklist[0].text.includes('Harvested outcome for the checklist row'),
+        `checklist row text missing the harvested summary: ${c.checklist[0].text}`);
+    });
     check('dayCards: pure and total — empty input, bad ts never throw', () => {
       assert.deepStrictEqual(evalDayCards([]), []);
       assert.ok(evalDayCards([unitWith({ ts: 'not-a-date' })]).length === 1);
@@ -1333,13 +1375,28 @@ async function main() {
       return {
         ts: overrides.ts, ask: overrides.ask !== undefined ? overrides.ask : '',
         author: overrides.author !== undefined ? overrides.author : 'You',
-        authorId: overrides.authorId, self: true,
+        authorId: overrides.authorId, self: overrides.self !== undefined ? overrides.self : true,
         source: overrides.source,
         project: overrides.project !== undefined ? overrides.project : 'ProjA',
         projectId: overrides.projectId, projectPath: overrides.projectPath,
         session: overrides.session,
+        summary: overrides.summary, distilled: overrides.distilled,
       };
     }
+    check('units: finalizeUnit carries a thread\'s harvested rep up to unit.repHarvested', () => {
+      // The real render path (buildThreads -> buildUnits/finalizeUnit ->
+      // buildDayCards) must expose a harvested summary at the unit level, or the
+      // teammate fallback in buildDayCards has nothing to read.
+      const units = evalBuildUnits([
+        rawEntry({ ts: dayCardsLocalTs(0, 14), self: false, author: 'Andrew', source: 'Codex',
+          session: 'ax-1', summary: 'Harvested outcome from Andrew', distilled: false }),
+      ]);
+      assert.strictEqual(units.length, 1);
+      assert.ok(!units[0].rep, 'a non-distilled entry must not become the distilled rep');
+      assert.ok(units[0].repHarvested && units[0].repHarvested.repHarvested,
+        'finalizeUnit did not propagate the harvested rep to the unit');
+      assert.strictEqual(units[0].repHarvested.repHarvested.summary, 'Harvested outcome from Andrew');
+    });
     check('units: different tools in one author+project burst never merge (Claude != Codex)', () => {
       const t = dayCardsLocalTs(0, 14);
       const units = evalBuildUnits([
@@ -2701,6 +2758,19 @@ async function main() {
       id: mock.entries.length + 1, created_at: new Date().toISOString(),
     });
 
+    // Option A — a distilled row on the backend must arrive at the puller with
+    // distilled:true preserved (pull selects + stores the column). Distinct
+    // (ts, source) so it is its own pulled entry, not deduped against another;
+    // an old ts keeps it from perturbing later newest-first feed-order asserts
+    // (the pull check below finds it by summary text, not position).
+    mock.entries.push({
+      project_id: linkA.projectId, author_id: credsA.userId, author_name: 'Marco',
+      ts: '2026-07-11T09:00:00.000Z', source: 'Claude Code',
+      ask: null, files: [], summary: 'Distilled outcome that must stay flagged distilled',
+      distilled: true,
+      id: mock.entries.length + 1, created_at: new Date().toISOString(),
+    });
+
 
     // Andrew: second machine (own MemBridge home), same repo basename, joins
     // by invite code — link_project maps his clone to the same project row.
@@ -2748,12 +2818,24 @@ async function main() {
         'summary missing from the pushed rows');
       const st = util.loadState();
       const key = Object.keys(st.projects).find(k => sameKey(k, projB));
-      const pulled = (st.projects[key].teamEntries || []).find(e => e.summary);
-      assert.ok(pulled, 'no pulled entry carries a summary');
+      // Specific to the smoke-test row: other summary-bearing teammate entries
+      // now share the feed (e.g. the distilled round-trip fixture), so a bare
+      // find-first would pick whichever sorts earliest, not this one.
+      const pulled = (st.projects[key].teamEntries || []).find(e => e.summary && e.summary.includes('smoke test'));
+      assert.ok(pulled, 'no pulled entry carries the smoke-test summary');
       assert.ok(pulled.summary.includes('smoke test'), `summary was: ${pulled.summary}`);
       const md = read(path.join(projB, 'CLAUDE.md'));
       assert.ok(md.includes('Did: '), 'Did line missing from the team section');
       assert.ok(md.includes('smoke test'), 'summary text missing from the team section');
+    });
+
+    check('team: pull preserves the distilled flag on a distilled row (Option A round-trip)', () => {
+      const st = util.loadState();
+      const key = Object.keys(st.projects).find(k => sameKey(k, projB));
+      const pulled = (st.projects[key].teamEntries || [])
+        .find(e => e.summary && e.summary.includes('must stay flagged distilled'));
+      assert.ok(pulled, 'the distilled row was not pulled into teamEntries');
+      assert.strictEqual(pulled.distilled, true, 'distilled flag was dropped over pull');
     });
 
     check('team: injection collapses each teammate session to its newest entry; state keeps all', () => {
@@ -6401,6 +6483,30 @@ async function main() {
     const theirs = feed.normalizeTeam(row, { selfUserId: 'someone-else' });
     assert.strictEqual(theirs.self, false);
     assert.strictEqual(theirs.author, 'Marco');
+  });
+  // Option A — propagate the distilled flag over team sync. A team_feed row that
+  // carries distilled:true must normalize to distilled:true (so a teammate's
+  // distilled summary is treated as distilled, not lumped in with harvested);
+  // a row without the column (pre-migration backend) stays false.
+  check('feed.normalizeTeam carries the distilled flag from the row', () => {
+    const base = { id: 7, project_id: 'p', project_name: 'p', author_id: 'a', author_name: 'A',
+      ts: '2026-07-22T05:00:00Z', source: 'Claude Code', ask: 'q', summary: 'Real distilled brief',
+      files: [], created_at: '2026-07-22T05:00:00Z' };
+    assert.strictEqual(feed.normalizeTeam({ ...base, distilled: true }, { selfUserId: 'me' }).distilled, true);
+    assert.strictEqual(feed.normalizeTeam({ ...base, distilled: false }, { selfUserId: 'me' }).distilled, false);
+    assert.strictEqual(feed.normalizeTeam(base, { selfUserId: 'me' }).distilled, false,
+      'a pre-migration row without the column must default to not-distilled');
+  });
+  // Option A — push side: entryToRow must copy the local entry's distilled bit
+  // onto the uploaded row so the backend can persist it.
+  check('teamsync.entryToRow carries the distilled flag onto the pushed row', () => {
+    const creds = { userId: 'u1', displayName: 'Marco' };
+    const distilled = teamsync.entryToRow({ ts: 't', source: 'Claude Code', summary: 's', distilled: true, files: [] },
+      'proj-1', creds, true, []);
+    const harvested = teamsync.entryToRow({ ts: 't', source: 'Claude Code', summary: 's', files: [] },
+      'proj-1', creds, true, []);
+    assert.strictEqual(distilled.distilled, true, 'distilled bit not sent on the pushed row');
+    assert.strictEqual(harvested.distilled, false, 'a harvested entry must push distilled:false');
   });
   check('feed.normalizeTeam tolerates a summary-less row (pre-migration backend)', () => {
     const n = feed.normalizeTeam({ id: 1, project_id: 'p', project_name: 'p', author_id: 'a',
