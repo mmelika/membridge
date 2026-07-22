@@ -160,17 +160,17 @@
       return;
     }
 
-    var setup = Array.prototype.map.call(
-      form.querySelectorAll('input[name="setup"]:checked'), function (c) { return c.value; });
+    var tools = Array.prototype.map.call(
+      form.querySelectorAll('input[name="setup"]:checked'), function (c) { return c.value; }).join(', ');
     var email = document.getElementById('email').value.trim();
 
+    // Live Supabase `feedback` table columns: tools (text), feedback (text), email, quote_ok, ref.
     var payload = {
-      setup: setup,
-      message: message,
+      tools: tools ? tools : null,
+      feedback: message,
       email: email ? email : null,
       quote_ok: document.getElementById('quote_ok').checked,
-      ref: refParam(),
-      created_at: new Date().toISOString()
+      ref: refParam()
     };
 
     btn.disabled = true;
