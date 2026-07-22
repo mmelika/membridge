@@ -44,7 +44,15 @@ function Entry({ e }) {
           </span>
           <span>{time(e.ts)}</span>
         </div>
-        <p className="mt-1 text-sm leading-relaxed">{e.ask}</p>
+        {/* E2E: browsers never hold the private key, so a ciphertext row with
+            no readable columns (post-cutover) renders as metadata only. */}
+        {e.ciphertext && !e.ask && !e.summary ? (
+          <p className="mt-1 text-sm italic text-slate-400">
+            Encrypted — view in the MemBridge desktop app
+          </p>
+        ) : (
+          <p className="mt-1 text-sm leading-relaxed">{e.ask}</p>
+        )}
         {files.length > 0 && (
           <button
             onClick={() => setOpen(!open)}

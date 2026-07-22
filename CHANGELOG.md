@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **End-to-end encryption is on by default, fail-closed.** Team sync content
+  (asks, summaries, decisions, gotchas, file paths, change notes) is
+  secretbox-encrypted with a per-team key sealed to each member's public key
+  (libsodium; private keys never leave the macOS Keychain, now fed to
+  `security` via stdin so secrets never touch argv). When encryption cannot
+  run — no key, tampered row, unmigrated backend — sync **holds entries and
+  pauses** instead of degrading to plaintext, and undecryptable rows render
+  opaque rather than trusting server-side text. The explicit
+  `team.encrypt: false` hatch restores legacy plaintext sync.
+- **Key authenticity + rotation.** Teammate public keys are pinned on first
+  use (TOFU); a changed key raises a loud alert, is excluded from key
+  sealing, and is only accepted via `membridge team trust` after comparing
+  `membridge team fingerprint` safety numbers out-of-band. Removing a member
+  rotates the team key to a new epoch sealed only to remaining members;
+  joiners are sealed into the current epoch automatically.
+- **The feed decrypts locally.** `team_feed` now returns ciphertext
+  (migration 013) and the desktop dashboard decrypts with the local
+  identity; the web feed shows an "Encrypted — view in the desktop app"
+  placeholder instead of ever holding keys in a browser. The
+  `team.plaintextOff` flag stops dual-writing plaintext entirely — see
+  `docs/E2E-CUTOVER.md` for the coordinated flip (migrations 009 + 013
+  must be applied to the live backend first).
+
 - **Session summaries are now cumulative and outcome-phrased.** Every
   checkpoint rewrites the whole-session summary (newest line wins on every
   surface) as *what changed in the project*, not AI activity — so a long
