@@ -4550,6 +4550,32 @@ async function main() {
         assert.ok(!((proj.sharedSessions || []).includes('sGhost')), 'flag must not persist when nothing was shared');
       });
 
+      await check('teamsync: an unlinked project short-circuits reshare before any credential/network work', async () => {
+        // A solo (team-unlinked) project must keep its local-flag toggle even
+        // when the stored token is stale and the auth backend is unreachable —
+        // the unlinked path needs no creds at all, so it must be checked first.
+        const savedCreds = fs.readFileSync(teamsync.credentialsPath(), 'utf8');
+        const savedUrl = process.env.MEMBRIDGE_TEAM_URL;
+        const projSolo = path.join(ROOT, 'projects', 'solo-unlinked-app');
+        fs.mkdirSync(projSolo, { recursive: true });
+        const stSolo = util.loadState();
+        stSolo.projects[projSolo] = { events: [
+          { ts: new Date(Date.now() - 5000).toISOString(), source: 'Claude Code', kind: 'prompt', session: 'sSolo', text: 'solo work' },
+        ] };
+        util.saveState(stSolo);
+        try {
+          const parsed = JSON.parse(savedCreds);
+          fs.writeFileSync(teamsync.credentialsPath(), JSON.stringify({ ...parsed, accessToken: 'stale', expiresAt: Date.now() - 60000 }));
+          process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:1'; // unreachable: any refresh attempt fails loudly
+          const res = await teamsync.reshareSession(util.getConfig(), projSolo, 'sSolo', true);
+          assert.strictEqual(res.ok, true, 'unlinked reshare must succeed without touching the network: ' + JSON.stringify(res));
+          assert.strictEqual(res.unlinked, true, 'unlinked marker missing');
+        } finally {
+          fs.writeFileSync(teamsync.credentialsPath(), savedCreds);
+          process.env.MEMBRIDGE_TEAM_URL = savedUrl;
+        }
+      });
+
       const pageLV = await (await fetch('http://127.0.0.1:' + SRV_PORT_LV + '/')).text();
       const scriptLV = (pageLV.match(/<script>\n([\s\S]*)\n<\/script>/) || [])[1] || '';
       await check('dashboard: share-toggle failure is inline (couldn’t share — retry), never the offline pill', () => {
