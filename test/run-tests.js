@@ -5090,6 +5090,50 @@ async function main() {
     assert.ok(!Buffer.from(enc.ciphertext, 'base64').toString('latin1').includes('src/login.js'), 'file path leaked into ciphertext');
     assert.notStrictEqual(teamcrypto.encrypt(payload, teamKey).ciphertext, enc.ciphertext, 'nonce reused');
   });
+  // Fingerprints (E2E completion Task 1): a short human-comparable digest of a
+  // box pubkey for Signal-style out-of-band verification. The format is a
+  // contract — it is what two humans read aloud to each other — so it is
+  // asserted exactly: eight 4-hex groups.
+  check('teamcrypto: fingerprint is stable, formatted, and key-specific', () => {
+    const kp = teamcrypto.genKeypair();
+    const fp = teamcrypto.fingerprint(kp.publicKey);
+    assert.strictEqual(fp, teamcrypto.fingerprint(kp.publicKey), 'same key -> same fingerprint');
+    assert.match(fp, /^[0-9a-f]{4}( [0-9a-f]{4}){7}$/, 'eight 4-hex groups');
+    assert.notStrictEqual(fp, teamcrypto.fingerprint(teamcrypto.genKeypair().publicKey), 'different key -> different fingerprint');
+  });
+  // TOFU pin store (E2E completion Task 1): first sight pins, change alerts,
+  // and the pinned key is never silently replaced — `membridge team trust` is
+  // the only way to re-pin. check() is pure; load/save go through the
+  // MEMBRIDGE_HOME-isolated pins.json.
+  const teampins = require('../lib/teampins');
+  check('teampins: TOFU pins unseen keys, alerts on change, load/save round trip', () => {
+    const kA = teamcrypto.genKeypair(), kB = teamcrypto.genKeypair(), kEvil = teamcrypto.genKeypair();
+    const fetched = [
+      { user_id: 'u-a', public_key: kA.publicKey, display_name: 'Alice' },
+      { user_id: 'u-b', public_key: kB.publicKey, display_name: 'Bob' },
+    ];
+    const first = teampins.check({}, fetched, '2026-07-21T00:00:00Z');
+    assert.strictEqual(first.allowed.length, 2, 'all first-sight keys allowed (TOFU)');
+    assert.strictEqual(first.alerts.length, 0, 'no alerts on first sight');
+    assert.strictEqual(first.pins['u-a'].publicKey, kA.publicKey, 'pinned A');
+    assert.strictEqual(first.pins['u-b'].name, 'Bob', 'pin carries the display name');
+    // The server swaps Bob's key: Bob is excluded and alerted, Alice unaffected,
+    // and Bob's PIN keeps the original key.
+    const swapped = [fetched[0], { user_id: 'u-b', public_key: kEvil.publicKey, display_name: 'Bob' }];
+    const second = teampins.check(first.pins, swapped, '2026-07-22T00:00:00Z');
+    assert.deepStrictEqual(second.allowed.map(m => m.user_id), ['u-a'], 'changed key excluded from allowed');
+    assert.strictEqual(second.alerts.length, 1, 'exactly one alert');
+    assert.strictEqual(second.alerts[0].user_id, 'u-b', 'alert names the member');
+    assert.strictEqual(second.alerts[0].pinned, kB.publicKey, 'alert carries the pinned key');
+    assert.strictEqual(second.alerts[0].fetched, kEvil.publicKey, 'alert carries the fetched key');
+    assert.strictEqual(second.pins['u-b'].publicKey, kB.publicKey, 'pin NOT overwritten by a changed key');
+    assert.strictEqual(first.pins['u-b'].publicKey, kB.publicKey, 'input pins object never mutated');
+    teampins.save(second.pins);
+    assert.deepStrictEqual(teampins.load(), second.pins, 'save/load round trip');
+    fs.writeFileSync(teampins.pinsPath(), '{nope');
+    assert.deepStrictEqual(teampins.load(), {}, 'corrupt pins file -> empty, never a crash');
+    teampins.save(second.pins); // leave a valid file behind for later sections
+  });
   // Private-key storage. The real keychain only exists on macOS, so off-darwin
   // this asserts the fail-closed contract instead of skipping blind.
   const keychain = require('../lib/keychain');
