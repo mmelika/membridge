@@ -5832,7 +5832,7 @@ async function main() {
       const projT = path.join(ROOT, 'projects', 'tamper-app');
       fs.mkdirSync(projT, { recursive: true });
       const kcDana = mkMemKeychain(), kcEve = mkMemKeychain();
-      let tErr = null, eveEntriesClosed = null, eveEntriesHatch = null, resEveClosed = null;
+      let tErr = null, eveEntriesClosed = null, eveEntriesHatch = null, resEveClosed = null, feedEve = null;
       try {
         await new Promise(r => mockT.server.listen(17955, '127.0.0.1', r));
         process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17955';
@@ -5883,6 +5883,23 @@ async function main() {
         util.saveState(stE2);
         await teamsync.syncTeams({ project: projT });
         eveEntriesHatch = ((util.loadState().projects[projT] || {}).teamEntries || []).map(e => ({ ...e }));
+
+        // Feed rewrite (E2E completion Task 6): the dashboard feed decrypts
+        // locally through the same fail-closed path. Dana pushes a fresh
+        // (uncorrupted) session, then Eve's feedPayload must decrypt it while
+        // rendering the corrupted t1 rows opaque — POISONED never surfaces.
+        process.env.MEMBRIDGE_HOME = homeD;
+        const stD2 = util.loadState();
+        stD2.projects[projT].events.push(
+          { ts: '2026-07-18T15:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'fresh content after corruption', session: 't2' });
+        util.saveState(stD2);
+        await teamsync.syncTeams({ project: projT, cryptoDeps: { keychain: kcDana, teamcrypto: tcE2E } });
+
+        process.env.MEMBRIDGE_HOME = homeE;
+        const rawE2 = util.loadUserConfig();
+        rawE2.team = { ...(rawE2.team || {}), encrypt: true };
+        util.saveUserConfig(rawE2);
+        feedEve = await feedPayload({ limit: 50, cryptoDeps: { keychain: kcEve, teamcrypto: tcE2E } });
       } catch (e) { tErr = e; } finally {
         process.env.MEMBRIDGE_HOME = savedHome;
         process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
@@ -5905,6 +5922,17 @@ async function main() {
         assert.ok(!tErr, `tamper scenario threw: ${tErr && tErr.message}`);
         assert.ok(eveEntriesHatch.some(e => e.summary === 'POISONED summary'),
           'hatch pull must read the plaintext columns exactly as a legacy client would');
+      });
+
+      check('feed: feedPayload decrypts team rows locally — good rows readable, corrupted rows opaque, poisoned plaintext never surfaces', () => {
+        assert.ok(!tErr, `tamper scenario threw: ${tErr && tErr.message}`);
+        assert.ok(feedEve && Array.isArray(feedEve.entries), 'feedPayload must return entries');
+        assert.ok(!JSON.stringify(feedEve.entries).includes('POISONED'),
+          'poisoned plaintext surfaced in the feed');
+        assert.ok(feedEve.entries.some(e => e.ask === 'fresh content after corruption'),
+          `fresh encrypted row must decrypt in the feed, got: ${JSON.stringify(feedEve.entries.map(e => ({ ask: e.ask, undecryptable: e.undecryptable })))}`);
+        assert.ok(feedEve.entries.some(e => e.undecryptable === true),
+          'corrupted rows must carry the undecryptable marker through normalizeTeam');
       });
     }
 
