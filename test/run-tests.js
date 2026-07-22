@@ -1582,7 +1582,7 @@ async function main() {
       const escSrc = extractVarFn(embeddedScript, 'esc') || '';
       const agoSrc = extractVarFn(embeddedScript, 'ago') || '';
       const constSrc = extractConst(embeddedScript, 'MONO');
-      const fnSrc = ['personColor', 'capLine', 'firstSentence', 'askHeadline', 'runHeadline', 'promptCellText', 'shareToggleHtml', 'dayDetailHtml']
+      const fnSrc = ['personColor', 'capLine', 'firstSentence', 'askHeadline', 'runHeadline', 'wordSafeTail', 'promptCellText', 'shareToggleHtml', 'dayDetailHtml']
         .map(n => extractFn(embeddedScript, n)).join('\n');
       const sandbox = new Function('expandedKeys',
         escSrc + '\n' + agoSrc + '\n' + constSrc + '\nvar catchupExpanded = expandedKeys || {};\n' + fnSrc +
@@ -1627,6 +1627,24 @@ async function main() {
       const h = evalDayDetailHtml(null);
       assert.ok(/data-day-back/.test(h), 'not-found still offers the way back');
       assert.ok(/isn|scrolled|no longer/i.test(h), 'not-found copy missing');
+    });
+    // BUG 2 (fix/share-live-and-clamp): day-detail text must never end
+    // mid-word. Local rows render the full ask (askFull); rows that only
+    // exist clipped (team rows, pre-fix data) get their tail tidied to the
+    // last whole word before the ellipsis.
+    check('dayDetailHtml: prompt/summary text never cut mid-word — full local text, word-safe fallback', () => {
+      const fullAsk = 'refactor the authentication checkpoints module end to end';
+      const dFull = unitWith({ ts: dayCardsLocalTs(0, 10), ask: 'refactor the authentication chec…' });
+      dFull.runs[0].entries[0].askFull = fullAsk;
+      const dClipped = unitWith({ ts: dayCardsLocalTs(0, 9), ask: 'triage the flaky supabase chec…' });
+      const dClipSum = unitWith({ ts: dayCardsLocalTs(0, 8), repEntry: { headline: 'Clip headline', summary: 'Landed the share fix across chec…' } });
+      const h = evalDayDetailHtml(evalDayCards([dFull, dClipped, dClipSum])[0]);
+      assert.ok(h.includes(fullAsk), 'local prompt row must render the complete ask (askFull)');
+      assert.ok(!h.includes('authentication chec…'), 'the clipped local ask must not render once the full text exists');
+      assert.ok(!h.includes('supabase chec…'), 'a clipped-only ask must not end mid-word anywhere (title or row)');
+      assert.ok(h.includes('supabase…'), 'the clipped-only ask ends at a word boundary instead');
+      assert.ok(!h.includes('across chec…'), 'a clipped-only summary must not end mid-word');
+      assert.ok(h.includes('across…'), 'the clipped-only summary ends at a word boundary instead');
     });
     // Regression: the day-cards v2 redesign dropped the per-session share toggle
     // from the Activity view (it survived only on the project page). It belongs on
@@ -4698,6 +4716,128 @@ async function main() {
     }
   }
 
+  // BUG 1 (fix/share-live-and-clamp): sharing a LIVE / never-pushed session.
+  // reshareSession must refresh stale credentials like every other
+  // authenticated call (it used raw loadCredentials, so an expired JWT made
+  // every reshare 401 while the 60s sync kept quietly refreshing creds for
+  // everything else), must INSERT rows for a session the backend has never
+  // seen, and /api/share-session must refuse honestly when a session has no
+  // local rows (it used to persist the flag as a silent no-op) — and the
+  // dashboard must surface a share failure inline, never via the offline pill.
+  {
+    const mockLV = createMockSupabase();
+    const MOCK_PORT_LV = 17961, SRV_PORT_LV = 17962;
+    await new Promise(r => mockLV.server.listen(MOCK_PORT_LV, '127.0.0.1', r));
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:' + MOCK_PORT_LV;
+    process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+    let srvLV;
+    try {
+      const projLV = path.join(ROOT, 'projects', 'share-live-app');
+      fs.mkdirSync(projLV, { recursive: true });
+      await teamsync.signup(util.getConfig(), 'sharelive@test.dev', 'pw-lv', 'Liver');
+      const teamLV = await teamsync.createTeam(util.getConfig(), 'ShareLiveTeam');
+      await teamsync.linkProject(util.getConfig(), projLV, teamLV.team_id, 'ShareLiveTeam');
+      { const rc = util.loadUserConfig(); if (rc.team) delete rc.team.sharePrompts; util.saveUserConfig(rc); }
+      // A LIVE session: one prompt seconds ago, no summary — and deliberately
+      // NO syncTeams, so the backend has zero rows for it.
+      const stLV = util.loadState();
+      stLV.projects[projLV] = { events: [
+        { ts: new Date(Date.now() - 5000).toISOString(), source: 'Claude Code', kind: 'prompt', session: 'sLive', text: 'working right now' },
+      ] };
+      util.saveState(stLV);
+
+      await check('teamsync: reshareSession inserts + shares a session the backend has never seen', async () => {
+        const creds = await teamsync.getAccessToken(util.getConfig());
+        assert.strictEqual(mockLV.entries.filter(e => e.session === 'sLive').length, 0, 'precondition: no backend row');
+        const res = await teamsync.reshareSession(util.getConfig(), projLV, 'sLive', true, { creds, crypto: null });
+        assert.strictEqual(res.ok, true, 'reshare must succeed for a never-pushed session: ' + JSON.stringify(res));
+        const row = mockLV.entries.filter(e => e.session === 'sLive')[0];
+        assert.ok(row, 'the share must insert the missing backend row');
+        assert.ok(row.ask && /working right now/.test(row.ask), 'inserted row must carry the shared prompt');
+      });
+
+      await check('teamsync: reshareSession refreshes a stale token instead of failing with it', async () => {
+        // Expire the stored access token but keep the refresh token valid. The
+        // old code sent the dead token verbatim (raw loadCredentials, never a
+        // refresh), so the whole reshare 401ed — the live-session share bug.
+        const saved = JSON.parse(fs.readFileSync(teamsync.credentialsPath(), 'utf8'));
+        fs.writeFileSync(teamsync.credentialsPath(), JSON.stringify({
+          ...saved, accessToken: 'expired-dead-token', expiresAt: Date.now() - 60000,
+        }));
+        const res = await teamsync.reshareSession(util.getConfig(), projLV, 'sLive', false);
+        assert.strictEqual(res.ok, true, 'reshare with a stale stored token must refresh and succeed: ' + JSON.stringify(res));
+        const row = mockLV.entries.filter(e => e.session === 'sLive')[0];
+        assert.strictEqual(row.ask, null, 'the refreshed reshare must still apply (scrub)');
+      });
+
+      srvLV = startServer(SRV_PORT_LV, { retries: 0 });
+      await waitForHttp('http://127.0.0.1:' + SRV_PORT_LV + '/api/status');
+      const onLive = await httpPost(SRV_PORT_LV, '/api/share-session', { project: projLV, session: 'sLive', share: true });
+      await check('server: /api/share-session ok:true for a previously-unpushed session', () => {
+        assert.strictEqual(onLive.ok, true, JSON.stringify(onLive));
+        const row = mockLV.entries.filter(e => e.session === 'sLive')[0];
+        assert.ok(row && row.ask && /working right now/.test(row.ask), 'live row must be inserted + shared via the endpoint');
+        const state = util.loadState();
+        const proj = state.projects[projLV] || state.projects[path.resolve(projLV)];
+        assert.ok((proj.sharedSessions || []).includes('sLive'), 'flag persists once the backend accepted');
+      });
+
+      const onGhost = await httpPost(SRV_PORT_LV, '/api/share-session', { project: projLV, session: 'sGhost', share: true });
+      await check('server: /api/share-session refuses a rowless session instead of silently persisting the flag', () => {
+        assert.strictEqual(onGhost.ok, false, 'a session with no local rows must not report success: ' + JSON.stringify(onGhost));
+        const state = util.loadState();
+        const proj = state.projects[projLV] || state.projects[path.resolve(projLV)];
+        assert.ok(!((proj.sharedSessions || []).includes('sGhost')), 'flag must not persist when nothing was shared');
+      });
+
+      await check('teamsync: an unlinked project short-circuits reshare before any credential/network work', async () => {
+        // A solo (team-unlinked) project must keep its local-flag toggle even
+        // when the stored token is stale and the auth backend is unreachable —
+        // the unlinked path needs no creds at all, so it must be checked first.
+        const savedCreds = fs.readFileSync(teamsync.credentialsPath(), 'utf8');
+        const savedUrl = process.env.MEMBRIDGE_TEAM_URL;
+        const projSolo = path.join(ROOT, 'projects', 'solo-unlinked-app');
+        fs.mkdirSync(projSolo, { recursive: true });
+        const stSolo = util.loadState();
+        stSolo.projects[projSolo] = { events: [
+          { ts: new Date(Date.now() - 5000).toISOString(), source: 'Claude Code', kind: 'prompt', session: 'sSolo', text: 'solo work' },
+        ] };
+        util.saveState(stSolo);
+        try {
+          const parsed = JSON.parse(savedCreds);
+          fs.writeFileSync(teamsync.credentialsPath(), JSON.stringify({ ...parsed, accessToken: 'stale', expiresAt: Date.now() - 60000 }));
+          process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:1'; // unreachable: any refresh attempt fails loudly
+          const res = await teamsync.reshareSession(util.getConfig(), projSolo, 'sSolo', true);
+          assert.strictEqual(res.ok, true, 'unlinked reshare must succeed without touching the network: ' + JSON.stringify(res));
+          assert.strictEqual(res.unlinked, true, 'unlinked marker missing');
+        } finally {
+          fs.writeFileSync(teamsync.credentialsPath(), savedCreds);
+          process.env.MEMBRIDGE_TEAM_URL = savedUrl;
+        }
+      });
+
+      const pageLV = await (await fetch('http://127.0.0.1:' + SRV_PORT_LV + '/')).text();
+      const scriptLV = (pageLV.match(/<script>\n([\s\S]*)\n<\/script>/) || [])[1] || '';
+      await check('dashboard: share-toggle failure is inline (couldn’t share — retry), never the offline pill', () => {
+        const marks = [];
+        let at = -1;
+        while ((at = scriptLV.indexOf("closest('[data-share-toggle]')", at + 1)) !== -1) marks.push(at);
+        assert.strictEqual(marks.length, 3, 'expected the three share handlers (feed, day, project), got ' + marks.length);
+        for (const m of marks) {
+          const block = scriptLV.slice(m, scriptLV.indexOf('.catch', m) + 220);
+          assert.ok(/shareFailUI\(/.test(block), 'handler at ' + m + ' does not route failure to the inline affordance');
+          assert.ok(!/setPill\(false\)/.test(block), 'handler at ' + m + ' still flips the global pill on a share failure');
+        }
+        assert.ok(/couldn&rsquo;t share/.test(scriptLV), 'inline failure copy missing');
+      });
+    } finally {
+      if (srvLV) await new Promise(r => srvLV.close(r));
+      mockLV.server.close();
+      delete process.env.MEMBRIDGE_TEAM_URL;
+      delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    }
+  }
+
   // Task 8: ship decisions/gotchas to teammates end to end, and pull must
   // survive a backend still missing goal/changes (or any optional column).
   const mockS = createMockSupabase();
@@ -6453,6 +6593,15 @@ async function main() {
     assert.deepStrictEqual(n.files, ['a.js', 'b.js']);
     assert.strictEqual(n.cursor, null);
   });
+  check('feed.normalizeLocal carries askFull through (unclipped twin, local rows only)', () => {
+    const e = { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'fix the authentication chec…',
+      askFull: 'fix the authentication checkpoints module', files: [] };
+    const n = feed.normalizeLocal(e, { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(n.askFull, 'fix the authentication checkpoints module');
+    const bare = feed.normalizeLocal({ ts: e.ts, source: e.source, ask: 'short', files: [] },
+      { projectPath: '/p', projectName: 'p', projectId: null });
+    assert.strictEqual(bare.askFull, null, 'no clipped ask -> askFull stays null');
+  });
   check('feed.normalizeLocal picks up meta.authorId when provided', () => {
     const e = { ts: '2026-07-14T06:00:00Z', source: 'Claude Code', ask: 'x', files: [] };
     const withId = feed.normalizeLocal(e, { projectPath: '/p', projectName: 'p', projectId: null, authorId: 'me' });
@@ -6606,6 +6755,28 @@ async function main() {
     const noted = e.changes.find(c => c.note);
     assert.ok(noted, 'a change carries the highlight note');
     assert.ok(!/SECRET123/.test(noted.note), 'secret is redacted from the note');
+  });
+  // BUG 2 (fix/share-live-and-clamp): digest.clip cuts at a raw character
+  // count, so a >300-char ask is stored ending mid-word ("…chec…"). The
+  // day-detail view needs the full text — keep an unclipped, still-redacted
+  // twin (askFull), exactly like summaryFull, and never let it cross the
+  // team boundary.
+  check('buildEntries: a clipped ask keeps its full text in askFull (local-only twin of summaryFull)', () => {
+    const longAsk = ('please refactor the authentication checkpoints module carefully ').repeat(6).trim();
+    const proj = { events: [
+      { ts: '2026-07-16T01:00:00.000Z', source: 'Claude Code', kind: 'prompt', session: 's-long', text: longAsk },
+      { ts: '2026-07-16T01:01:00.000Z', source: 'Claude Code', kind: 'prompt', session: 's-short', text: 'short ask' },
+    ] };
+    const entries = memorydb.buildEntries(proj1, proj, {});
+    const long = entries.find(x => x.session === 's-long');
+    assert.ok(long.ask.length <= 300 && long.ask.endsWith('…'), 'precondition: the stored ask is clipped');
+    assert.strictEqual(long.askFull, longAsk, 'askFull must carry the complete redacted text');
+    const short = entries.find(x => x.session === 's-short');
+    assert.ok(!('askFull' in short), 'an unclipped ask needs no askFull twin');
+  });
+  check('teamsync source never touches askFull — the unclipped ask stays on this machine', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'lib', 'teamsync.js'), 'utf8');
+    assert.ok(!/askFull/.test(src), 'teamsync must not push, pull, or reshare askFull');
   });
   // Task 9 perf fix: deriveChanges (which spawns git subprocesses) must only
   // run for entries that survive the maxEntries slice — never for distilled
