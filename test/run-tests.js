@@ -4458,6 +4458,102 @@ async function main() {
     }
   }
 
+  // BUG 1 (fix/share-live-and-clamp): sharing a LIVE / never-pushed session.
+  // reshareSession must refresh stale credentials like every other
+  // authenticated call (it used raw loadCredentials, so an expired JWT made
+  // every reshare 401 while the 60s sync kept quietly refreshing creds for
+  // everything else), must INSERT rows for a session the backend has never
+  // seen, and /api/share-session must refuse honestly when a session has no
+  // local rows (it used to persist the flag as a silent no-op) — and the
+  // dashboard must surface a share failure inline, never via the offline pill.
+  {
+    const mockLV = createMockSupabase();
+    const MOCK_PORT_LV = 17961, SRV_PORT_LV = 17962;
+    await new Promise(r => mockLV.server.listen(MOCK_PORT_LV, '127.0.0.1', r));
+    process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:' + MOCK_PORT_LV;
+    process.env.MEMBRIDGE_TEAM_ANON_KEY = 'anon-test';
+    let srvLV;
+    try {
+      const projLV = path.join(ROOT, 'projects', 'share-live-app');
+      fs.mkdirSync(projLV, { recursive: true });
+      await teamsync.signup(util.getConfig(), 'sharelive@test.dev', 'pw-lv', 'Liver');
+      const teamLV = await teamsync.createTeam(util.getConfig(), 'ShareLiveTeam');
+      await teamsync.linkProject(util.getConfig(), projLV, teamLV.team_id, 'ShareLiveTeam');
+      { const rc = util.loadUserConfig(); if (rc.team) delete rc.team.sharePrompts; util.saveUserConfig(rc); }
+      // A LIVE session: one prompt seconds ago, no summary — and deliberately
+      // NO syncTeams, so the backend has zero rows for it.
+      const stLV = util.loadState();
+      stLV.projects[projLV] = { events: [
+        { ts: new Date(Date.now() - 5000).toISOString(), source: 'Claude Code', kind: 'prompt', session: 'sLive', text: 'working right now' },
+      ] };
+      util.saveState(stLV);
+
+      await check('teamsync: reshareSession inserts + shares a session the backend has never seen', async () => {
+        const creds = await teamsync.getAccessToken(util.getConfig());
+        assert.strictEqual(mockLV.entries.filter(e => e.session === 'sLive').length, 0, 'precondition: no backend row');
+        const res = await teamsync.reshareSession(util.getConfig(), projLV, 'sLive', true, { creds, crypto: null });
+        assert.strictEqual(res.ok, true, 'reshare must succeed for a never-pushed session: ' + JSON.stringify(res));
+        const row = mockLV.entries.filter(e => e.session === 'sLive')[0];
+        assert.ok(row, 'the share must insert the missing backend row');
+        assert.ok(row.ask && /working right now/.test(row.ask), 'inserted row must carry the shared prompt');
+      });
+
+      await check('teamsync: reshareSession refreshes a stale token instead of failing with it', async () => {
+        // Expire the stored access token but keep the refresh token valid. The
+        // old code sent the dead token verbatim (raw loadCredentials, never a
+        // refresh), so the whole reshare 401ed — the live-session share bug.
+        const saved = JSON.parse(fs.readFileSync(teamsync.credentialsPath(), 'utf8'));
+        fs.writeFileSync(teamsync.credentialsPath(), JSON.stringify({
+          ...saved, accessToken: 'expired-dead-token', expiresAt: Date.now() - 60000,
+        }));
+        const res = await teamsync.reshareSession(util.getConfig(), projLV, 'sLive', false);
+        assert.strictEqual(res.ok, true, 'reshare with a stale stored token must refresh and succeed: ' + JSON.stringify(res));
+        const row = mockLV.entries.filter(e => e.session === 'sLive')[0];
+        assert.strictEqual(row.ask, null, 'the refreshed reshare must still apply (scrub)');
+      });
+
+      srvLV = startServer(SRV_PORT_LV, { retries: 0 });
+      await waitForHttp('http://127.0.0.1:' + SRV_PORT_LV + '/api/status');
+      const onLive = await httpPost(SRV_PORT_LV, '/api/share-session', { project: projLV, session: 'sLive', share: true });
+      await check('server: /api/share-session ok:true for a previously-unpushed session', () => {
+        assert.strictEqual(onLive.ok, true, JSON.stringify(onLive));
+        const row = mockLV.entries.filter(e => e.session === 'sLive')[0];
+        assert.ok(row && row.ask && /working right now/.test(row.ask), 'live row must be inserted + shared via the endpoint');
+        const state = util.loadState();
+        const proj = state.projects[projLV] || state.projects[path.resolve(projLV)];
+        assert.ok((proj.sharedSessions || []).includes('sLive'), 'flag persists once the backend accepted');
+      });
+
+      const onGhost = await httpPost(SRV_PORT_LV, '/api/share-session', { project: projLV, session: 'sGhost', share: true });
+      await check('server: /api/share-session refuses a rowless session instead of silently persisting the flag', () => {
+        assert.strictEqual(onGhost.ok, false, 'a session with no local rows must not report success: ' + JSON.stringify(onGhost));
+        const state = util.loadState();
+        const proj = state.projects[projLV] || state.projects[path.resolve(projLV)];
+        assert.ok(!((proj.sharedSessions || []).includes('sGhost')), 'flag must not persist when nothing was shared');
+      });
+
+      const pageLV = await (await fetch('http://127.0.0.1:' + SRV_PORT_LV + '/')).text();
+      const scriptLV = (pageLV.match(/<script>\n([\s\S]*)\n<\/script>/) || [])[1] || '';
+      await check('dashboard: share-toggle failure is inline (couldn’t share — retry), never the offline pill', () => {
+        const marks = [];
+        let at = -1;
+        while ((at = scriptLV.indexOf("closest('[data-share-toggle]')", at + 1)) !== -1) marks.push(at);
+        assert.strictEqual(marks.length, 3, 'expected the three share handlers (feed, day, project), got ' + marks.length);
+        for (const m of marks) {
+          const block = scriptLV.slice(m, scriptLV.indexOf('.catch', m) + 220);
+          assert.ok(/shareFailUI\(/.test(block), 'handler at ' + m + ' does not route failure to the inline affordance');
+          assert.ok(!/setPill\(false\)/.test(block), 'handler at ' + m + ' still flips the global pill on a share failure');
+        }
+        assert.ok(/couldn&rsquo;t share/.test(scriptLV), 'inline failure copy missing');
+      });
+    } finally {
+      if (srvLV) await new Promise(r => srvLV.close(r));
+      mockLV.server.close();
+      delete process.env.MEMBRIDGE_TEAM_URL;
+      delete process.env.MEMBRIDGE_TEAM_ANON_KEY;
+    }
+  }
+
   // Task 8: ship decisions/gotchas to teammates end to end, and pull must
   // survive a backend still missing goal/changes (or any optional column).
   const mockS = createMockSupabase();
