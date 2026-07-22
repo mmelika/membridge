@@ -1358,8 +1358,9 @@ async function main() {
     // burst collapsed into ONE unit that finalizeUnit then labeled by its
     // newest entry's tool — hiding the other tool on the unfiltered Activity
     // view until the Tool filter narrowed to it. unitKeyOf now includes the
-    // tool; different tools never share a unit, and buildDayCards' key carries
-    // the tool too so they never share a day card either.
+    // tool; different tools never share a unit. (buildDayCards, by contrast,
+    // intentionally keys WITHOUT the tool — FIX 1 — so a person's tools share
+    // one day card, each surfaced as its own checklist row and tool badge.)
     function evalBuildUnits(entries) {
       const escSrc = extractVarFn(embeddedScript, 'esc') || '';
       const fnSrc = ['normKeyPart', 'feedKey', 'threadKey', 'buildThreads', 'unitKeyOf', 'finalizeUnit', 'buildUnits']
@@ -1414,12 +1415,27 @@ async function main() {
       assert.strictEqual(units.length, 1, 'same author+project+tool within the burst window is one unit');
       assert.strictEqual(units[0].agentCount, 2, 'both runs roll up as agents inside the one unit');
     });
-    check('dayCards: same author+project+day but different tools -> separate cards', () => {
+    // FIX 1 (auto/day-card-fixes): consolidate all of one person's tools for a
+    // day into ONE card that carries every tool as a badge set and every tool's
+    // work units in its checklist. Supersedes the earlier per-tool split
+    // (commit 261fe74): units stay per-tool (so nothing is hidden — see the
+    // buildUnits checks above), but the DAY CARD no longer keys on tool.
+    check('dayCards: one card per author+project+day across all tools, carrying every tool as a badge set', () => {
       const claude = unitWith({ ts: dayCardsLocalTs(0, 14), source: 'Claude Code' });
-      const codex = unitWith({ ts: dayCardsLocalTs(0, 10), source: 'Codex' });
-      const cards = evalDayCards([claude, codex]);
-      assert.strictEqual(cards.length, 2, 'Claude and Codex must not share a day card');
-      assert.deepStrictEqual(cards.map(c => c.source).sort(), ['Claude Code', 'Codex']);
+      const codex = unitWith({ ts: dayCardsLocalTs(0, 10), source: 'Codex', live: true });
+      const distilled = unitWith({ ts: dayCardsLocalTs(0, 12), source: 'Distilled', repEntry: { headline: 'Distilled outcome' } });
+      const cards = evalDayCards([claude, codex, distilled]);
+      assert.strictEqual(cards.length, 1, 'all of a person\'s tools for one day collapse into a single card');
+      assert.strictEqual(cards[0].units.length, 3, 'every tool\'s work unit is retained on the card');
+      assert.ok(Array.isArray(cards[0].tools), 'card carries a tools badge set');
+      assert.deepStrictEqual(cards[0].tools.slice().sort(), ['Claude Code', 'Codex', 'Distilled'], 'all three tools present as badges');
+      assert.strictEqual(cards[0].checklist.length, 3, 'checklist includes a row from every tool');
+      assert.strictEqual(cards[0].checklist[0].live, true, 'live-first: the live Codex unit heads the checklist');
+    });
+    check('dayCards: a single-tool day carries exactly one tool badge', () => {
+      const cards = evalDayCards([unitWith({ ts: dayCardsLocalTs(0, 14), source: 'Claude Code' })]);
+      assert.strictEqual(cards.length, 1);
+      assert.deepStrictEqual(cards[0].tools, ['Claude Code'], 'a one-tool day shows one badge');
     });
     // v2 checklist data (docs/superpowers/specs/2026-07-20-activity-day-cards-v2-design.md, Task 1):
     // each card carries a checklist[] — one {glyph, text, live} row per unit,
@@ -1503,6 +1519,16 @@ async function main() {
       assert.ok(iLive !== -1 && iDone !== -1 && iBare !== -1, 'all three state glyphs render');
       assert.ok(iLive < iDone && iDone < iBare, 'live row first, then distilled, then no-summary');
       assert.strictEqual((h.match(/working now/g) || []).length, 1, 'exactly the live row carries the tag');
+    });
+    // FIX 1 render side: the consolidated card shows one badge per tool used.
+    check('dayCardHtml: renders a badge for every tool the day used', () => {
+      const claude = unitWith({ ts: dayCardsLocalTs(0, 14), source: 'Claude Code' });
+      const codex = unitWith({ ts: dayCardsLocalTs(0, 12), source: 'Codex' });
+      const distilled = unitWith({ ts: dayCardsLocalTs(0, 10), source: 'Distilled', repEntry: { headline: 'D' } });
+      const h = evalDayCardHtml(evalDayCards([claude, codex, distilled])[0]);
+      assert.ok(/Claude Code/.test(h) && /Codex/.test(h) && /Distilled/.test(h), 'all tool badges must render on the one card');
+      const single = evalDayCardHtml(evalDayCards([unitWith({ ts: dayCardsLocalTs(0, 14), source: 'Codex' })])[0]);
+      assert.ok(/Codex/.test(single) && !/Claude Code/.test(single), 'a single-tool day shows only its one badge');
     });
     check('dayCardHtml v2: stat row sums sessions · prompts · files over the day', () => {
       const su1 = unitWith({ ts: dayCardsLocalTs(0, 15), agentCount: 2, promptCount: 5 });
