@@ -105,6 +105,13 @@ function openDashboard() {
     icon: nativeImage.createFromPath(path.join(__dirname, 'assets', 'icon.png')),
   });
   win.loadURL(dashboardUrl());
+  // Anything the dashboard opens as a popup (the GitHub sign-in round trip)
+  // goes to the default browser — GitHub is already signed in there, and
+  // nothing external ever renders inside the app window.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
   win.on('closed', () => {
     win = null;
   });
