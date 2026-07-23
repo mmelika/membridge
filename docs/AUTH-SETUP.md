@@ -29,13 +29,17 @@ provider account and a DNS record, so budget a little longer for that part.
    Configuration*:
    - **Site URL**: the deployed web workspace's URL (the Vercel deployment of
      `web/`).
-   - **Redirect URLs**: add `https://<that-domain>/**` and, for local dev,
-     `http://localhost:3000/**`.
+   - **Redirect URLs**: add `https://<that-domain>/**`, plus
+     `http://localhost:7437/**` and `http://127.0.0.1:7437/**` (the desktop
+     app's dashboard — its GitHub button round-trips through
+     `/team/oauth/callback` on that port), and `http://localhost:3000/**`
+     for local web dev.
 
    The GitHub button sends people back to the exact page they started from
-   (`/login` or `/join/<token>`), and Supabase only honors destinations on
-   this allowlist — skip this step and everyone lands on the Site URL
-   instead, which breaks the invite auto-join.
+   (`/login`, `/join/<token>`, or the app's dashboard), and Supabase only
+   honors destinations on this allowlist — skip this step and everyone lands
+   on the Site URL instead, which breaks the invite auto-join and the app's
+   sign-in completion.
 
 4. **Good to know**
    - If someone signs in with GitHub using the same **verified** email as an

@@ -2068,12 +2068,20 @@ async function main() {
       // rendering the placeholder as wide-tracked ALL-CAPS mono.
       assert.ok(/<label[^>]*><span[^>]*>Password<\/span><input name="password"/.test(embeddedScript),
         'password label missing or its styling sits on the label element (input would inherit mono/uppercase)');
-      assert.ok(embeddedScript.includes('<label style="display:grid;gap:6px;text-align:left"><span'),
+      // The label must actively neutralize the .team-form label mono/uppercase
+      // rule (font/letter-spacing/text-transform/color back to inherit), or the
+      // input — font-family:inherit — renders its placeholder in wide mono.
+      assert.ok(embeddedScript.includes('<label style="display:grid;gap:6px;text-align:left;font:inherit;letter-spacing:normal;text-transform:none;color:inherit"><span'),
         'the wrapping label is not style-neutral');
-      assert.ok(!embeddedScript.includes('placeholder="How teammates see you"'),
-        'display-name placeholder still reads "How teammates see you"');
-      assert.ok(embeddedScript.includes('placeholder="Display name"'), 'display-name placeholder missing');
-      assert.ok(embeddedScript.includes('placeholder="At least 6 characters"'), 'password hint placeholder lost');
+      // Every field now carries a real label, so placeholders are free to be
+      // hints ("How teammates see you") instead of restating the field name.
+      assert.ok(/<span[^>]*>Display name<\/span><input name="displayName"/.test(embeddedScript),
+        'display-name label missing');
+      assert.ok(/<span[^>]*>Email<\/span><input name="email"/.test(embeddedScript),
+        'email label missing');
+      // The 6-character guidance moved from the placeholder to helper text
+      // under the signup password field.
+      assert.ok(embeddedScript.includes('at least 6 characters'), 'password length hint lost');
     });
     check('auth screen: the mark is a proper MemBridge logo lockup, not a bare toggle-look tile', () => {
       // the enlarged header-style lockup: brand-mark tile + wordmark side by side
@@ -2920,6 +2928,37 @@ async function main() {
       process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey;
     }
   });
+
+  check('team: oauthAuthorizeUrl targets the backend with the redirect encoded', () => {
+    const u = teamsync.oauthAuthorizeUrl(util.getConfig(), 'http://127.0.0.1:7437/team/oauth/callback');
+    assert.ok(u.startsWith('http://127.0.0.1:17945/auth/v1/authorize?provider=github'), u);
+    assert.ok(u.includes(encodeURIComponent('http://127.0.0.1:7437/team/oauth/callback')), 'redirect not encoded');
+  });
+
+  {
+    // GitHub OAuth completion: fragment tokens become stored credentials, with
+    // the display name falling back to GitHub metadata (OAuth accounts carry
+    // user_name/full_name, never display_name). Runs before the password
+    // signup below so the credentials it writes get overwritten by that flow.
+    const ghUser = { id: 'gh-user-1', email: 'octo@test.dev', metadata: { user_name: 'octomarco' } };
+    mock.users.set(ghUser.email, ghUser);
+    mock.sessions.set('at-gh-test', ghUser.id);
+    const ghCreds = await teamsync.loginWithTokens(util.getConfig(), 'at-gh-test', 'rt-gh-test', 3600);
+    check('team: loginWithTokens verifies the token and stores GitHub credentials', () => {
+      assert.strictEqual(ghCreds.email, 'octo@test.dev');
+      assert.strictEqual(ghCreds.displayName, 'octomarco');
+      const stored = JSON.parse(read(teamsync.credentialsPath()));
+      assert.strictEqual(stored.userId, 'gh-user-1');
+      assert.strictEqual(stored.refreshToken, 'rt-gh-test');
+    });
+    let rejected = false;
+    try { await teamsync.loginWithTokens(util.getConfig(), 'at-never-issued', 'rt-x', 3600); }
+    catch { rejected = true; }
+    check('team: loginWithTokens rejects a token the backend never issued', () => {
+      assert.ok(rejected, 'unissued token was accepted');
+    });
+    teamsync.clearCredentials();
+  }
 
   try {
     // Marco: signup, team, link the shop-app project, first push.

@@ -283,6 +283,14 @@ function createMockSupabase() {
         users.set(body.email, user);
         return json(res, 200, newSession(user));
       }
+      if (url.pathname === '/auth/v1/user') {
+        // What loginWithTokens calls to verify an OAuth access token. Only
+        // tokens this mock issued (or a test seeded into `sessions`) resolve.
+        const userId = authedUser(req);
+        if (!userId) return json(res, 401, { msg: 'invalid JWT' });
+        const user = [...users.values()].find(u => u.id === userId);
+        return json(res, 200, { id: user.id, email: user.email, user_metadata: user.metadata || {} });
+      }
       if (url.pathname === '/auth/v1/token') {
         if (url.searchParams.get('grant_type') === 'password') {
           const user = users.get(body.email);
