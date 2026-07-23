@@ -5745,6 +5745,35 @@ async function main() {
     assert.deepStrictEqual(teampins.load(), {}, 'corrupt pins file -> empty, never a crash');
     teampins.save(second.pins); // leave a valid file behind for later sections
   });
+  // Per-device identity (multi-device E2E, section 1): a stable id persisted in
+  // device.json, an env override for test isolation, and self-healing on a
+  // corrupt file. deviceId must never change across calls, or a device would
+  // look new and re-seal needlessly.
+  const device = require('../lib/device');
+  check('device: deviceId is stable, persisted, env-overridable, and self-heals', () => {
+    const savedEnv = process.env.MEMBRIDGE_DEVICE_ID;
+    delete process.env.MEMBRIDGE_DEVICE_ID;
+    try {
+      try { fs.unlinkSync(device.devicePath()); } catch {}
+      const id1 = device.deviceId();
+      assert.ok(id1 && typeof id1 === 'string', 'deviceId returns a non-empty string');
+      assert.ok(fs.existsSync(device.devicePath()), 'device.json is created lazily');
+      assert.strictEqual(device.deviceId(), id1, 'deviceId is stable across calls');
+      assert.ok(device.deviceLabel(), 'deviceLabel returns a label');
+      // Corrupt file -> regenerate a fresh id, never throw.
+      fs.writeFileSync(device.devicePath(), '{nope');
+      const id2 = device.deviceId();
+      assert.ok(id2 && id2 !== id1, 'corrupt device.json regenerates a new id, never crashes');
+      // Env override wins and is NOT persisted (the file keeps id2).
+      process.env.MEMBRIDGE_DEVICE_ID = 'dev-override';
+      assert.strictEqual(device.deviceId(), 'dev-override', 'MEMBRIDGE_DEVICE_ID overrides');
+      delete process.env.MEMBRIDGE_DEVICE_ID;
+      assert.strictEqual(device.deviceId(), id2, 'override is not persisted; file id stands');
+    } finally {
+      if (savedEnv === undefined) delete process.env.MEMBRIDGE_DEVICE_ID;
+      else process.env.MEMBRIDGE_DEVICE_ID = savedEnv;
+    }
+  });
   // Private-key storage. The real keychain only exists on macOS, so off-darwin
   // this asserts the fail-closed contract instead of skipping blind.
   const keychain = require('../lib/keychain');
