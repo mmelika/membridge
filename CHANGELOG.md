@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 — 2026-07-22
+
+Public launch. Version numbers reset to 0.1.0; the sections below this release
+are pre-launch internal history and their version numbers no longer correspond
+to published releases.
 
 - **End-to-end encryption is on by default, fail-closed.** Team sync content
   (asks, summaries, decisions, gotchas, file paths, change notes) is
