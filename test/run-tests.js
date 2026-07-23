@@ -693,6 +693,33 @@ async function main() {
     st2.projects[key].teamEntries = saved;
     util.saveState(st2);
   });
+  check('perf(deferChanges): deferred derivation equals the inline change model', () => {
+    // The feed + project-page hot paths call buildEntries with deferChanges to
+    // skip the per-entry git subprocess storm, then derive changes only for the
+    // entries they show. Prove that deferred derivation is byte-identical to the
+    // old inline path, so the speedup changes nothing a teammate sees.
+    const config = util.getConfig();
+    const digestLib = require('../lib/digest');
+    const key = path.join(ROOT, 'projects', 'defer-app');
+    const ago = sec => new Date(Date.now() - sec * 1000).toISOString();
+    const proj = {
+      events: [
+        { ts: ago(30), source: 'Claude Code', kind: 'prompt', session: 'ds1', text: 'do the thing' },
+        { ts: ago(20), source: 'Claude Code', kind: 'edit', session: 'ds1', file: path.join(key, 'src', 'a.js') },
+        { ts: ago(10), source: 'Distilled', kind: 'summary', session: 'ds1', text: 'Did the thing.',
+          goal: 'g', decisions: '', gotchas: '', highlights: [{ file: 'src/a.js', note: 'touched a.js' }] },
+      ],
+    };
+    const inline = memorydb.buildEntries(key, JSON.parse(JSON.stringify(proj)), config);
+    const deferred = memorydb.buildEntries(key, JSON.parse(JSON.stringify(proj)), config, { deferChanges: true });
+    const inlineEntry = inline.find(e => Array.isArray(e.changes) && e.changes.length);
+    assert.ok(inlineEntry, 'inline path should produce a change model to compare against');
+    const deferredEntry = deferred.find(e => e.session === inlineEntry.session && e._highlights);
+    assert.ok(deferredEntry, 'deferred path should keep _highlights instead of deriving inline');
+    assert.ok(!Array.isArray(deferredEntry.changes) || !deferredEntry.changes.length, 'deferred path must not derive changes inline');
+    const derived = memorydb.deriveEntryChanges(key, deferredEntry.files, deferredEntry._highlights, digestLib.compileRedactions(config));
+    assert.deepStrictEqual(derived, inlineEntry.changes, 'deferred derivation must equal the inline change model');
+  });
   check('planPayload: recentAsks merges + dedupes teammate teamEntries, sorted, capped at 20', () => {
     const config = util.getConfig();
     const proj = {
