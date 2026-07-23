@@ -6361,6 +6361,19 @@ async function main() {
       assert.ok(!('ciphertext' in pushRow), 'input row must not be mutated');
     });
 
+    // Cutover default: ciphertext-only is the DEFAULT once a team key exists —
+    // dual-write survives only as the explicit rollback hatch
+    // (`team.plaintextOff: false`). Guards the leak where every "encrypted"
+    // row still carried readable content columns unless each machine
+    // hand-set the flag.
+    check('teamsync: plaintextOffFor defaults ON — only an explicit false re-enables dual-write', () => {
+      assert.strictEqual(teamsync.plaintextOffFor({}), true, 'no team config → ciphertext-only');
+      assert.strictEqual(teamsync.plaintextOffFor(null), true, 'null config → ciphertext-only');
+      assert.strictEqual(teamsync.plaintextOffFor({ team: {} }), true, 'empty team config → ciphertext-only');
+      assert.strictEqual(teamsync.plaintextOffFor({ team: { plaintextOff: true } }), true, 'explicit true stays on');
+      assert.strictEqual(teamsync.plaintextOffFor({ team: { plaintextOff: false } }), false, 'explicit false is the only dual-write hatch');
+    });
+
     // Fail-closed wiring: flag ON, crypto/keychain unavailable. The pass must
     // push today's plaintext rows, never throw — and must LOG the fallback,
     // which is what separates "the wiring engaged and failed closed" from
@@ -6510,12 +6523,12 @@ async function main() {
       resAlice = await teamsync.syncTeams({ project: projE2E, cryptoDeps: { keychain: kcAlice, teamcrypto: tcE2E } });
       origRows = mockE2E.entries.map(e => ({ ...e }));
 
-      // Tamper every stored plaintext column: a correct pull must recover
-      // content from the CIPHERTEXT, so the tampering must never surface.
+      // Inject fake plaintext into every stored content column: cutover rows
+      // carry none, so anything readable server-side is server-controlled. A
+      // correct pull recovers content from the CIPHERTEXT, so the injection
+      // must never surface.
       for (const e of mockE2E.entries) {
-        if (e.ask) e.ask = 'TAMPERED ' + e.ask;
-        if (e.summary) e.summary = 'TAMPERED ' + e.summary;
-        if (e.decisions) e.decisions = 'TAMPERED';
+        e.ask = 'TAMPERED ask'; e.summary = 'TAMPERED summary'; e.decisions = 'TAMPERED';
       }
       // Plus one plaintext-only row (no ciphertext): must pull through as-is.
       const alice = mockE2E.users.get('alice-e2e@test.dev');
@@ -6541,7 +6554,7 @@ async function main() {
       mockE2E.server.close();
     }
 
-    check('teamsync: flag-on push dual-writes ciphertext rows and seals the epoch key to every member', () => {
+    check('teamsync: flag-on push is ciphertext-only by default and seals the epoch key to every member', () => {
       assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
       assert.deepStrictEqual(resAlice.errors, [], `alice sync errors: ${JSON.stringify(resAlice && resAlice.errors)}`);
       assert.ok(origRows.length >= 1, 'expected pushed rows');
@@ -6549,8 +6562,10 @@ async function main() {
         assert.ok(r.ciphertext && r.nonce && r.key_epoch === 1, 'pushed row missing ciphertext/nonce/key_epoch');
         assert.ok(!Buffer.from(r.ciphertext, 'base64').toString('latin1').includes('src/core.js'),
           'file path visible in ciphertext bytes');
+        for (const col of ['ask', 'goal', 'decisions', 'gotchas', 'summary', 'files', 'changes']) {
+          assert.strictEqual(r[col], null, `${col} must be null — ciphertext-only is the default, dual-write is opt-in`);
+        }
       }
-      assert.ok(origRows.some(r => r.summary), 'plaintext summary must still be populated (dual-write)');
       assert.strictEqual(mockE2E.pubkeys.size, 2, 'both members must have uploaded pubkeys');
       assert.strictEqual(mockE2E.teamKeys.length, 2, 'epoch key must be sealed once to each member');
     });
@@ -6575,13 +6590,14 @@ async function main() {
 
     check('teamsync: round trip — Bob recovers exactly what Alice pushed, through the ciphertext', () => {
       assert.ok(!e2eErr, `e2e scenario threw: ${e2eErr && e2eErr.message}`);
-      const orig = origRows.find(r => r.summary);
+      // The server rows carry no readable content (ciphertext-only default),
+      // so the round-trip oracle is the content Alice PLANTED, not the rows.
       const got = bobEntries.find(e => e.session === 'e2e1' && e.summary);
-      assert.ok(orig && got, 'summary-bearing row missing on one side');
-      assert.strictEqual(got.ask, orig.ask, 'ask must round-trip identically');
-      assert.strictEqual(got.summary, orig.summary, 'summary must round-trip identically');
-      assert.strictEqual(got.decisions, orig.decisions, 'decisions must round-trip identically');
-      assert.deepStrictEqual(got.files, orig.files, 'files must round-trip identically');
+      assert.ok(got, 'summary-bearing e2e1 entry missing from Bob\'s pull');
+      assert.strictEqual(got.summary, 'Shipped the slice end to end', 'summary must round-trip through the ciphertext');
+      assert.strictEqual(got.decisions, 'sealed-box model kept', 'decisions must round-trip through the ciphertext');
+      assert.ok(Array.isArray(got.files) && got.files.some(f => String(f).includes('core.js')),
+        'edited file must round-trip through the ciphertext');
       assert.ok(!JSON.stringify(bobEntries).includes('sk-e2e-alice-999'),
         'secret must have been redacted before encryption');
     });
@@ -6732,9 +6748,12 @@ async function main() {
       });
     }
 
-    // Pre-migration backend (no 009 columns): flag-on push must drop the
-    // three new columns and land plaintext (PGRST204 retry), and the pull
-    // select must degrade instead of erroring. Fresh mock + home.
+    // Pre-migration backend (no 009 columns): under the ciphertext-only
+    // DEFAULT the push must fail closed and hold entries — dropping the
+    // ciphertext column would upload contentless rows. Only the explicit
+    // dual-write hatch (plaintextOff: false) restores the legacy degrade:
+    // drop the three new columns and land plaintext (PGRST204 retry).
+    // Fresh mock + home.
     {
       const mockPre = createMockSupabase();
       mockPre.flags.rejectColumns.add('ciphertext');
@@ -6743,7 +6762,10 @@ async function main() {
       const homeCarol = path.join(ROOT, 'home-e2ec');
       const projPre = path.join(ROOT, 'projects', 'pre-app');
       fs.mkdirSync(projPre, { recursive: true });
-      let preErr = null, resPre = null;
+      let preErr = null, resPre = null, resPreHatch = null, heldCount = -1, mintedAfterHold = -1;
+      // ONE keychain for both passes: a fresh keychain on the second pass
+      // would be a brand-new identity that cannot unseal the epoch-1 key.
+      const kcCarol = mkMemKeychain();
       try {
         await new Promise(r => mockPre.server.listen(17954, '127.0.0.1', r));
         process.env.MEMBRIDGE_TEAM_URL = 'http://127.0.0.1:17954';
@@ -6758,23 +6780,37 @@ async function main() {
           { ts: '2026-07-18T13:00:00.000Z', source: 'Claude Code', kind: 'prompt', text: 'premigration push', session: 'pre1' },
         ] };
         util.saveState(stC);
-        resPre = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: mkMemKeychain(), teamcrypto: tcE2E } });
+        resPre = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: kcCarol, teamcrypto: tcE2E } });
+        heldCount = mockPre.entries.length;
+        mintedAfterHold = mockPre.teamKeys.length;
+        // Explicit dual-write hatch: the ONLY way the old degrade path runs.
+        const rawC = util.loadUserConfig();
+        rawC.team = { ...(rawC.team || {}), plaintextOff: false };
+        util.saveUserConfig(rawC);
+        resPreHatch = await teamsync.syncTeams({ project: projPre, cryptoDeps: { keychain: kcCarol, teamcrypto: tcE2E } });
       } catch (e) { preErr = e; } finally {
         process.env.MEMBRIDGE_HOME = savedHome;
         process.env.MEMBRIDGE_TEAM_URL = savedUrl2;
         process.env.MEMBRIDGE_TEAM_ANON_KEY = savedKey2;
         mockPre.server.close();
       }
-      check('teamsync: flag-on against a 009-less backend — push drops ciphertext/nonce/key_epoch and retries, pull select degrades, no errors', () => {
+      check('teamsync: 009-less backend under the ciphertext-only default — push fails closed and holds entries', () => {
         assert.ok(!preErr, `premigration scenario threw: ${preErr && preErr.message}`);
-        assert.deepStrictEqual(resPre.errors, [], `sync errors: ${JSON.stringify(resPre && resPre.errors)}`);
-        assert.ok(mockPre.entries.length >= 1, 'expected the push to land after dropping the new columns');
+        assert.strictEqual(resPre.errors.length, 1, `expected exactly the held-entries error: ${JSON.stringify(resPre && resPre.errors)}`);
+        assert.ok(/backend lacks the \w+ column required for ciphertext-only push/.test(resPre.errors[0]),
+          `error must name the missing-column hold: ${resPre.errors[0]}`);
+        assert.strictEqual(heldCount, 0, 'no row may land — a dropped ciphertext column would upload contentless rows');
+        assert.strictEqual(mintedAfterHold, 1, 'the epoch mint itself must still succeed (team_keys has no flag)');
+      });
+      check('teamsync: 009-less backend with the explicit plaintextOff:false hatch — push drops ciphertext/nonce/key_epoch and lands plaintext', () => {
+        assert.ok(!preErr, `premigration scenario threw: ${preErr && preErr.message}`);
+        assert.deepStrictEqual(resPreHatch.errors, [], `hatch sync errors: ${JSON.stringify(resPreHatch && resPreHatch.errors)}`);
+        assert.ok(mockPre.entries.length >= 1, 'expected the hatch push to land after dropping the new columns');
         for (const r of mockPre.entries) {
           assert.ok(!('ciphertext' in r) && !('nonce' in r) && !('key_epoch' in r),
             'new columns must have been dropped for the old backend');
         }
         assert.ok(mockPre.entries.some(e => /premigration push/.test(e.ask || '')), 'plaintext content missing');
-        assert.strictEqual(mockPre.teamKeys.length, 1, 'the epoch mint itself must still succeed (team_keys has no flag)');
       });
     }
   }

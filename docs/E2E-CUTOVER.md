@@ -45,17 +45,23 @@ a KEY ALERT; after re-verifying out-of-band, accept the new key with:
 
     membridge team trust <name or user-id>
 
-## 4. Flip plaintext off (every member)
+## 4. Plaintext off (now the default — just update)
 
-In `~/.membridge/config.json`, under `team`:
+Ciphertext-only is the DEFAULT on this release and later: once a team key
+resolves, pushed rows carry ciphertext + routing metadata only; every
+content column is null. There is nothing to set — updating is the flip.
+If the backend is missing the 009/013 columns the push refuses to degrade
+and holds entries instead (fail-closed).
+
+Dual-write survives only as an explicit rollback hatch, in
+`~/.membridge/config.json` under `team`:
 
 ```json
-{ "team": { "plaintextOff": true } }
+{ "team": { "plaintextOff": false } }
 ```
 
-From then on pushed rows carry ciphertext + routing metadata only; every
-content column is null. If the backend is missing the 009/013 columns the
-push refuses to degrade and holds entries instead (fail-closed).
+(On releases before this default, the same key had to be hand-set to `true`
+on every machine — an unset flag silently kept dual-writing plaintext.)
 
 ## 5. (Optional) scrub historical plaintext
 
@@ -75,7 +81,7 @@ should not exist server-side at all.
 
 ## Rollback
 
-`team.plaintextOff` removed → dual-write resumes. `team.encrypt: false` →
+`team.plaintextOff: false` (explicit) → dual-write resumes. `team.encrypt: false` →
 full plaintext legacy sync (the explicit hatch; both members must flip it
 to read each other again). Neither undoes step 5.
 
