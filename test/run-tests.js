@@ -5810,6 +5810,41 @@ async function main() {
     assert.ok(keychain.remove(acct), 'remove failed');
     assert.strictEqual(keychain.load(acct), null, 'load after remove must be null');
   });
+  // Windows DPAPI backend (multi-device section 2). Command construction is
+  // asserted cross-platform through the win runner seam: the secret must travel
+  // on stdin, never argv (the PowerShell script carries no secret), and a
+  // protect->store->load round trip must recover the value. The real DPAPI path
+  // is exercised only on win32 below.
+  check('keychain(win): secret rides stdin not argv; protect/load round trips (via seam)', () => {
+    const calls = [];
+    // Fake DPAPI: protect base64-encodes the stdin secret; unprotect reverses it.
+    // Distinguished by the script body so store and load route correctly.
+    const prev = keychain._setWinRunner((args, input) => {
+      calls.push({ args, input: input || '' });
+      const script = args[args.length - 1];
+      if (/::Protect\(/.test(script)) return { status: 0, stdout: Buffer.from(String(input), 'utf8').toString('base64') };
+      if (/::Unprotect\(/.test(script)) return { status: 0, stdout: Buffer.from(String(input), 'base64').toString('utf8') };
+      return { status: 0, stdout: '' };
+    });
+    try {
+      const secret = 'PRIV+key/base64VALUE==';
+      assert.ok(keychain._winStore('membridge.box.privatekey', secret), 'win store failed');
+      assert.ok(calls.every(c => !c.args.join(' ').includes(secret)), 'secret leaked into argv (PowerShell script)');
+      const protect = calls.find(c => /::Protect\(/.test(c.args[c.args.length - 1]));
+      assert.ok(protect && protect.input.includes(secret), 'secret must travel on stdin');
+      assert.strictEqual(keychain._winLoad('membridge.box.privatekey'), secret, 'win load round trip');
+      assert.ok(keychain._winRemove('membridge.box.privatekey'), 'win remove failed');
+      assert.strictEqual(keychain._winLoad('membridge.box.privatekey'), null, 'load after remove must be null');
+    } finally { keychain._setWinRunner(prev); }
+  });
+  check('keychain(win): real DPAPI round trip on win32', () => {
+    if (process.platform !== 'win32') return; // exercised only on the Windows box
+    const acct = 'membridge.test.' + Date.now();
+    assert.ok(keychain.store(acct, 'WIN-SECRET'), 'store failed');
+    assert.strictEqual(keychain.load(acct), 'WIN-SECRET', 'load round trip');
+    assert.ok(keychain.remove(acct), 'remove failed');
+    assert.strictEqual(keychain.load(acct), null, 'load after remove must be null');
+  });
   // Identity bootstrap (ensureIdentity, plan Task 4): pure by injection, so
   // every scenario runs offline against fakes — no network, no real keychain.
   // Awaits happen at block level (check() doesn't await), wrapped so a missing
